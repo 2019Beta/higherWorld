@@ -3,11 +3,10 @@
   "id": "higherworld",
   "version": "${version}",
   "name": "higherWorld",
-  "description": "",
-  "authors": [],
+  "description": "Sparse cubic world runtime with no dimension-configured build-height cap.",
+  "authors": ["devt"],
   "contact": {},
-  "license": "unlicense",
-  "icon": "assets/higherworld/icon.png",
+  "license": "Unlicense",
   "environment": "*",
   "entrypoints": {
     "fabric-datagen": [
