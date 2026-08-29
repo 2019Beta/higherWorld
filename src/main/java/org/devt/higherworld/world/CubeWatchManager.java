@@ -1,6 +1,8 @@
 package org.devt.higherworld.world;
 
 import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -54,7 +56,7 @@ public final class CubeWatchManager {
         WATCHERS.entrySet().removeIf(entry -> entry.getValue().world == world);
     }
 
-    static void broadcastBlockUpdate(ServerWorld world, BlockPos pos, BlockState state) {
+    public static void broadcastBlockUpdate(ServerWorld world, BlockPos pos, BlockState state) {
         CubeBlockUpdatePayload payload = new CubeBlockUpdatePayload(pos, state);
         for (ServerPlayerEntity player : PlayerLookup.around(world, pos.toCenterPos(), 256.0)) {
             if (watches(player, CubePos.fromBlock(pos.getX(), pos.getY(), pos.getZ()))
@@ -93,7 +95,10 @@ public final class CubeWatchManager {
                 continue;
             }
             if (!ServerPlayNetworking.canSend(player, CubeDataPayload.ID)) {
-                continue;
+                // The play channel can become ready a few ticks after the watcher
+                // is created. Keep the cube queued instead of losing it forever.
+                state.pending.addFirst(pos);
+                break;
             }
             byte[] payload = CubicWorldManager.cubePayload(world, pos);
             if (payload.length != 0 && CubeDataPayload.canEncode(payload)) {
@@ -124,17 +129,20 @@ public final class CubeWatchManager {
         }
 
         state.pending.clear();
+        ArrayList<CubePos> pending = new ArrayList<>();
         for (int dy = -VERTICAL_RADIUS; dy <= VERTICAL_RADIUS; dy++) {
             for (int dz = -HORIZONTAL_RADIUS; dz <= HORIZONTAL_RADIUS; dz++) {
                 for (int dx = -HORIZONTAL_RADIUS; dx <= HORIZONTAL_RADIUS; dx++) {
                     CubePos pos = new CubePos(center.x() + dx, center.y() + dy, center.z() + dz);
                     if (pos.isBlockRangeRepresentable() && isOutsideVanillaHeight(world, pos)
                             && !state.sent.contains(pos)) {
-                        state.pending.addLast(pos);
+                        pending.add(pos);
                     }
                 }
             }
         }
+        pending.sort(Comparator.comparingInt(pos -> squaredDistance(pos, center)));
+        state.pending.addAll(pending);
     }
 
     private static void unloadAll(ServerPlayerEntity player, WatchState state) {
@@ -151,6 +159,13 @@ public final class CubeWatchManager {
         return Math.abs(pos.x() - center.x()) <= HORIZONTAL_RADIUS
                 && Math.abs(pos.y() - center.y()) <= VERTICAL_RADIUS
                 && Math.abs(pos.z() - center.z()) <= HORIZONTAL_RADIUS;
+    }
+
+    private static int squaredDistance(CubePos pos, CubePos center) {
+        int dx = pos.x() - center.x();
+        int dy = pos.y() - center.y();
+        int dz = pos.z() - center.z();
+        return dx * dx + dy * dy + dz * dz;
     }
 
     private static boolean watches(ServerPlayerEntity player, CubePos pos) {

@@ -165,7 +165,6 @@ public final class CubicWorldManager {
                 if ((flags & net.minecraft.block.Block.NOTIFY_NEIGHBORS) != 0 && maxUpdateDepth > 0) {
                     world.updateNeighborsAlways(pos, blockState.getBlock(), null);
                 }
-                CubeWatchManager.broadcastBlockUpdate(world, pos, blockState);
             }
             return changed;
         } catch (IOException | RuntimeException exception) {

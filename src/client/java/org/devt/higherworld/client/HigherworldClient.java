@@ -24,7 +24,13 @@ public class HigherworldClient implements ClientModInitializer {
         });
         ClientPlayNetworking.registerGlobalReceiver(CubeBlockUpdatePayload.ID, (payload, context) -> {
             if (context.client().world != null) {
-                ClientCubeCache.setBlockState(context.client().world, payload.blockPos(), payload.blockState());
+                // Use the same path as vanilla BlockUpdateS2CPacket. In particular,
+                // this replaces the state stored by PendingUpdateManager for a
+                // predicted break. Writing the cube cache directly leaves the old
+                // state pending, so the sequence acknowledgement resurrects a
+                // server-side deleted block until the client rejoins.
+                context.client().world.handleBlockUpdate(
+                        payload.blockPos(), payload.blockState(), 19);
             }
         });
     }
