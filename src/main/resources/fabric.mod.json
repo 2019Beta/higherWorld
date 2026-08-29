@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "id": "higherworld",
+  "version": "${version}",
+  "name": "higherWorld",
+  "description": "",
+  "authors": [],
+  "contact": {},
+  "license": "unlicense",
+  "icon": "assets/higherworld/icon.png",
+  "environment": "*",
+  "entrypoints": {
+    "fabric-datagen": [
+      "org.devt.higherworld.client.HigherworldDataGenerator"
+    ],
+    "client": [
+      "org.devt.higherworld.client.HigherworldClient"
+    ],
+    "main": [
+      "org.devt.higherworld.Higherworld"
+    ]
+  },
+  "mixins": [
+    "higherworld.mixins.json",
+    {
+      "config": "higherworld.client.mixins.json",
+      "environment": "client"
+    }
+  ],
+  "depends": {
+    "fabricloader": ">=${loader_version}",
+    "fabric-api": "*",
+    "minecraft": "${minecraft_version}"
+  }
+}
