@@ -1,4 +1,4 @@
-package org.devt.higherworld.client;
+package org.devt.higherworld.client.mixin;
 
 import net.minecraft.block.BlockState;
 import net.minecraft.client.world.ClientWorld;
@@ -15,6 +15,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import java.util.Map;
 import java.util.HashMap;
 import net.minecraft.block.entity.BlockEntity;
+import org.devt.higherworld.client.ClientCubeCache;
 import org.devt.higherworld.storage.CubePos;
 
 /** Supplies render snapshots from the cubic cache when a section index is outside a vanilla column. */

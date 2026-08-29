@@ -12,6 +12,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.devt.higherworld.world.CubicBlockView;
 import org.devt.higherworld.world.CubicWorldManager;
 import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
@@ -19,6 +20,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 /** Routes positions outside the vanilla section array through sparse runtime cubes. */
 @Mixin(World.class)
 abstract class WorldMixin {
+    @Unique
     private static final int HORIZONTAL_LIMIT = 30_000_000;
 
     @Inject(method = "isInBuildLimit", at = @At("HEAD"), cancellable = true)
@@ -121,6 +123,7 @@ abstract class WorldMixin {
         }
     }
 
+    /** Overrides the inherited BlockRenderView default for cubic positions. */
     public int getLightLevel(LightType type, BlockPos pos) {
         World world = (World) (Object) this;
         if (!isOutsideVanillaHeight(world, pos)) {
@@ -139,24 +142,29 @@ abstract class WorldMixin {
         return pos.getY() > effectiveHighest ? 15 : 0;
     }
 
+    /** Overrides the inherited BlockRenderView default for cubic positions. */
     public int getBaseLightLevel(BlockPos pos, int ambientDarkness) {
         return Math.max(getLightLevel(LightType.BLOCK, pos),
                 Math.max(0, getLightLevel(LightType.SKY, pos) - ambientDarkness));
     }
 
+    /** Overrides the inherited BlockRenderView default for cubic positions. */
     public boolean isSkyVisible(BlockPos pos) {
         return getLightLevel(LightType.SKY, pos) >= 15;
     }
 
+    @Unique
     private static boolean isOutsideVanillaHeight(World world, BlockPos pos) {
         return pos.getY() < world.getBottomY() || pos.getY() > world.getTopYInclusive();
     }
 
+    @Unique
     private static boolean isValidHorizontally(BlockPos pos) {
         return pos.getX() >= -HORIZONTAL_LIMIT && pos.getX() < HORIZONTAL_LIMIT
                 && pos.getZ() >= -HORIZONTAL_LIMIT && pos.getZ() < HORIZONTAL_LIMIT;
     }
 
+    @Unique
     private static boolean isLoadableHorizontally(BlockPos pos) {
         int chunkX = Math.floorDiv(pos.getX(), 16);
         int chunkZ = Math.floorDiv(pos.getZ(), 16);

@@ -1,12 +1,14 @@
-package org.devt.higherworld.client;
+package org.devt.higherworld.client.mixin;
 
 import net.minecraft.client.render.chunk.ChunkRendererRegion;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.world.LightType;
 import net.minecraft.world.World;
+import org.devt.higherworld.client.ClientCubeCache;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
+import org.spongepowered.asm.mixin.Unique;
 
 /** Provides deterministic light values while the cubic light graph is sparse. */
 @Mixin(ChunkRendererRegion.class)
@@ -43,6 +45,7 @@ abstract class ChunkRendererRegionMixin {
         return outsideVanillaHeight(pos) ? getLightLevel(LightType.SKY, pos) >= 15 : world.isSkyVisible(pos);
     }
 
+    @Unique
     private boolean outsideVanillaHeight(BlockPos pos) {
         return pos.getY() < world.getBottomY() || pos.getY() > world.getTopYInclusive();
     }

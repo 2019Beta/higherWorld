@@ -1,9 +1,10 @@
-package org.devt.higherworld.client;
+package org.devt.higherworld.client.mixin;
 
 import net.minecraft.block.BlockState;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.fluid.FluidState;
 import net.minecraft.util.math.BlockPos;
+import org.devt.higherworld.client.ClientCubeCache;
 import org.devt.higherworld.world.CubicBlockView;
 import org.spongepowered.asm.mixin.Mixin;
 import net.minecraft.block.entity.BlockEntity;

@@ -1,4 +1,4 @@
-package org.devt.higherworld.client;
+package org.devt.higherworld.client.mixin;
 
 import net.minecraft.client.render.BuiltChunkStorage;
 import net.minecraft.util.math.ChunkSectionPos;

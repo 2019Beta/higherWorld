@@ -3,13 +3,14 @@ package org.devt.higherworld.world;
 import net.minecraft.network.RegistryByteBuf;
 import net.minecraft.network.codec.PacketCodec;
 import net.minecraft.network.packet.CustomPayload;
+import net.minecraft.util.Identifier;
 import org.devt.higherworld.Higherworld;
 import org.devt.higherworld.storage.CubePos;
 
 /** Full block and biome palette data for one 16-cubed cube. */
 public record CubeDataPayload(CubePos pos, byte[] data) implements CustomPayload {
     private static final int MAX_PAYLOAD_BYTES = 2 * 1024 * 1024;
-    public static final Id<CubeDataPayload> ID = CustomPayload.id(Higherworld.MOD_ID + ":cube_data");
+    public static final Id<CubeDataPayload> ID = new Id<>(Identifier.of(Higherworld.MOD_ID, "cube_data"));
     public static final PacketCodec<RegistryByteBuf, CubeDataPayload> CODEC = CustomPayload.codecOf(
             CubeDataPayload::write, CubeDataPayload::read);
 
