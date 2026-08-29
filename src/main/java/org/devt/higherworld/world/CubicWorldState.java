@@ -21,6 +21,7 @@ import org.devt.higherworld.storage.CubeStorage;
 
 /** Runtime cube cache and persistence boundary for one server dimension. */
 final class CubicWorldState implements AutoCloseable {
+    private static final byte[] EMPTY_PAYLOAD = new byte[0];
     private final ServerWorld world;
     private final CubeStorage storage;
     private final ConcurrentMap<ColumnPos, CubeColumn<LoadedCube>> columns = new ConcurrentHashMap<>();
@@ -86,35 +87,6 @@ final class CubicWorldState implements AutoCloseable {
         }
     }
 
-    void attach(CubePos pos, ChunkSection vanillaSection) throws IOException {
-        CubeColumn<LoadedCube> column = columns.computeIfAbsent(
-                new ColumnPos(pos.x(), pos.z()), ignored -> new CubeColumn<>());
-        LoadedCube existing = column.get(pos.y());
-        if (existing != null) {
-            if (existing.section() != vanillaSection) {
-                ChunkSectionCodec.decodeInto(ChunkSectionCodec.encode(existing.section()), vanillaSection);
-            }
-            return;
-        }
-
-        Optional<byte[]> payload = storage.read(pos);
-        LoadedCube attached = new LoadedCube(pos, vanillaSection);
-        if (payload.isPresent()) {
-            for (BlockEntity blockEntity : CubeRecordCodec.decode(payload.get(), vanillaSection, world)) {
-                attached.putLoadedBlockEntity(blockEntity);
-            }
-        }
-        column.put(pos.y(), attached);
-    }
-
-    void save(CubePos pos) throws IOException {
-        CubeColumn<LoadedCube> column = columns.get(new ColumnPos(pos.x(), pos.z()));
-        LoadedCube cube = column == null ? null : column.get(pos.y());
-        if (cube != null) {
-            save(cube, true);
-        }
-    }
-
     int loadedCubeCount() {
         return columns.values().stream().mapToInt(CubeColumn::size).sum();
     }
@@ -124,7 +96,30 @@ final class CubicWorldState implements AutoCloseable {
     }
 
     byte[] cubePayload(CubePos pos) throws IOException {
-        return CubeRecordCodec.encode(cube(pos), world);
+        CubeColumn<LoadedCube> column = columns.get(new ColumnPos(pos.x(), pos.z()));
+        LoadedCube loaded = column == null ? null : column.get(pos.y());
+        if (loaded != null) {
+            return CubeRecordCodec.encode(loaded, world);
+        }
+
+        // A missing sparse cube is implicitly air. Do not instantiate, index and
+        // encode thousands of empty sections merely because a player can see them.
+        Optional<byte[]> stored = storage.read(pos);
+        if (stored.isEmpty()) {
+            return EMPTY_PAYLOAD;
+        }
+
+        // Real stored cubes still enter the runtime so their block entities and
+        // random-ticking blocks continue to simulate while watched.
+        CubeColumn<LoadedCube> targetColumn = columns.computeIfAbsent(
+                new ColumnPos(pos.x(), pos.z()), ignored -> new CubeColumn<>());
+        LoadedCube created = load(pos, stored.get());
+        try {
+            targetColumn.put(pos.y(), created);
+            return stored.get();
+        } catch (IllegalArgumentException raced) {
+            return CubeRecordCodec.encode(targetColumn.get(pos.y()), world);
+        }
     }
 
     void flushDirty() throws IOException {
@@ -176,11 +171,11 @@ final class CubicWorldState implements AutoCloseable {
 
     void tick() {
         int randomTickSpeed = world.getGameRules().getValue(GameRules.RANDOM_TICK_SPEED);
-        for (LoadedCube cube : loadedCubes()) {
-            if (isOutsideVanillaHeight(cube.pos())) {
+        for (CubeColumn<LoadedCube> column : columns.values()) {
+            column.forEach(cube -> {
                 cube.tickBlockEntities(world);
                 cube.tickRandomly(world, randomTickSpeed);
-            }
+            });
         }
     }
 
@@ -189,11 +184,14 @@ final class CubicWorldState implements AutoCloseable {
     }
 
     private LoadedCube load(CubePos pos) throws IOException {
+        return load(pos, storage.read(pos).orElse(null));
+    }
+
+    private LoadedCube load(CubePos pos, byte[] payload) throws IOException {
         ChunkSection section = new ChunkSection(world.getPalettesFactory());
         LoadedCube cube = new LoadedCube(pos, section);
-        Optional<byte[]> payload = storage.read(pos);
-        if (payload.isPresent()) {
-            for (BlockEntity blockEntity : CubeRecordCodec.decode(payload.get(), section, world)) {
+        if (payload != null) {
+            for (BlockEntity blockEntity : CubeRecordCodec.decode(payload, section, world)) {
                 cube.putLoadedBlockEntity(blockEntity);
             }
         }

@@ -44,7 +44,11 @@ public final class CubeWatchManager {
                 retained.addAll(state.sent);
             }
         }
-        CubicWorldManager.evictExcept(world, retained);
+        // Cache eviction is maintenance, not simulation. Running the full cache
+        // walk every server tick creates avoidable allocation and CPU pressure.
+        if (world.getTime() % 20L == 0L) {
+            CubicWorldManager.evictExcept(world, retained);
+        }
         CubicWorldManager.tick(world);
 
         if (world.getTime() % 200L == 0L) {
@@ -87,9 +91,10 @@ public final class CubeWatchManager {
             rebuildQueue(player, state, world, center);
         }
 
-        int sent = 0;
-        while (sent < SENDS_PER_TICK && !state.pending.isEmpty()) {
+        int processed = 0;
+        while (processed < SENDS_PER_TICK && !state.pending.isEmpty()) {
             CubePos pos = state.pending.removeFirst();
+            processed++;
             if (!withinView(pos, state.center) || !isOutsideVanillaHeight(world, pos)
                     || state.sent.contains(pos)) {
                 continue;
@@ -103,9 +108,11 @@ public final class CubeWatchManager {
             byte[] payload = CubicWorldManager.cubePayload(world, pos);
             if (payload.length != 0 && CubeDataPayload.canEncode(payload)) {
                 ServerPlayNetworking.send(player, new CubeDataPayload(pos, payload));
-                state.sent.add(pos);
-                sent++;
             }
+            // Track empty positions too. They are implicit air and need no packet,
+            // but remembering them prevents rechecking the overlapping 3D view
+            // every time the player crosses a section boundary.
+            state.sent.add(pos);
         }
     }
 

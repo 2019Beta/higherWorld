@@ -16,13 +16,11 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.WorldSavePath;
-import net.minecraft.world.chunk.ChunkSection;
-import net.minecraft.world.chunk.WorldChunk;
 import org.devt.higherworld.Higherworld;
 import org.devt.higherworld.storage.CubePos;
 import org.devt.higherworld.storage.CubeStorage;
 
-/** Bridges vanilla's currently loaded chunk sections to the cubic persistence layer. */
+/** Owns sparse cube state outside the vanilla dimension height range. */
 public final class CubicWorldManager {
     private static final Map<ServerWorld, CubicWorldState> WORLDS = new ConcurrentHashMap<>();
 
@@ -56,44 +54,6 @@ public final class CubicWorldManager {
             state.close();
         } catch (IOException exception) {
             Higherworld.LOGGER.error("Cannot close cubic storage for {}", world.getRegistryKey().getValue(), exception);
-        }
-    }
-
-    public static void save(ServerWorld world, WorldChunk chunk) {
-        CubicWorldState state = WORLDS.get(world);
-        if (state == null) {
-            return;
-        }
-
-        ChunkSection[] sections = chunk.getSectionArray();
-        int bottomSectionY = Math.floorDiv(chunk.getBottomY(), CubePos.SIZE);
-        for (int index = 0; index < sections.length; index++) {
-            CubePos cubePos = CubePos.fromSection(chunk.getPos().x, bottomSectionY + index, chunk.getPos().z);
-            try {
-                state.attach(cubePos, sections[index]);
-                state.save(cubePos);
-            } catch (IOException | RuntimeException exception) {
-                Higherworld.LOGGER.error("Cannot save cube {} in {}", cubePos, world.getRegistryKey().getValue(), exception);
-            }
-        }
-    }
-
-    public static void restore(ServerWorld world, WorldChunk chunk) {
-        CubicWorldState state = WORLDS.get(world);
-        if (state == null) {
-            return;
-        }
-
-        ChunkSection[] sections = chunk.getSectionArray();
-        int bottomSectionY = Math.floorDiv(chunk.getBottomY(), CubePos.SIZE);
-        for (int index = 0; index < sections.length; index++) {
-            CubePos cubePos = CubePos.fromSection(chunk.getPos().x, bottomSectionY + index, chunk.getPos().z);
-            try {
-                state.attach(cubePos, sections[index]);
-            } catch (IOException | RuntimeException exception) {
-                Higherworld.LOGGER.error("Cannot restore cube {} in {}; vanilla data will be used", cubePos,
-                        world.getRegistryKey().getValue(), exception);
-            }
         }
     }
 

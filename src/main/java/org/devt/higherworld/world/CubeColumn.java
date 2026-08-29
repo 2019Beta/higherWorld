@@ -5,6 +5,7 @@ import java.util.List;
 import java.util.concurrent.ConcurrentNavigableMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.function.IntFunction;
+import java.util.function.Consumer;
 
 /**
  * Sparse, vertically ordered cube storage for one x/z column.
@@ -58,5 +59,10 @@ public final class CubeColumn<T> {
 
     public int size() {
         return cubes.size();
+    }
+
+    /** Iterates the weakly-consistent live view without allocating a snapshot. */
+    public void forEach(Consumer<? super T> action) {
+        cubes.values().forEach(action);
     }
 }

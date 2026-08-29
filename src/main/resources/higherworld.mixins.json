@@ -8,7 +8,6 @@
     "ChunkCacheMixin",
     "EntityMixin",
     "PacketByteBufMixin",
-    "ServerChunkLoadingManagerMixin",
     "ServerPlayNetworkHandlerMixin",
     "ServerWorldMixin",
     "WorldMixin"
