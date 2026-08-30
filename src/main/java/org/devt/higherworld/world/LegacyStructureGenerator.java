@@ -5,10 +5,10 @@ import net.minecraft.block.Blocks;
 import org.devt.higherworld.storage.CubePos;
 
 /** Deterministic, order-independent structure placement for sparse cubes. */
-final class InfiniteStructureGenerator {
+final class LegacyStructureGenerator {
     private static final BlockState AIR = Blocks.CAVE_AIR.getDefaultState();
 
-    private InfiniteStructureGenerator() {
+    private LegacyStructureGenerator() {
     }
 
     static void generate(long seed, LoadedCube cube, StructureGenerationSettings settings) {

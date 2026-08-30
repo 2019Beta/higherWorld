@@ -10,12 +10,13 @@ import net.minecraft.util.math.BlockPos;
 import net.minecraft.world.chunk.WorldChunk;
 import net.minecraft.world.gen.chunk.ChunkGeneratorSettings;
 import net.minecraft.world.gen.densityfunction.DensityFunction;
+import net.minecraft.world.gen.densityfunction.DensityFunctionTypes;
 import net.minecraft.world.gen.noise.NoiseConfig;
 import org.devt.higherworld.storage.CubePos;
 
 /** Lazily extends Overworld terrain below the vanilla generation band. */
 final class InfiniteDownwardGenerator {
-    static final int GENERATION_VERSION = 7;
+    static final int GENERATION_VERSION = 9;
     private static final BlockState AIR = Blocks.AIR.getDefaultState();
     private static final BlockState DEEPSLATE = Blocks.DEEPSLATE.getDefaultState();
     private static final int NOISE_CELL_SIZE = 4;
@@ -28,13 +29,16 @@ final class InfiniteDownwardGenerator {
     private static final int LEGACY_SURFACE_BAND_HEIGHT = 56;
     private static final int LEGACY_SURFACE_BLEND_HEIGHT = 12;
     private static final double[] NOISE_DELTAS = {0.0, 0.15625, 0.5, 0.84375};
-    private static final Map<ServerWorld, DensityFunction> CAVE_DENSITIES = new ConcurrentHashMap<>();
+    private static final Map<ServerWorld, DensityFunction> LEGACY_CAVE_DENSITIES = new ConcurrentHashMap<>();
+    private static final Map<ServerWorld, DensityFunction> EXTENDED_OVERWORLD_DENSITIES =
+            new ConcurrentHashMap<>();
 
     private InfiniteDownwardGenerator() {
     }
 
     static void release(ServerWorld world) {
-        CAVE_DENSITIES.remove(world);
+        LEGACY_CAVE_DENSITIES.remove(world);
+        EXTENDED_OVERWORLD_DENSITIES.remove(world);
     }
 
     static void generate(
@@ -43,20 +47,22 @@ final class InfiniteDownwardGenerator {
         int baseX = pos.minBlockX();
         int baseY = pos.minBlockY();
         int baseZ = pos.minBlockZ();
-        double[] density = createDensityGrid(world, baseX, baseY, baseZ);
-        BoundaryField boundary = createBoundaryField(world, baseX, baseY, baseZ);
+        DensityFunction density = extendedOverworldDensity(world);
 
         for (int localY = 0; localY < CubePos.SIZE; localY++) {
-            int y = baseY + localY;
+            int worldY = baseY + localY;
             for (int localZ = 0; localZ < CubePos.SIZE; localZ++) {
+                int worldZ = baseZ + localZ;
                 for (int localX = 0; localX < CubePos.SIZE; localX++) {
-                    if (!isCave(world, density, boundary, localX, localY, localZ, y)) {
+                    int worldX = baseX + localX;
+                    if (density.sample(new DensityFunction.UnblendedNoisePos(
+                            worldX, worldY, worldZ)) > 0.0) {
                         cube.setGeneratedBlockState(localX, localY, localZ, DEEPSLATE);
                     }
                 }
             }
         }
-        InfiniteStructureGenerator.generate(world.getSeed(), cube, structureSettings);
+        VanillaStructureGenerator.generate(world, cube, structureSettings);
         cube.setGenerationVersion(GENERATION_VERSION);
         cube.markDirty();
     }
@@ -65,6 +71,22 @@ final class InfiniteDownwardGenerator {
     static boolean upgradeLegacyTerrain(
             ServerWorld world, LoadedCube cube, StructureGenerationSettings structureSettings) {
         if (cube.generationVersion() >= GENERATION_VERSION) {
+            return false;
+        }
+        if (cube.generationVersion() == 8) {
+            cube.setGenerationVersion(GENERATION_VERSION);
+            cube.markDirty();
+            return false;
+        }
+        if (cube.generationVersion() == 7) {
+            if (cube.blockEntities().isEmpty()
+                    && matchesVersion7(world, cube, structureSettings)) {
+                clear(cube);
+                generate(world, cube, structureSettings);
+                return true;
+            }
+            cube.setGenerationVersion(GENERATION_VERSION);
+            cube.markDirty();
             return false;
         }
         if (cube.generationVersion() == 6) {
@@ -139,10 +161,49 @@ final class InfiniteDownwardGenerator {
         return true;
     }
 
+    private static boolean matchesVersion7(
+            ServerWorld world, LoadedCube cube, StructureGenerationSettings structureSettings) {
+        LoadedCube expected = new LoadedCube(
+                cube.pos(), new net.minecraft.world.chunk.ChunkSection(world.getPalettesFactory()));
+        generateVersion7(world, expected, structureSettings);
+        for (int y = 0; y < CubePos.SIZE; y++) {
+            for (int z = 0; z < CubePos.SIZE; z++) {
+                for (int x = 0; x < CubePos.SIZE; x++) {
+                    if (!cube.section().getBlockState(x, y, z)
+                            .equals(expected.section().getBlockState(x, y, z))) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    private static void generateVersion7(
+            ServerWorld world, LoadedCube cube, StructureGenerationSettings structureSettings) {
+        CubePos pos = cube.pos();
+        double[] density = createLegacyCaveDensityGrid(
+                world, pos.minBlockX(), pos.minBlockY(), pos.minBlockZ());
+        BoundaryField boundary = createBoundaryField(
+                world, pos.minBlockX(), pos.minBlockY(), pos.minBlockZ());
+        for (int localY = 0; localY < CubePos.SIZE; localY++) {
+            int worldY = pos.minBlockY() + localY;
+            for (int localZ = 0; localZ < CubePos.SIZE; localZ++) {
+                for (int localX = 0; localX < CubePos.SIZE; localX++) {
+                    if (!isVersion7Cave(world, density, boundary,
+                            localX, localY, localZ, worldY)) {
+                        cube.setGeneratedBlockState(localX, localY, localZ, DEEPSLATE);
+                    }
+                }
+            }
+        }
+        LegacyStructureGenerator.generate(world.getSeed(), cube, structureSettings);
+    }
+
     private static void generateVersion6(
             ServerWorld world, LoadedCube cube, StructureGenerationSettings structureSettings) {
         CubePos pos = cube.pos();
-        double[] density = createDensityGrid(
+        double[] density = createLegacyCaveDensityGrid(
                 world, pos.minBlockX(), pos.minBlockY(), pos.minBlockZ());
         boolean[] boundaryAir = createLegacyBoundaryMask(
                 world, pos.minBlockX(), pos.minBlockY(), pos.minBlockZ());
@@ -157,11 +218,12 @@ final class InfiniteDownwardGenerator {
                 }
             }
         }
-        InfiniteStructureGenerator.generateVersion6(world.getSeed(), cube, structureSettings);
+        LegacyStructureGenerator.generateVersion6(world.getSeed(), cube, structureSettings);
     }
 
-    private static double[] createDensityGrid(ServerWorld world, int baseX, int baseY, int baseZ) {
-        DensityFunction finalDensity = CAVE_DENSITIES.computeIfAbsent(world, ignored ->
+    private static double[] createLegacyCaveDensityGrid(
+            ServerWorld world, int baseX, int baseY, int baseZ) {
+        DensityFunction finalDensity = LEGACY_CAVE_DENSITIES.computeIfAbsent(world, ignored ->
                 NoiseConfig.create(world.getRegistryManager(), ChunkGeneratorSettings.CAVES, world.getSeed())
                         .getNoiseRouter().finalDensity());
         double[] density = new double[NOISE_GRID_SIZE * NOISE_GRID_SIZE * NOISE_GRID_SIZE];
@@ -236,7 +298,7 @@ final class InfiniteDownwardGenerator {
         return new BoundaryField(signedDensity);
     }
 
-    private static boolean isCave(
+    private static boolean isVersion7Cave(
             ServerWorld world, double[] density, BoundaryField boundary,
             int x, int y, int z, int worldY) {
         double generatedDensity = interpolateDensity(density, x, y, z);
@@ -508,11 +570,42 @@ final class InfiniteDownwardGenerator {
         return state.isAir() || !state.getFluidState().isEmpty();
     }
 
+    /** Replaces only the lower slide from vanilla overworld.json with a constant 1. */
+    private static final class BottomSlideRemover
+            implements DensityFunction.DensityFunctionVisitor {
+        @Override
+        public DensityFunction apply(DensityFunction function) {
+            if (!"YClampedGradient".equals(function.getClass().getSimpleName())) {
+                return function;
+            }
+            try {
+                int fromY = (int) accessor(function, "fromY");
+                int toY = (int) accessor(function, "toY");
+                double fromValue = (double) accessor(function, "fromValue");
+                double toValue = (double) accessor(function, "toValue");
+                if (fromY == -64 && toY == -40
+                        && fromValue == 0.0 && toValue == 1.0) {
+                    return DensityFunctionTypes.constant(1.0);
+                }
+                return function;
+            } catch (ReflectiveOperationException exception) {
+                throw new IllegalStateException("Cannot inspect vanilla bottom-slide density", exception);
+            }
+        }
+
+        private static Object accessor(DensityFunction function, String name)
+                throws ReflectiveOperationException {
+            java.lang.reflect.Method method = function.getClass().getDeclaredMethod(name);
+            method.setAccessible(true);
+            return method.invoke(function);
+        }
+    }
+
     private record BoundaryField(double[] density) {
     }
 
     static void openVanillaFloor(ServerWorld world, WorldChunk chunk) {
-        rewriteVanillaFloor(world, chunk, false);
+        rewriteVanillaFloor(world, chunk, true);
     }
 
     private static void migratePreviouslyReplacedFloor(ServerWorld world, CubePos pos) {
@@ -528,14 +621,26 @@ final class InfiniteDownwardGenerator {
         boolean changed = false;
         for (int localZ = 0; localZ < CubePos.SIZE; localZ++) {
             for (int localX = 0; localX < CubePos.SIZE; localX++) {
-                mutable.set(baseX + localX, bottomY + 5, baseZ + localZ);
-                boolean open = isOpenTerrain(chunk.getBlockState(mutable));
+                boolean allLegacyAir = true;
+                boolean allLegacyDeepslate = true;
+                for (int y = bottomY; y < bottomY + 5; y++) {
+                    mutable.set(baseX + localX, y, baseZ + localZ);
+                    BlockState state = chunk.getBlockState(mutable);
+                    allLegacyAir &= state.isAir();
+                    allLegacyDeepslate &= state.isOf(Blocks.DEEPSLATE);
+                }
                 for (int y = bottomY; y < bottomY + 5; y++) {
                     mutable.set(baseX + localX, y, baseZ + localZ);
                     BlockState current = chunk.getBlockState(mutable);
-                    if (current.isOf(Blocks.BEDROCK)
-                            || (replaceLegacyDeepslate && open && current.isOf(Blocks.DEEPSLATE))) {
-                        chunk.setBlockState(mutable, open ? AIR : DEEPSLATE, 0);
+                    if (current.isOf(Blocks.BEDROCK) || allLegacyAir
+                            || (replaceLegacyDeepslate && allLegacyDeepslate)) {
+                        BlockState generated = extendedOverworldDensity(world).sample(
+                                new DensityFunction.UnblendedNoisePos(
+                                        mutable.getX(), mutable.getY(), mutable.getZ())) < 0.0
+                                ? AIR : DEEPSLATE;
+                        if (!current.equals(generated)) {
+                            chunk.setBlockState(mutable, generated, 0);
+                        }
                         changed = true;
                     }
                 }
@@ -544,5 +649,11 @@ final class InfiniteDownwardGenerator {
         if (changed) {
             chunk.markNeedsSaving();
         }
+    }
+
+    private static DensityFunction extendedOverworldDensity(ServerWorld world) {
+        return EXTENDED_OVERWORLD_DENSITIES.computeIfAbsent(world, ignored ->
+                world.getChunkManager().getNoiseConfig().getNoiseRouter().finalDensity()
+                        .apply(new BottomSlideRemover()));
     }
 }
