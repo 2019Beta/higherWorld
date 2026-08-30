@@ -35,13 +35,20 @@ public final class CubicWorldManager {
     }
 
     public static void open(MinecraftServer server, ServerWorld world) {
-        Path root = server.getSavePath(WorldSavePath.ROOT)
-                .resolve("cubic_chunks")
+        Path cubicRoot = server.getSavePath(WorldSavePath.ROOT).resolve("cubic_chunks");
+        Path root = cubicRoot
                 .resolve(world.getRegistryKey().getValue().getNamespace())
                 .resolve(world.getRegistryKey().getValue().getPath())
                 .resolve("region3d");
         try {
-            CubicWorldState previous = WORLDS.put(world, new CubicWorldState(world, new CubeStorage(root)));
+            boolean infiniteDownward = generatesInfinitelyDownward(world);
+            StructureGenerationSettings structureSettings = infiniteDownward
+                    ? StructureGenerationSettings.load(cubicRoot, true)
+                    : StructureGenerationSettings.defaults();
+            boolean generateStructures = server.getSaveProperties()
+                    .getGeneratorOptions().shouldGenerateStructures();
+            CubicWorldState previous = WORLDS.put(world, new CubicWorldState(
+                    world, new CubeStorage(root), generateStructures, structureSettings));
             if (previous != null) {
                 previous.close();
             }
@@ -53,6 +60,7 @@ public final class CubicWorldManager {
 
     public static void close(MinecraftServer server, ServerWorld world) {
         CubeWatchManager.removeWorld(world);
+        InfiniteDownwardGenerator.release(world);
         CubicWorldState state = WORLDS.remove(world);
         if (state == null) {
             return;

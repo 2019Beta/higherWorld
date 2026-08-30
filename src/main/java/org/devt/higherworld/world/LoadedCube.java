@@ -20,6 +20,7 @@ final class LoadedCube {
     private final CubePos pos;
     private final ChunkSection section;
     private final AtomicBoolean dirty = new AtomicBoolean();
+    private int generationVersion;
     private final Map<BlockPos, BlockEntity> blockEntities = new ConcurrentHashMap<>();
 
     LoadedCube(CubePos pos, ChunkSection section) {
@@ -33,6 +34,14 @@ final class LoadedCube {
 
     ChunkSection section() {
         return section;
+    }
+
+    int generationVersion() {
+        return generationVersion;
+    }
+
+    void setGenerationVersion(int generationVersion) {
+        this.generationVersion = generationVersion;
     }
 
     BlockState getBlockState(BlockPos blockPos) {

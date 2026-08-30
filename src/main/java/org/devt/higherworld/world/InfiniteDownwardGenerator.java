@@ -1,56 +1,117 @@
 package org.devt.higherworld.world;
 
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.world.chunk.WorldChunk;
+import net.minecraft.world.gen.chunk.ChunkGeneratorSettings;
+import net.minecraft.world.gen.densityfunction.DensityFunction;
+import net.minecraft.world.gen.noise.NoiseConfig;
 import org.devt.higherworld.storage.CubePos;
 
 /** Lazily extends Overworld terrain below the vanilla generation band. */
 final class InfiniteDownwardGenerator {
+    static final int GENERATION_VERSION = 7;
     private static final BlockState AIR = Blocks.AIR.getDefaultState();
     private static final BlockState DEEPSLATE = Blocks.DEEPSLATE.getDefaultState();
     private static final int NOISE_CELL_SIZE = 4;
     private static final int NOISE_GRID_SIZE = CubePos.SIZE / NOISE_CELL_SIZE + 1;
-    private static final int VANILLA_TRANSITION_DEPTH = 32;
+    private static final int VANILLA_TRANSITION_DEPTH = 12;
+    private static final int LEGACY_V6_TRANSITION_DEPTH = 32;
+    private static final int BOUNDARY_DISTANCE_RADIUS = 4;
+    private static final int CAVE_NOISE_BAND_HEIGHT = 136;
+    private static final int CAVE_NOISE_BLEND_HEIGHT = 16;
+    private static final int LEGACY_SURFACE_BAND_HEIGHT = 56;
+    private static final int LEGACY_SURFACE_BLEND_HEIGHT = 12;
     private static final double[] NOISE_DELTAS = {0.0, 0.15625, 0.5, 0.84375};
+    private static final Map<ServerWorld, DensityFunction> CAVE_DENSITIES = new ConcurrentHashMap<>();
 
     private InfiniteDownwardGenerator() {
     }
 
-    static void generate(ServerWorld world, LoadedCube cube) {
+    static void release(ServerWorld world) {
+        CAVE_DENSITIES.remove(world);
+    }
+
+    static void generate(
+            ServerWorld world, LoadedCube cube, StructureGenerationSettings structureSettings) {
         CubePos pos = cube.pos();
         int baseX = pos.minBlockX();
         int baseY = pos.minBlockY();
         int baseZ = pos.minBlockZ();
-        long seed = world.getSeed();
-        double[] density = createDensityGrid(seed, baseX, baseY, baseZ);
-        boolean[] boundaryAir = createBoundaryMask(world, baseX, baseY, baseZ);
+        double[] density = createDensityGrid(world, baseX, baseY, baseZ);
+        BoundaryField boundary = createBoundaryField(world, baseX, baseY, baseZ);
 
         for (int localY = 0; localY < CubePos.SIZE; localY++) {
             int y = baseY + localY;
             for (int localZ = 0; localZ < CubePos.SIZE; localZ++) {
                 for (int localX = 0; localX < CubePos.SIZE; localX++) {
-                    if (!isCave(world, density, boundaryAir, localX, localY, localZ, y)) {
+                    if (!isCave(world, density, boundary, localX, localY, localZ, y)) {
                         cube.setGeneratedBlockState(localX, localY, localZ, DEEPSLATE);
                     }
                 }
             }
         }
+        InfiniteStructureGenerator.generate(world.getSeed(), cube, structureSettings);
+        cube.setGenerationVersion(GENERATION_VERSION);
         cube.markDirty();
     }
 
     /** Upgrades untouched cubes produced by either previous generator revision. */
-    static boolean upgradeLegacyTransition(ServerWorld world, LoadedCube cube) {
-        int bottomY = world.getBottomY();
-        int topY = cube.pos().minBlockY() + CubePos.SIZE - 1;
-        if (topY < bottomY - VANILLA_TRANSITION_DEPTH || !cube.blockEntities().isEmpty()) {
+    static boolean upgradeLegacyTerrain(
+            ServerWorld world, LoadedCube cube, StructureGenerationSettings structureSettings) {
+        if (cube.generationVersion() >= GENERATION_VERSION) {
             return false;
         }
-        if (!matchesLegacyGrid(world, cube) && !matchesLegacyPerBlock(world, cube)) {
+        if (cube.generationVersion() == 6) {
+            if (cube.blockEntities().isEmpty()
+                    && matchesVersion6(world, cube, structureSettings)) {
+                clear(cube);
+                generate(world, cube, structureSettings);
+                return true;
+            }
+            cube.setGenerationVersion(GENERATION_VERSION);
+            cube.markDirty();
             return false;
         }
+        // Version 5 cubes may contain player edits. Preserve them and let only
+        // newly generated cubes receive the newly introduced structures.
+        if (cube.generationVersion() == 5) {
+            cube.setGenerationVersion(GENERATION_VERSION);
+            cube.markDirty();
+            return false;
+        }
+        if (!cube.blockEntities().isEmpty()) {
+            cube.setGenerationVersion(GENERATION_VERSION);
+            cube.markDirty();
+            return false;
+        }
+        boolean untouched = cube.generationVersion() == 4
+                ? matchesSurfaceRouterTerrain(world, cube)
+                : matchesLegacyGrid(world, cube)
+                        || matchesPreviousTransition(world, cube)
+                        || matchesLegacyPerBlock(world, cube);
+        if (!untouched) {
+            // The cube contains player changes or unknown generator output. Keep
+            // its blocks unchanged, but persist the decision so later loads do not
+            // repeat the expensive legacy comparisons.
+            cube.setGenerationVersion(GENERATION_VERSION);
+            cube.markDirty();
+            return false;
+        }
+        if (cube.pos().y() == world.getBottomSectionCoord() - 1) {
+            migratePreviouslyReplacedFloor(world, cube.pos());
+        }
+        clear(cube);
+        generate(world, cube, structureSettings);
+        return true;
+    }
+
+    private static void clear(LoadedCube cube) {
         for (int y = 0; y < CubePos.SIZE; y++) {
             for (int z = 0; z < CubePos.SIZE; z++) {
                 for (int x = 0; x < CubePos.SIZE; x++) {
@@ -58,11 +119,69 @@ final class InfiniteDownwardGenerator {
                 }
             }
         }
-        generate(world, cube);
+    }
+
+    private static boolean matchesVersion6(
+            ServerWorld world, LoadedCube cube, StructureGenerationSettings structureSettings) {
+        LoadedCube expected = new LoadedCube(
+                cube.pos(), new net.minecraft.world.chunk.ChunkSection(world.getPalettesFactory()));
+        generateVersion6(world, expected, structureSettings);
+        for (int y = 0; y < CubePos.SIZE; y++) {
+            for (int z = 0; z < CubePos.SIZE; z++) {
+                for (int x = 0; x < CubePos.SIZE; x++) {
+                    if (!cube.section().getBlockState(x, y, z)
+                            .equals(expected.section().getBlockState(x, y, z))) {
+                        return false;
+                    }
+                }
+            }
+        }
         return true;
     }
 
-    private static double[] createDensityGrid(long seed, int baseX, int baseY, int baseZ) {
+    private static void generateVersion6(
+            ServerWorld world, LoadedCube cube, StructureGenerationSettings structureSettings) {
+        CubePos pos = cube.pos();
+        double[] density = createDensityGrid(
+                world, pos.minBlockX(), pos.minBlockY(), pos.minBlockZ());
+        boolean[] boundaryAir = createLegacyBoundaryMask(
+                world, pos.minBlockX(), pos.minBlockY(), pos.minBlockZ());
+        for (int localY = 0; localY < CubePos.SIZE; localY++) {
+            int worldY = pos.minBlockY() + localY;
+            for (int localZ = 0; localZ < CubePos.SIZE; localZ++) {
+                for (int localX = 0; localX < CubePos.SIZE; localX++) {
+                    if (!isVersion6Cave(world, density, boundaryAir,
+                            localX, localY, localZ, worldY)) {
+                        cube.setGeneratedBlockState(localX, localY, localZ, DEEPSLATE);
+                    }
+                }
+            }
+        }
+        InfiniteStructureGenerator.generateVersion6(world.getSeed(), cube, structureSettings);
+    }
+
+    private static double[] createDensityGrid(ServerWorld world, int baseX, int baseY, int baseZ) {
+        DensityFunction finalDensity = CAVE_DENSITIES.computeIfAbsent(world, ignored ->
+                NoiseConfig.create(world.getRegistryManager(), ChunkGeneratorSettings.CAVES, world.getSeed())
+                        .getNoiseRouter().finalDensity());
+        double[] density = new double[NOISE_GRID_SIZE * NOISE_GRID_SIZE * NOISE_GRID_SIZE];
+        for (int gridY = 0; gridY < NOISE_GRID_SIZE; gridY++) {
+            int y = baseY + gridY * NOISE_CELL_SIZE;
+            for (int gridZ = 0; gridZ < NOISE_GRID_SIZE; gridZ++) {
+                int z = baseZ + gridZ * NOISE_CELL_SIZE;
+                for (int gridX = 0; gridX < NOISE_GRID_SIZE; gridX++) {
+                    int x = baseX + gridX * NOISE_CELL_SIZE;
+                    // Positive values are cave scores; vanilla final density uses
+                    // the opposite sign (positive means a solid block).
+                    density[index(gridX, gridY, gridZ)] = -sampleCaveDensity(
+                            finalDensity, world.getSeed(), x, y, z);
+                }
+            }
+        }
+        return density;
+    }
+
+    private static double[] createLegacyDensityGrid(long seed, int baseX, int baseY, int baseZ) {
         double[] density = new double[NOISE_GRID_SIZE * NOISE_GRID_SIZE * NOISE_GRID_SIZE];
         for (int gridY = 0; gridY < NOISE_GRID_SIZE; gridY++) {
             int y = baseY + gridY * NOISE_CELL_SIZE;
@@ -80,45 +199,97 @@ final class InfiniteDownwardGenerator {
         return density;
     }
 
-    private static boolean[] createBoundaryMask(
+    private static BoundaryField createBoundaryField(
             ServerWorld world, int baseX, int baseY, int baseZ) {
         int bottomY = world.getBottomY();
         if (baseY + CubePos.SIZE - 1 < bottomY - VANILLA_TRANSITION_DEPTH) {
+            return null;
+        }
+        int radius = BOUNDARY_DISTANCE_RADIUS;
+        int sampleSize = CubePos.SIZE + radius * 2;
+        boolean[] samples = new boolean[sampleSize * sampleSize];
+        BlockPos.Mutable mutable = new BlockPos.Mutable();
+        for (int z = 0; z < sampleSize; z++) {
+            for (int x = 0; x < sampleSize; x++) {
+                mutable.set(baseX + x - radius, bottomY + 5, baseZ + z - radius);
+                samples[z * sampleSize + x] = isOpenTerrain(world.getBlockState(mutable));
+            }
+        }
+        double[] signedDensity = new double[CubePos.SIZE * CubePos.SIZE];
+        for (int localZ = 0; localZ < CubePos.SIZE; localZ++) {
+            for (int localX = 0; localX < CubePos.SIZE; localX++) {
+                int sampleX = localX + radius;
+                int sampleZ = localZ + radius;
+                boolean open = samples[sampleZ * sampleSize + sampleX];
+                double nearestOpposite = radius + 1.0;
+                for (int dz = -radius; dz <= radius; dz++) {
+                    for (int dx = -radius; dx <= radius; dx++) {
+                        if (samples[(sampleZ + dz) * sampleSize + sampleX + dx] != open) {
+                            nearestOpposite = Math.min(nearestOpposite, Math.sqrt(dx * dx + dz * dz));
+                        }
+                    }
+                }
+                double magnitude = 0.28 + Math.min(radius, nearestOpposite) * 0.12;
+                signedDensity[localZ * CubePos.SIZE + localX] = open ? magnitude : -magnitude;
+            }
+        }
+        return new BoundaryField(signedDensity);
+    }
+
+    private static boolean isCave(
+            ServerWorld world, double[] density, BoundaryField boundary,
+            int x, int y, int z, int worldY) {
+        double generatedDensity = interpolateDensity(density, x, y, z);
+        if (boundary == null) {
+            return generatedDensity > 0.0;
+        }
+
+        // Preserve the sign of the vanilla opening at the seam, but use its
+        // horizontal distance to the nearest wall as the strength. The weaker
+        // edge values and short blend prevent a two-cube-long vertical extrusion.
+        int depth = world.getBottomY() - worldY;
+        double transition = fade(Math.clamp((depth - 1.0) / (VANILLA_TRANSITION_DEPTH - 1.0), 0.0, 1.0));
+        double boundaryDensity = boundary.density[z * CubePos.SIZE + x];
+        return lerp(boundaryDensity, generatedDensity, transition) > 0.0;
+    }
+
+    private static boolean[] createLegacyBoundaryMask(
+            ServerWorld world, int baseX, int baseY, int baseZ) {
+        int bottomY = world.getBottomY();
+        if (baseY + CubePos.SIZE - 1 < bottomY - LEGACY_V6_TRANSITION_DEPTH) {
             return null;
         }
         boolean[] boundaryAir = new boolean[CubePos.SIZE * CubePos.SIZE];
         BlockPos.Mutable mutable = new BlockPos.Mutable();
         for (int localZ = 0; localZ < CubePos.SIZE; localZ++) {
             for (int localX = 0; localX < CubePos.SIZE; localX++) {
-                mutable.set(baseX + localX, bottomY, baseZ + localZ);
-                boundaryAir[localZ * CubePos.SIZE + localX] = world.getBlockState(mutable).isAir();
+                mutable.set(baseX + localX, bottomY + 5, baseZ + localZ);
+                boundaryAir[localZ * CubePos.SIZE + localX] =
+                        isOpenTerrain(world.getBlockState(mutable));
             }
         }
         return boundaryAir;
     }
 
-    private static boolean isCave(
+    private static boolean isVersion6Cave(
             ServerWorld world, double[] density, boolean[] boundaryAir,
             int x, int y, int z, int worldY) {
         double generatedDensity = interpolateDensity(density, x, y, z);
         if (boundaryAir == null) {
-            return generatedDensity > 0.69;
+            return generatedDensity > 0.0;
         }
-
-        // Match the exact air/solid state of the vanilla bottom at Y=-64, then
-        // fade into HigherWorld noise over two cubes. This removes the planar
-        // seam without forcing a new artificial solid band below the old floor.
         int depth = world.getBottomY() - worldY;
-        double transition = fade(Math.clamp((depth - 1.0) / (VANILLA_TRANSITION_DEPTH - 1.0), 0.0, 1.0));
-        double boundaryDensity = boundaryAir[z * CubePos.SIZE + x] ? 1.0 : 0.0;
-        return lerp(boundaryDensity, generatedDensity, transition) > 0.69;
+        double transition = fade(Math.clamp(
+                (depth - 1.0) / (LEGACY_V6_TRANSITION_DEPTH - 1.0), 0.0, 1.0));
+        double boundaryDensity = boundaryAir[z * CubePos.SIZE + x] ? 1.0 : -1.0;
+        return lerp(boundaryDensity, generatedDensity, transition) > 0.0;
     }
 
     private static boolean matchesLegacyGrid(ServerWorld world, LoadedCube cube) {
         int baseX = cube.pos().minBlockX();
         int baseY = cube.pos().minBlockY();
         int baseZ = cube.pos().minBlockZ();
-        double[] density = createDensityGrid(world.getSeed(), baseX, baseY, baseZ);
+        double[] density = createLegacyDensityGrid(world.getSeed(), baseX, baseY, baseZ);
         for (int y = 0; y < CubePos.SIZE; y++) {
             int worldY = baseY + y;
             for (int z = 0; z < CubePos.SIZE; z++) {
@@ -158,9 +329,118 @@ final class InfiniteDownwardGenerator {
         return true;
     }
 
+    private static boolean matchesPreviousTransition(ServerWorld world, LoadedCube cube) {
+        int baseX = cube.pos().minBlockX();
+        int baseY = cube.pos().minBlockY();
+        int baseZ = cube.pos().minBlockZ();
+        int bottomY = world.getBottomY();
+        if (baseY + CubePos.SIZE - 1 < bottomY - VANILLA_TRANSITION_DEPTH) {
+            return false;
+        }
+        double[] density = createLegacyDensityGrid(world.getSeed(), baseX, baseY, baseZ);
+        for (int y = 0; y < CubePos.SIZE; y++) {
+            int depth = bottomY - (baseY + y);
+            double transition = fade(Math.clamp(
+                    (depth - 1.0) / (VANILLA_TRANSITION_DEPTH - 1.0), 0.0, 1.0));
+            for (int z = 0; z < CubePos.SIZE; z++) {
+                for (int x = 0; x < CubePos.SIZE; x++) {
+                    // The previous implementation sampled the already-replaced
+                    // Y=-64 floor, which was solid in every column.
+                    boolean cave = lerp(0.0, interpolateDensity(density, x, y, z), transition) > 0.69;
+                    if (!matchesGeneratedState(cube, x, y, z, cave)) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    private static boolean matchesSurfaceRouterTerrain(ServerWorld world, LoadedCube cube) {
+        int baseX = cube.pos().minBlockX();
+        int baseY = cube.pos().minBlockY();
+        int baseZ = cube.pos().minBlockZ();
+        DensityFunction surfaceDensity = world.getChunkManager().getNoiseConfig()
+                .getNoiseRouter().finalDensity();
+        double[] density = new double[NOISE_GRID_SIZE * NOISE_GRID_SIZE * NOISE_GRID_SIZE];
+        for (int gridY = 0; gridY < NOISE_GRID_SIZE; gridY++) {
+            int worldY = baseY + gridY * NOISE_CELL_SIZE;
+            for (int gridZ = 0; gridZ < NOISE_GRID_SIZE; gridZ++) {
+                int worldZ = baseZ + gridZ * NOISE_CELL_SIZE;
+                for (int gridX = 0; gridX < NOISE_GRID_SIZE; gridX++) {
+                    int worldX = baseX + gridX * NOISE_CELL_SIZE;
+                    density[index(gridX, gridY, gridZ)] = -sampleBandedDensity(
+                            surfaceDensity, world.getSeed(), worldX, worldY, worldZ,
+                            LEGACY_SURFACE_BAND_HEIGHT, LEGACY_SURFACE_BLEND_HEIGHT);
+                }
+            }
+        }
+        boolean[] boundaryAir = createLegacyBoundaryMask(world, baseX, baseY, baseZ);
+        for (int y = 0; y < CubePos.SIZE; y++) {
+            int worldY = baseY + y;
+            for (int z = 0; z < CubePos.SIZE; z++) {
+                for (int x = 0; x < CubePos.SIZE; x++) {
+                    if (!matchesGeneratedState(
+                            cube, x, y, z,
+                            isVersion6Cave(world, density, boundaryAir, x, y, z, worldY))) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
     private static boolean matchesGeneratedState(LoadedCube cube, int x, int y, int z, boolean cave) {
         BlockState actual = cube.section().getBlockState(x, y, z);
-        return cave ? actual.isAir() : actual.isOf(Blocks.DEEPSLATE);
+        // Fluids can naturally flow from the vanilla band into a generated cave
+        // after first load. Treat them as the original air for migration so a
+        // lava cascade does not pin an entire obsolete terrain cube forever.
+        return cave ? actual.isAir() || !actual.getFluidState().isEmpty()
+                : actual.isOf(Blocks.DEEPSLATE);
+    }
+
+    private static double sampleCaveDensity(
+            DensityFunction density, long seed, int x, int y, int z) {
+        return sampleBandedDensity(
+                density, seed, x, y, z, CAVE_NOISE_BAND_HEIGHT, CAVE_NOISE_BLEND_HEIGHT);
+    }
+
+    private static double sampleBandedDensity(
+            DensityFunction density, long seed, int x, int y, int z,
+            int bandHeight, int blendHeight) {
+        long depth = Math.max(0L, -65L - y);
+        long band = Math.floorDiv(depth, bandHeight);
+        int localY = (int) Math.floorMod(depth, bandHeight);
+        double current = sampleNoiseBand(density, seed, band, x, -40 + localY, z);
+        if (band <= 0 || localY >= blendHeight) {
+            return current;
+        }
+
+        // Blend the beginning of each new, seed-shifted band with the continued
+        // end of the preceding band. No horizontal or vertical plane is created
+        // when the wrapped vanilla sampling Y returns from 15 to -40.
+        double previous = sampleNoiseBand(
+                density, seed, band - 1, x,
+                -40 + bandHeight + localY, z);
+        double delta = fade(localY / (double) blendHeight);
+        return lerp(previous, current, delta);
+    }
+
+    private static double sampleNoiseBand(
+            DensityFunction density, long seed, long band, int x, int sampleY, int z) {
+        int offsetX = band == 0 ? 0 : bandOffset(seed, band, 0x632BE59BD9B4E019L);
+        int offsetZ = band == 0 ? 0 : bandOffset(seed, band, 0x85157AF5D66D3E27L);
+        return density.sample(new DensityFunction.UnblendedNoisePos(
+                x + offsetX, sampleY, z + offsetZ));
+    }
+
+    private static int bandOffset(long seed, long band, long salt) {
+        long value = seed ^ band * 0x9E3779B97F4A7C15L ^ salt;
+        value = (value ^ value >>> 30) * 0xBF58476D1CE4E5B9L;
+        value = (value ^ value >>> 27) * 0x94D049BB133111EBL;
+        value ^= value >>> 31;
+        return (int) Math.floorMod(value, 2_000_001L) - 1_000_000;
     }
 
     private static double interpolateDensity(double[] density, int x, int y, int z) {
@@ -224,7 +504,23 @@ final class InfiniteDownwardGenerator {
         return a + (b - a) * delta;
     }
 
+    private static boolean isOpenTerrain(BlockState state) {
+        return state.isAir() || !state.getFluidState().isEmpty();
+    }
+
+    private record BoundaryField(double[] density) {
+    }
+
     static void openVanillaFloor(ServerWorld world, WorldChunk chunk) {
+        rewriteVanillaFloor(world, chunk, false);
+    }
+
+    private static void migratePreviouslyReplacedFloor(ServerWorld world, CubePos pos) {
+        rewriteVanillaFloor(world, world.getChunk(pos.x(), pos.z()), true);
+    }
+
+    private static void rewriteVanillaFloor(
+            ServerWorld world, WorldChunk chunk, boolean replaceLegacyDeepslate) {
         int bottomY = world.getBottomY();
         int baseX = chunk.getPos().getStartX();
         int baseZ = chunk.getPos().getStartZ();
@@ -232,10 +528,14 @@ final class InfiniteDownwardGenerator {
         boolean changed = false;
         for (int localZ = 0; localZ < CubePos.SIZE; localZ++) {
             for (int localX = 0; localX < CubePos.SIZE; localX++) {
+                mutable.set(baseX + localX, bottomY + 5, baseZ + localZ);
+                boolean open = isOpenTerrain(chunk.getBlockState(mutable));
                 for (int y = bottomY; y < bottomY + 5; y++) {
                     mutable.set(baseX + localX, y, baseZ + localZ);
-                    if (chunk.getBlockState(mutable).isOf(Blocks.BEDROCK)) {
-                        chunk.setBlockState(mutable, DEEPSLATE, 0);
+                    BlockState current = chunk.getBlockState(mutable);
+                    if (current.isOf(Blocks.BEDROCK)
+                            || (replaceLegacyDeepslate && open && current.isOf(Blocks.DEEPSLATE))) {
+                        chunk.setBlockState(mutable, open ? AIR : DEEPSLATE, 0);
                         changed = true;
                     }
                 }

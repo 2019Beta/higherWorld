@@ -18,7 +18,8 @@ import net.minecraft.world.chunk.ChunkSection;
 
 /** Versioned cube payload containing palettes plus block entities. */
 public final class CubeRecordCodec {
-    private static final int MAGIC = 0x48574332; // HWC2
+    private static final int MAGIC_V2 = 0x48574332; // HWC2
+    private static final int MAGIC_V3 = 0x48574333; // HWC3, includes generator version
     private static final int MAX_SECTION_BYTES = 2 * 1024 * 1024;
     private static final int MAX_BLOCK_ENTITIES = 4096;
 
@@ -29,7 +30,8 @@ public final class CubeRecordCodec {
         byte[] sectionPayload = ChunkSectionCodec.encode(cube.section());
         ByteArrayOutputStream bytes = new ByteArrayOutputStream(sectionPayload.length + 128);
         try (DataOutputStream output = new DataOutputStream(bytes)) {
-            output.writeInt(MAGIC);
+            output.writeInt(MAGIC_V3);
+            output.writeInt(cube.generationVersion());
             output.writeInt(sectionPayload.length);
             output.write(sectionPayload);
             output.writeInt(cube.blockEntities().size());
@@ -41,13 +43,17 @@ public final class CubeRecordCodec {
     }
 
     public static List<BlockEntity> decode(byte[] payload, ChunkSection section, World world) throws IOException {
-        if (payload.length < Integer.BYTES || readMagic(payload) != MAGIC) {
+        int magic = payload.length < Integer.BYTES ? 0 : readMagic(payload);
+        if (magic != MAGIC_V2 && magic != MAGIC_V3) {
             ChunkSectionCodec.decodeInto(payload, section);
             return List.of();
         }
 
         try (DataInputStream input = new DataInputStream(new ByteArrayInputStream(payload))) {
             input.readInt();
+            if (magic == MAGIC_V3) {
+                input.readInt();
+            }
             int sectionLength = input.readInt();
             if (sectionLength < 0 || sectionLength > MAX_SECTION_BYTES || sectionLength > input.available()) {
                 throw new IOException("Invalid cube section payload length: " + sectionLength);
@@ -75,6 +81,14 @@ public final class CubeRecordCodec {
             }
             return blockEntities;
         }
+    }
+
+    static int generationVersion(byte[] payload) {
+        if (payload.length < Integer.BYTES * 2 || readMagic(payload) != MAGIC_V3) {
+            return 0;
+        }
+        return (payload[4] & 0xFF) << 24 | (payload[5] & 0xFF) << 16
+                | (payload[6] & 0xFF) << 8 | payload[7] & 0xFF;
     }
 
     private static int readMagic(byte[] payload) {

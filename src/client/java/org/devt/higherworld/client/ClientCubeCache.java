@@ -129,10 +129,11 @@ public final class ClientCubeCache {
         int localX = local(blockX);
         int localZ = local(blockZ);
         Integer highest = null;
-        for (ChunkSection section : column.loaded()) {
+        for (Map.Entry<Integer, ChunkSection> entry : column.entries()) {
+            int sectionY = entry.getKey();
+            ChunkSection section = entry.getValue();
             for (int localY = CubePos.SIZE - 1; localY >= 0; localY--) {
                 if (!section.getBlockState(localX, localY, localZ).isAir()) {
-                    int sectionY = findSectionY(column, section);
                     int y = Math.addExact(Math.multiplyExact(sectionY, CubePos.SIZE), localY);
                     highest = highest == null ? y : Math.max(highest, y);
                     break;
@@ -140,15 +141,6 @@ public final class ClientCubeCache {
             }
         }
         return highest;
-    }
-
-    private static int findSectionY(CubeColumn<ChunkSection> column, ChunkSection target) {
-        for (int sectionY : column.sectionCoordinates()) {
-            if (column.get(sectionY) == target) {
-                return sectionY;
-            }
-        }
-        throw new IllegalStateException("Detached cube section");
     }
 
     private static ChunkSection section(ClientWorld world, CubePos pos) {

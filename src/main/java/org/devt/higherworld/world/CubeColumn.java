@@ -2,6 +2,7 @@ package org.devt.higherworld.world;
 
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ConcurrentNavigableMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.function.IntFunction;
@@ -47,6 +48,19 @@ public final class CubeColumn<T> {
     /** Returns a stable snapshot of every currently loaded cube. */
     public Collection<T> loaded() {
         return List.copyOf(cubes.values());
+    }
+
+    /**
+     * Returns a stable snapshot of cube coordinates and values.
+     *
+     * <p>Keeping each coordinate paired with its value is important for readers
+     * that run concurrently with cube unloads. Taking separate snapshots of the
+     * keys and values can otherwise leave a value with no discoverable key.</p>
+     */
+    public List<Map.Entry<Integer, T>> entries() {
+        return cubes.entrySet().stream()
+                .map(entry -> Map.entry(entry.getKey(), entry.getValue()))
+                .toList();
     }
 
     public Collection<Integer> sectionCoordinates() {

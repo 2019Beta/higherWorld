@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import java.util.List;
+import java.util.Map;
 import org.junit.jupiter.api.Test;
 
 class CubeColumnTest {
@@ -37,5 +38,17 @@ class CubeColumnTest {
         CubeColumn<Object> column = new CubeColumn<>();
         column.put(7, new Object());
         assertThrows(IllegalArgumentException.class, () -> column.put(7, new Object()));
+    }
+
+    @Test
+    void entrySnapshotKeepsCoordinatesAttachedAfterUnload() {
+        CubeColumn<String> column = new CubeColumn<>();
+        column.put(-11, "section");
+
+        List<Map.Entry<Integer, String>> snapshot = column.entries();
+        column.remove(-11);
+
+        assertEquals(List.of(Map.entry(-11, "section")), snapshot);
+        assertNull(column.get(-11));
     }
 }

@@ -26,13 +26,19 @@ final class CubicWorldState implements AutoCloseable {
     private final ServerWorld world;
     private final CubeStorage storage;
     private final boolean generateInfinitelyDownward;
+    private final boolean generateStructures;
+    private final StructureGenerationSettings structureSettings;
     private final ConcurrentMap<ColumnPos, CubeColumn<LoadedCube>> columns = new ConcurrentHashMap<>();
     private final ConcurrentMap<BlockColumnPos, Integer> highestBlocks = new ConcurrentHashMap<>();
 
-    CubicWorldState(ServerWorld world, CubeStorage storage) {
+    CubicWorldState(
+            ServerWorld world, CubeStorage storage, boolean generateStructures,
+            StructureGenerationSettings structureSettings) {
         this.world = world;
         this.storage = storage;
         this.generateInfinitelyDownward = CubicWorldManager.generatesInfinitelyDownward(world);
+        this.generateStructures = generateStructures;
+        this.structureSettings = structureSettings;
     }
 
     BlockState getBlockState(BlockPos pos) throws IOException {
@@ -207,14 +213,16 @@ final class CubicWorldState implements AutoCloseable {
         ChunkSection section = new ChunkSection(world.getPalettesFactory());
         LoadedCube cube = new LoadedCube(pos, section);
         if (payload != null) {
+            cube.setGenerationVersion(CubeRecordCodec.generationVersion(payload));
             for (BlockEntity blockEntity : CubeRecordCodec.decode(payload, section, world)) {
                 cube.putLoadedBlockEntity(blockEntity);
             }
-            if (shouldGenerate(pos) && InfiniteDownwardGenerator.upgradeLegacyTransition(world, cube)) {
-                Higherworld.LOGGER.debug("Upgraded untouched terrain transition cube {}", pos);
+            if (shouldGenerate(pos) && InfiniteDownwardGenerator.upgradeLegacyTerrain(
+                    world, cube, effectiveStructureSettings())) {
+                Higherworld.LOGGER.debug("Upgraded untouched generated terrain cube {}", pos);
             }
         } else if (shouldGenerate(pos)) {
-            InfiniteDownwardGenerator.generate(world, cube);
+            InfiniteDownwardGenerator.generate(world, cube, effectiveStructureSettings());
         }
         indexHeights(cube);
         return cube;
@@ -222,6 +230,10 @@ final class CubicWorldState implements AutoCloseable {
 
     private boolean shouldGenerate(CubePos pos) {
         return generateInfinitelyDownward && pos.y() < world.getBottomSectionCoord();
+    }
+
+    private StructureGenerationSettings effectiveStructureSettings() {
+        return generateStructures ? structureSettings : StructureGenerationSettings.none();
     }
 
     private void indexHeights(LoadedCube cube) {

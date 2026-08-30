@@ -8,6 +8,8 @@
     "ChunkRenderingDataPreparerMixin",
     "ChunkRendererRegionMixin",
     "ClientWorldMixin",
+    "CreateWorldScreenMixin",
+    "CreateWorldWorldTabMixin",
     "RenderableChunksMixin",
     "RenderedChunkMixin"
   ],

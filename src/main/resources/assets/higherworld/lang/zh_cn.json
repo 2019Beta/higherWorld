@@ -1,3 +1,15 @@
 {
-  "generator.higherworld.infinite_downward": "无限向下"
+  "generator.higherworld.infinite_downward": "无限向下",
+  "button.higherworld.structure_settings": "生成结构设置...",
+  "button.higherworld.structure_settings.tooltip": "选择可在 Y=-64 以下生成的结构",
+  "screen.higherworld.structures.title": "地下结构生成设置",
+  "screen.higherworld.structures.description": "勾选允许在 Y=-64 以下生成的结构",
+  "structure.higherworld.mineshaft": "废弃矿井",
+  "structure.higherworld.mineshaft.description": "生成木制矿道、支柱和横梁",
+  "structure.higherworld.stronghold": "要塞",
+  "structure.higherworld.stronghold.description": "生成石砖房间和交叉通道",
+  "structure.higherworld.ancient_city": "远古城市",
+  "structure.higherworld.ancient_city.description": "生成深板岩、幽匿方块和城市遗迹",
+  "structure.higherworld.trial_chambers": "试炼密室",
+  "structure.higherworld.trial_chambers.description": "生成凝灰岩与铜质密室"
 }

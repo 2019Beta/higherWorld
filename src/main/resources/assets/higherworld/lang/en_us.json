@@ -1,3 +1,15 @@
 {
-  "generator.higherworld.infinite_downward": "Infinite Downward"
+  "generator.higherworld.infinite_downward": "Infinite Downward",
+  "button.higherworld.structure_settings": "Structure Generation Settings...",
+  "button.higherworld.structure_settings.tooltip": "Choose structures that may generate below Y=-64",
+  "screen.higherworld.structures.title": "Underground Structure Generation",
+  "screen.higherworld.structures.description": "Select structures allowed to generate below Y=-64",
+  "structure.higherworld.mineshaft": "Mineshaft",
+  "structure.higherworld.mineshaft.description": "Generates wooden tunnels, supports, and beams",
+  "structure.higherworld.stronghold": "Stronghold",
+  "structure.higherworld.stronghold.description": "Generates stone-brick rooms and crossing corridors",
+  "structure.higherworld.ancient_city": "Ancient City",
+  "structure.higherworld.ancient_city.description": "Generates deepslate, sculk, and city ruins",
+  "structure.higherworld.trial_chambers": "Trial Chambers",
+  "structure.higherworld.trial_chambers.description": "Generates tuff-and-copper chambers"
 }
