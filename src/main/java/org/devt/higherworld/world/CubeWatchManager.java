@@ -20,9 +20,8 @@ import org.devt.higherworld.storage.CubePos;
 
 /** Maintains a bounded three-dimensional cube view around every player. */
 public final class CubeWatchManager {
-    private static final int HORIZONTAL_RADIUS = 4;
     private static final int VERTICAL_RADIUS = 4;
-    private static final int SENDS_PER_TICK = 32;
+    private static final int SENDS_PER_TICK = 64;
     private static final Map<UUID, WatchState> WATCHERS = new HashMap<>();
 
     private CubeWatchManager() {
@@ -87,15 +86,18 @@ public final class CubeWatchManager {
         ServerWorld world = player.getEntityWorld();
         CubePos center = CubePos.fromBlock(
                 player.getBlockX(), player.getBlockY(), player.getBlockZ());
-        if (state.world != world || !center.equals(state.center)) {
-            rebuildQueue(player, state, world, center);
+        int horizontalRadius = player.getViewDistance();
+        if (state.world != world || !center.equals(state.center)
+                || state.horizontalRadius != horizontalRadius) {
+            rebuildQueue(player, state, world, center, horizontalRadius);
         }
 
         int processed = 0;
         while (processed < SENDS_PER_TICK && !state.pending.isEmpty()) {
             CubePos pos = state.pending.removeFirst();
             processed++;
-            if (!withinView(pos, state.center) || !isOutsideVanillaHeight(world, pos)
+            if (!withinView(pos, state.center, state.horizontalRadius)
+                    || !isOutsideVanillaHeight(world, pos)
                     || state.sent.contains(pos)) {
                 continue;
             }
@@ -117,17 +119,19 @@ public final class CubeWatchManager {
     }
 
     private static void rebuildQueue(
-            ServerPlayerEntity player, WatchState state, ServerWorld world, CubePos center) {
+            ServerPlayerEntity player, WatchState state, ServerWorld world, CubePos center,
+            int horizontalRadius) {
         if (state.world != null && state.world != world) {
             unloadAll(player, state);
         }
         state.world = world;
         state.center = center;
+        state.horizontalRadius = horizontalRadius;
 
         Iterator<CubePos> iterator = state.sent.iterator();
         while (iterator.hasNext()) {
             CubePos pos = iterator.next();
-            if (!withinView(pos, center)) {
+            if (!withinView(pos, center, horizontalRadius)) {
                 if (ServerPlayNetworking.canSend(player, CubeUnloadPayload.ID)) {
                     ServerPlayNetworking.send(player, new CubeUnloadPayload(pos));
                 }
@@ -138,8 +142,8 @@ public final class CubeWatchManager {
         state.pending.clear();
         ArrayList<CubePos> pending = new ArrayList<>();
         for (int dy = -VERTICAL_RADIUS; dy <= VERTICAL_RADIUS; dy++) {
-            for (int dz = -HORIZONTAL_RADIUS; dz <= HORIZONTAL_RADIUS; dz++) {
-                for (int dx = -HORIZONTAL_RADIUS; dx <= HORIZONTAL_RADIUS; dx++) {
+            for (int dz = -horizontalRadius; dz <= horizontalRadius; dz++) {
+                for (int dx = -horizontalRadius; dx <= horizontalRadius; dx++) {
                     CubePos pos = new CubePos(center.x() + dx, center.y() + dy, center.z() + dz);
                     if (pos.isBlockRangeRepresentable() && isOutsideVanillaHeight(world, pos)
                             && !state.sent.contains(pos)) {
@@ -162,10 +166,10 @@ public final class CubeWatchManager {
         state.pending.clear();
     }
 
-    private static boolean withinView(CubePos pos, CubePos center) {
-        return Math.abs(pos.x() - center.x()) <= HORIZONTAL_RADIUS
+    private static boolean withinView(CubePos pos, CubePos center, int horizontalRadius) {
+        return Math.abs(pos.x() - center.x()) <= horizontalRadius
                 && Math.abs(pos.y() - center.y()) <= VERTICAL_RADIUS
-                && Math.abs(pos.z() - center.z()) <= HORIZONTAL_RADIUS;
+                && Math.abs(pos.z() - center.z()) <= horizontalRadius;
     }
 
     private static int squaredDistance(CubePos pos, CubePos center) {
@@ -177,7 +181,7 @@ public final class CubeWatchManager {
 
     private static boolean watches(ServerPlayerEntity player, CubePos pos) {
         CubePos center = CubePos.fromBlock(player.getBlockX(), player.getBlockY(), player.getBlockZ());
-        return withinView(pos, center);
+        return withinView(pos, center, player.getViewDistance());
     }
 
     private static boolean isOutsideVanillaHeight(ServerWorld world, CubePos pos) {
@@ -187,6 +191,7 @@ public final class CubeWatchManager {
     private static final class WatchState {
         private ServerWorld world;
         private CubePos center;
+        private int horizontalRadius;
         private final Set<CubePos> sent = new HashSet<>();
         private final ArrayDeque<CubePos> pending = new ArrayDeque<>();
     }

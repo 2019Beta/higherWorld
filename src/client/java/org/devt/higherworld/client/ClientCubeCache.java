@@ -44,7 +44,7 @@ public final class ClientCubeCache {
         for (BlockEntity blockEntity : blockEntities) {
             BLOCK_ENTITIES.put(blockEntity.getPos().toImmutable(), blockEntity);
         }
-        scheduleRender(pos);
+        scheduleRenderNeighborhood(pos);
     }
 
     public static void unload(ClientWorld world, CubePos pos) {
@@ -58,7 +58,7 @@ public final class ClientCubeCache {
             }
         }
         removeBlockEntities(pos);
-        scheduleRender(pos);
+        scheduleRenderNeighborhood(pos);
     }
 
     public static BlockState getBlockState(ClientWorld world, BlockPos pos) {
@@ -81,7 +81,7 @@ public final class ClientCubeCache {
         ChunkSection section = column.getOrCreate(cubePos.y(), ignored -> new ChunkSection(world.getPalettesFactory()));
         BlockState previous = section.setBlockState(local(pos.getX()), local(pos.getY()), local(pos.getZ()), state);
         if (previous != state) {
-            scheduleRender(cubePos);
+            scheduleRenderNeighborhood(cubePos);
             return true;
         }
         return false;
@@ -169,10 +169,21 @@ public final class ClientCubeCache {
         }
     }
 
-    private static void scheduleRender(CubePos pos) {
+    /**
+     * A cube mesh owns the faces on its six boundaries. When a neighboring cube
+     * appears or disappears, rebuilding only the changed cube leaves the old
+     * neighbor's full boundary face in the scene as a visible 16-block sheet.
+     */
+    private static void scheduleRenderNeighborhood(CubePos pos) {
         MinecraftClient client = MinecraftClient.getInstance();
         if (client.worldRenderer != null) {
             client.worldRenderer.scheduleChunkRender(pos.x(), pos.y(), pos.z());
+            client.worldRenderer.scheduleChunkRender(pos.x() - 1, pos.y(), pos.z());
+            client.worldRenderer.scheduleChunkRender(pos.x() + 1, pos.y(), pos.z());
+            client.worldRenderer.scheduleChunkRender(pos.x(), pos.y() - 1, pos.z());
+            client.worldRenderer.scheduleChunkRender(pos.x(), pos.y() + 1, pos.z());
+            client.worldRenderer.scheduleChunkRender(pos.x(), pos.y(), pos.z() - 1);
+            client.worldRenderer.scheduleChunkRender(pos.x(), pos.y(), pos.z() + 1);
             client.worldRenderer.scheduleTerrainUpdate();
         }
     }

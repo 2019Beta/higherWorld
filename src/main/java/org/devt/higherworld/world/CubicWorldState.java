@@ -16,6 +16,7 @@ import net.minecraft.server.world.ServerWorld;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.world.chunk.ChunkSection;
 import net.minecraft.world.rule.GameRules;
+import org.devt.higherworld.Higherworld;
 import org.devt.higherworld.storage.CubePos;
 import org.devt.higherworld.storage.CubeStorage;
 
@@ -24,12 +25,14 @@ final class CubicWorldState implements AutoCloseable {
     private static final byte[] EMPTY_PAYLOAD = new byte[0];
     private final ServerWorld world;
     private final CubeStorage storage;
+    private final boolean generateInfinitelyDownward;
     private final ConcurrentMap<ColumnPos, CubeColumn<LoadedCube>> columns = new ConcurrentHashMap<>();
     private final ConcurrentMap<BlockColumnPos, Integer> highestBlocks = new ConcurrentHashMap<>();
 
     CubicWorldState(ServerWorld world, CubeStorage storage) {
         this.world = world;
         this.storage = storage;
+        this.generateInfinitelyDownward = CubicWorldManager.generatesInfinitelyDownward(world);
     }
 
     BlockState getBlockState(BlockPos pos) throws IOException {
@@ -102,11 +105,24 @@ final class CubicWorldState implements AutoCloseable {
             return CubeRecordCodec.encode(loaded, world);
         }
 
-        // A missing sparse cube is implicitly air. Do not instantiate, index and
-        // encode thousands of empty sections merely because a player can see them.
+        // A missing sparse cube is implicitly air unless this world's selected
+        // preset asks HigherWorld to lazily generate the terrain below it.
         Optional<byte[]> stored = storage.read(pos);
         if (stored.isEmpty()) {
-            return EMPTY_PAYLOAD;
+            if (!shouldGenerate(pos)) {
+                return EMPTY_PAYLOAD;
+            }
+            // We already know storage has no record. Construct directly instead
+            // of making cube(pos) perform the same disk lookup a second time.
+            CubeColumn<LoadedCube> targetColumn = columns.computeIfAbsent(
+                    new ColumnPos(pos.x(), pos.z()), ignored -> new CubeColumn<>());
+            LoadedCube generated = load(pos, null);
+            try {
+                targetColumn.put(pos.y(), generated);
+                return CubeRecordCodec.encode(generated, world);
+            } catch (IllegalArgumentException raced) {
+                return CubeRecordCodec.encode(targetColumn.get(pos.y()), world);
+            }
         }
 
         // Real stored cubes still enter the runtime so their block entities and
@@ -116,7 +132,7 @@ final class CubicWorldState implements AutoCloseable {
         LoadedCube created = load(pos, stored.get());
         try {
             targetColumn.put(pos.y(), created);
-            return stored.get();
+            return created.isDirty() ? CubeRecordCodec.encode(created, world) : stored.get();
         } catch (IllegalArgumentException raced) {
             return CubeRecordCodec.encode(targetColumn.get(pos.y()), world);
         }
@@ -194,9 +210,18 @@ final class CubicWorldState implements AutoCloseable {
             for (BlockEntity blockEntity : CubeRecordCodec.decode(payload, section, world)) {
                 cube.putLoadedBlockEntity(blockEntity);
             }
+            if (shouldGenerate(pos) && InfiniteDownwardGenerator.upgradeLegacyTransition(world, cube)) {
+                Higherworld.LOGGER.debug("Upgraded untouched terrain transition cube {}", pos);
+            }
+        } else if (shouldGenerate(pos)) {
+            InfiniteDownwardGenerator.generate(world, cube);
         }
         indexHeights(cube);
         return cube;
+    }
+
+    private boolean shouldGenerate(CubePos pos) {
+        return generateInfinitelyDownward && pos.y() < world.getBottomSectionCoord();
     }
 
     private void indexHeights(LoadedCube cube) {

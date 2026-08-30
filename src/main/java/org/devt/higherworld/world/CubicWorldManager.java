@@ -16,12 +16,19 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.WorldSavePath;
+import net.minecraft.registry.RegistryKey;
+import net.minecraft.registry.RegistryKeys;
+import net.minecraft.util.Identifier;
+import net.minecraft.world.dimension.DimensionType;
+import net.minecraft.world.chunk.WorldChunk;
 import org.devt.higherworld.Higherworld;
 import org.devt.higherworld.storage.CubePos;
 import org.devt.higherworld.storage.CubeStorage;
 
 /** Owns sparse cube state outside the vanilla dimension height range. */
 public final class CubicWorldManager {
+    private static final RegistryKey<DimensionType> INFINITE_OVERWORLD = RegistryKey.of(
+            RegistryKeys.DIMENSION_TYPE, Identifier.of(Higherworld.MOD_ID, "infinite_overworld"));
     private static final Map<ServerWorld, CubicWorldState> WORLDS = new ConcurrentHashMap<>();
 
     private CubicWorldManager() {
@@ -59,6 +66,17 @@ public final class CubicWorldManager {
 
     public static boolean isCubic(ServerWorld world) {
         return WORLDS.containsKey(world);
+    }
+
+    static boolean generatesInfinitelyDownward(ServerWorld world) {
+        return world.getDimensionEntry().matchesKey(INFINITE_OVERWORLD);
+    }
+
+    /** Removes the obsolete vanilla floor for both new and already-created chunks. */
+    public static void onChunkLoad(ServerWorld world, WorldChunk chunk) {
+        if (generatesInfinitelyDownward(world)) {
+            InfiniteDownwardGenerator.openVanillaFloor(world, chunk);
+        }
     }
 
     /** Reads through the sparse cube cache without packing Y into a vanilla long key. */

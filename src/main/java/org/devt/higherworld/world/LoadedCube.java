@@ -52,12 +52,20 @@ final class LoadedCube {
         return previous;
     }
 
+    void setGeneratedBlockState(int localX, int localY, int localZ, BlockState state) {
+        section.setBlockState(localX, localY, localZ, state);
+    }
+
     void markDirty() {
         dirty.set(true);
     }
 
     boolean takeDirty() {
         return dirty.getAndSet(false);
+    }
+
+    boolean isDirty() {
+        return dirty.get();
     }
 
     void restoreDirty() {
