@@ -21,7 +21,9 @@ import org.devt.higherworld.storage.CubePos;
 /** Maintains a bounded three-dimensional cube view around every player. */
 public final class CubeWatchManager {
     private static final int VERTICAL_RADIUS = 4;
-    private static final int SENDS_PER_TICK = 64;
+    // Cube creation runs vanilla noise and biome decoration. A small per-player
+    // budget keeps initial view streaming from monopolizing the server thread.
+    private static final int SENDS_PER_TICK = 2;
     private static final Map<UUID, WatchState> WATCHERS = new HashMap<>();
 
     private CubeWatchManager() {
@@ -37,15 +39,15 @@ public final class CubeWatchManager {
         WATCHERS.entrySet().removeIf(entry -> !present.contains(entry.getKey())
                 && entry.getValue().world == world);
 
-        Set<CubePos> retained = new HashSet<>();
-        for (WatchState state : WATCHERS.values()) {
-            if (state.world == world) {
-                retained.addAll(state.sent);
-            }
-        }
         // Cache eviction is maintenance, not simulation. Running the full cache
         // walk every server tick creates avoidable allocation and CPU pressure.
         if (world.getTime() % 20L == 0L) {
+            Set<CubePos> retained = new HashSet<>();
+            for (WatchState state : WATCHERS.values()) {
+                if (state.world == world) {
+                    retained.addAll(state.sent);
+                }
+            }
             CubicWorldManager.evictExcept(world, retained);
         }
         CubicWorldManager.tick(world);

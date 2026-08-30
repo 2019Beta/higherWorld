@@ -1,6 +1,7 @@
 package org.devt.higherworld.world;
 
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 import net.minecraft.block.BlockState;
@@ -16,7 +17,7 @@ import org.devt.higherworld.storage.CubePos;
 
 /** Lazily extends Overworld terrain below the vanilla generation band. */
 final class InfiniteDownwardGenerator {
-    static final int GENERATION_VERSION = 9;
+    static final int GENERATION_VERSION = 11;
     private static final BlockState AIR = Blocks.AIR.getDefaultState();
     private static final BlockState DEEPSLATE = Blocks.DEEPSLATE.getDefaultState();
     private static final int NOISE_CELL_SIZE = 4;
@@ -32,6 +33,8 @@ final class InfiniteDownwardGenerator {
     private static final Map<ServerWorld, DensityFunction> LEGACY_CAVE_DENSITIES = new ConcurrentHashMap<>();
     private static final Map<ServerWorld, DensityFunction> EXTENDED_OVERWORLD_DENSITIES =
             new ConcurrentHashMap<>();
+    private static final Map<ServerWorld, Set<Long>> REWRITTEN_FLOOR_CHUNKS =
+            new ConcurrentHashMap<>();
 
     private InfiniteDownwardGenerator() {
     }
@@ -39,32 +42,82 @@ final class InfiniteDownwardGenerator {
     static void release(ServerWorld world) {
         LEGACY_CAVE_DENSITIES.remove(world);
         EXTENDED_OVERWORLD_DENSITIES.remove(world);
+        REWRITTEN_FLOOR_CHUNKS.remove(world);
+        VanillaCubeTerrainGenerator.release(world);
     }
 
     static void generate(
             ServerWorld world, LoadedCube cube, StructureGenerationSettings structureSettings) {
+        if (!VanillaCubeTerrainGenerator.generate(world, cube)) {
+            generateVanillaNoiseTerrain(world, cube);
+        }
+        VanillaStructureGenerator.generate(world, cube, structureSettings);
+        VanillaPlacedFeatureGenerator.generate(world, cube);
+        cube.setGenerationVersion(GENERATION_VERSION);
+        cube.markDirty();
+    }
+
+    private static void generateVanillaNoiseTerrain(ServerWorld world, LoadedCube cube) {
         CubePos pos = cube.pos();
-        int baseX = pos.minBlockX();
-        int baseY = pos.minBlockY();
-        int baseZ = pos.minBlockZ();
         DensityFunction density = extendedOverworldDensity(world);
+        int horizontalCell = 4;
+        int verticalCell = 8;
+        int horizontalCells = CubePos.SIZE / horizontalCell;
+        int verticalCells = CubePos.SIZE / verticalCell;
+        double[] samples = new double[
+                (horizontalCells + 1) * (verticalCells + 1) * (horizontalCells + 1)];
+        for (int gridY = 0; gridY <= verticalCells; gridY++) {
+            for (int gridZ = 0; gridZ <= horizontalCells; gridZ++) {
+                for (int gridX = 0; gridX <= horizontalCells; gridX++) {
+                    samples[vanillaSampleIndex(gridX, gridY, gridZ, horizontalCells)] = density.sample(
+                            new DensityFunction.UnblendedNoisePos(
+                                    pos.minBlockX() + gridX * horizontalCell,
+                                    pos.minBlockY() + gridY * verticalCell,
+                                    pos.minBlockZ() + gridZ * horizontalCell));
+                }
+            }
+        }
 
         for (int localY = 0; localY < CubePos.SIZE; localY++) {
-            int worldY = baseY + localY;
             for (int localZ = 0; localZ < CubePos.SIZE; localZ++) {
-                int worldZ = baseZ + localZ;
                 for (int localX = 0; localX < CubePos.SIZE; localX++) {
-                    int worldX = baseX + localX;
-                    if (density.sample(new DensityFunction.UnblendedNoisePos(
-                            worldX, worldY, worldZ)) > 0.0) {
+                    if (interpolateVanillaDensity(
+                            samples, localX, localY, localZ,
+                            horizontalCell, verticalCell, horizontalCells) > 0.0) {
                         cube.setGeneratedBlockState(localX, localY, localZ, DEEPSLATE);
                     }
                 }
             }
         }
-        VanillaStructureGenerator.generate(world, cube, structureSettings);
-        cube.setGenerationVersion(GENERATION_VERSION);
-        cube.markDirty();
+    }
+
+    private static double interpolateVanillaDensity(
+            double[] samples, int x, int y, int z,
+            int horizontalCell, int verticalCell, int horizontalCells) {
+        int gridX = x / horizontalCell;
+        int gridY = y / verticalCell;
+        int gridZ = z / horizontalCell;
+        double tx = (double) (x % horizontalCell) / horizontalCell;
+        double ty = (double) (y % verticalCell) / verticalCell;
+        double tz = (double) (z % horizontalCell) / horizontalCell;
+        double x00 = lerp(
+                samples[vanillaSampleIndex(gridX, gridY, gridZ, horizontalCells)],
+                samples[vanillaSampleIndex(gridX + 1, gridY, gridZ, horizontalCells)], tx);
+        double x10 = lerp(
+                samples[vanillaSampleIndex(gridX, gridY + 1, gridZ, horizontalCells)],
+                samples[vanillaSampleIndex(gridX + 1, gridY + 1, gridZ, horizontalCells)], tx);
+        double x01 = lerp(
+                samples[vanillaSampleIndex(gridX, gridY, gridZ + 1, horizontalCells)],
+                samples[vanillaSampleIndex(gridX + 1, gridY, gridZ + 1, horizontalCells)], tx);
+        double x11 = lerp(
+                samples[vanillaSampleIndex(gridX, gridY + 1, gridZ + 1, horizontalCells)],
+                samples[vanillaSampleIndex(gridX + 1, gridY + 1, gridZ + 1, horizontalCells)], tx);
+        return lerp(lerp(x00, x10, ty), lerp(x01, x11, ty), tz);
+    }
+
+    private static int vanillaSampleIndex(int x, int y, int z, int horizontalCells) {
+        int side = horizontalCells + 1;
+        return (y * side + z) * side + x;
     }
 
     /** Upgrades untouched cubes produced by either previous generator revision. */
@@ -73,10 +126,32 @@ final class InfiniteDownwardGenerator {
         if (cube.generationVersion() >= GENERATION_VERSION) {
             return false;
         }
-        if (cube.generationVersion() == 8) {
+        if (cube.generationVersion() == 10) {
+            if (cube.section().isEmpty() && cube.blockEntities().isEmpty()) {
+                generate(world, cube, structureSettings);
+                return true;
+            }
             cube.setGenerationVersion(GENERATION_VERSION);
             cube.markDirty();
             return false;
+        }
+        if (cube.generationVersion() == 9) {
+            if (cube.pos().y() == world.getBottomSectionCoord() - 1) {
+                migratePreviouslyReplacedFloor(world, cube.pos());
+            }
+            VanillaPlacedFeatureGenerator.generate(world, cube);
+            cube.setGenerationVersion(GENERATION_VERSION);
+            cube.markDirty();
+            return true;
+        }
+        if (cube.generationVersion() == 8) {
+            if (cube.pos().y() == world.getBottomSectionCoord() - 1) {
+                migratePreviouslyReplacedFloor(world, cube.pos());
+            }
+            VanillaPlacedFeatureGenerator.generate(world, cube);
+            cube.setGenerationVersion(GENERATION_VERSION);
+            cube.markDirty();
+            return true;
         }
         if (cube.generationVersion() == 7) {
             if (cube.blockEntities().isEmpty()
@@ -605,7 +680,10 @@ final class InfiniteDownwardGenerator {
     }
 
     static void openVanillaFloor(ServerWorld world, WorldChunk chunk) {
-        rewriteVanillaFloor(world, chunk, true);
+        boolean firstLoad = REWRITTEN_FLOOR_CHUNKS
+                .computeIfAbsent(world, ignored -> ConcurrentHashMap.newKeySet())
+                .add(chunk.getPos().toLong());
+        rewriteVanillaFloor(world, chunk, firstLoad);
     }
 
     private static void migratePreviouslyReplacedFloor(ServerWorld world, CubePos pos) {
@@ -618,30 +696,45 @@ final class InfiniteDownwardGenerator {
         int baseX = chunk.getPos().getStartX();
         int baseZ = chunk.getPos().getStartZ();
         BlockPos.Mutable mutable = new BlockPos.Mutable();
-        boolean changed = false;
-        for (int localZ = 0; localZ < CubePos.SIZE; localZ++) {
-            for (int localX = 0; localX < CubePos.SIZE; localX++) {
-                boolean allLegacyAir = true;
-                boolean allLegacyDeepslate = true;
+        boolean needsRewrite = false;
+        for (int localZ = 0; localZ < CubePos.SIZE && !needsRewrite; localZ++) {
+            for (int localX = 0; localX < CubePos.SIZE && !needsRewrite; localX++) {
                 for (int y = bottomY; y < bottomY + 5; y++) {
                     mutable.set(baseX + localX, y, baseZ + localZ);
                     BlockState state = chunk.getBlockState(mutable);
-                    allLegacyAir &= state.isAir();
-                    allLegacyDeepslate &= state.isOf(Blocks.DEEPSLATE);
+                    if (state.isOf(Blocks.BEDROCK)
+                            || (replaceLegacyDeepslate
+                                    && (state.isAir() || state.isOf(Blocks.DEEPSLATE)))) {
+                        needsRewrite = true;
+                    }
                 }
+            }
+        }
+        if (!needsRewrite) {
+            return;
+        }
+
+        LoadedCube generatedFloor = new LoadedCube(
+                new CubePos(chunk.getPos().x, world.getBottomSectionCoord(), chunk.getPos().z),
+                new net.minecraft.world.chunk.ChunkSection(world.getPalettesFactory()));
+        // Chunk-load callbacks can run inside the vanilla generation worker pool.
+        // Use the synchronous vanilla-density fallback here, never the invoker or a future.
+        generateVanillaNoiseTerrain(world, generatedFloor);
+        boolean changed = false;
+        for (int localZ = 0; localZ < CubePos.SIZE; localZ++) {
+            for (int localX = 0; localX < CubePos.SIZE; localX++) {
                 for (int y = bottomY; y < bottomY + 5; y++) {
                     mutable.set(baseX + localX, y, baseZ + localZ);
                     BlockState current = chunk.getBlockState(mutable);
-                    if (current.isOf(Blocks.BEDROCK) || allLegacyAir
-                            || (replaceLegacyDeepslate && allLegacyDeepslate)) {
-                        BlockState generated = extendedOverworldDensity(world).sample(
-                                new DensityFunction.UnblendedNoisePos(
-                                        mutable.getX(), mutable.getY(), mutable.getZ())) < 0.0
-                                ? AIR : DEEPSLATE;
+                    if (current.isOf(Blocks.BEDROCK)
+                            || (replaceLegacyDeepslate
+                                    && (current.isAir() || current.isOf(Blocks.DEEPSLATE)))) {
+                        BlockState generated = generatedFloor.section().getBlockState(
+                                localX, y - bottomY, localZ);
                         if (!current.equals(generated)) {
                             chunk.setBlockState(mutable, generated, 0);
+                            changed = true;
                         }
-                        changed = true;
                     }
                 }
             }
@@ -655,5 +748,10 @@ final class InfiniteDownwardGenerator {
         return EXTENDED_OVERWORLD_DENSITIES.computeIfAbsent(world, ignored ->
                 world.getChunkManager().getNoiseConfig().getNoiseRouter().finalDensity()
                         .apply(new BottomSlideRemover()));
+    }
+
+    static net.minecraft.world.gen.noise.NoiseRouter removeVanillaBottomSlide(
+            net.minecraft.world.gen.noise.NoiseRouter router) {
+        return router.apply(new BottomSlideRemover());
     }
 }

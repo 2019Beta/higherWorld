@@ -80,20 +80,14 @@ final class CubicWorldState implements AutoCloseable {
     }
 
     LoadedCube cube(CubePos pos) throws IOException {
-        CubeColumn<LoadedCube> column = columns.computeIfAbsent(
-                new ColumnPos(pos.x(), pos.z()), ignored -> new CubeColumn<>());
-        LoadedCube loaded = column.get(pos.y());
+        ColumnPos columnPos = new ColumnPos(pos.x(), pos.z());
+        CubeColumn<LoadedCube> column = columns.get(columnPos);
+        LoadedCube loaded = column == null ? null : column.get(pos.y());
         if (loaded != null) {
             return loaded;
         }
 
-        LoadedCube created = load(pos);
-        try {
-            column.put(pos.y(), created);
-            return created;
-        } catch (IllegalArgumentException raced) {
-            return column.get(pos.y());
-        }
+        return loadOrRegister(pos, storage.read(pos).orElse(null));
     }
 
     int loadedCubeCount() {
@@ -120,28 +114,14 @@ final class CubicWorldState implements AutoCloseable {
             }
             // We already know storage has no record. Construct directly instead
             // of making cube(pos) perform the same disk lookup a second time.
-            CubeColumn<LoadedCube> targetColumn = columns.computeIfAbsent(
-                    new ColumnPos(pos.x(), pos.z()), ignored -> new CubeColumn<>());
-            LoadedCube generated = load(pos, null);
-            try {
-                targetColumn.put(pos.y(), generated);
-                return CubeRecordCodec.encode(generated, world);
-            } catch (IllegalArgumentException raced) {
-                return CubeRecordCodec.encode(targetColumn.get(pos.y()), world);
-            }
+            LoadedCube generated = loadOrRegister(pos, null);
+            return CubeRecordCodec.encode(generated, world);
         }
 
         // Real stored cubes still enter the runtime so their block entities and
         // random-ticking blocks continue to simulate while watched.
-        CubeColumn<LoadedCube> targetColumn = columns.computeIfAbsent(
-                new ColumnPos(pos.x(), pos.z()), ignored -> new CubeColumn<>());
-        LoadedCube created = load(pos, stored.get());
-        try {
-            targetColumn.put(pos.y(), created);
-            return created.isDirty() ? CubeRecordCodec.encode(created, world) : stored.get();
-        } catch (IllegalArgumentException raced) {
-            return CubeRecordCodec.encode(targetColumn.get(pos.y()), world);
-        }
+        LoadedCube created = loadOrRegister(pos, stored.get());
+        return created.isDirty() ? CubeRecordCodec.encode(created, world) : stored.get();
     }
 
     void flushDirty() throws IOException {
@@ -205,16 +185,44 @@ final class CubicWorldState implements AutoCloseable {
         return pos.y() < world.getBottomSectionCoord() || pos.y() >= world.getTopSectionCoord();
     }
 
-    private LoadedCube load(CubePos pos) throws IOException {
-        return load(pos, storage.read(pos).orElse(null));
+    private LoadedCube loadOrRegister(CubePos pos, byte[] payload) throws IOException {
+        ColumnPos columnPos = new ColumnPos(pos.x(), pos.z());
+        while (true) {
+            CubeColumn<LoadedCube> column = columns.computeIfAbsent(
+                    columnPos, ignored -> new CubeColumn<>());
+            LoadedCube loaded = column.get(pos.y());
+            if (loaded != null) {
+                return loaded;
+            }
+
+            // Register the placeholder before generation. Feature code and block
+            // entities can call World#getBlockState while this cube is loading.
+            LoadedCube created = new LoadedCube(
+                    pos, new ChunkSection(world.getPalettesFactory()));
+            try {
+                column.put(pos.y(), created);
+            } catch (IllegalArgumentException raced) {
+                continue;
+            }
+
+            try {
+                load(created, payload);
+                return created;
+            } catch (IOException | RuntimeException | Error exception) {
+                column.remove(pos.y(), created);
+                if (column.isEmpty()) {
+                    columns.remove(columnPos, column);
+                }
+                throw exception;
+            }
+        }
     }
 
-    private LoadedCube load(CubePos pos, byte[] payload) throws IOException {
-        ChunkSection section = new ChunkSection(world.getPalettesFactory());
-        LoadedCube cube = new LoadedCube(pos, section);
+    private void load(LoadedCube cube, byte[] payload) throws IOException {
+        CubePos pos = cube.pos();
         if (payload != null) {
             cube.setGenerationVersion(CubeRecordCodec.generationVersion(payload));
-            for (BlockEntity blockEntity : CubeRecordCodec.decode(payload, section, world)) {
+            for (BlockEntity blockEntity : CubeRecordCodec.decode(payload, cube.section(), world)) {
                 cube.putLoadedBlockEntity(blockEntity);
             }
             if (shouldGenerate(pos) && InfiniteDownwardGenerator.upgradeLegacyTerrain(
@@ -225,7 +233,6 @@ final class CubicWorldState implements AutoCloseable {
             InfiniteDownwardGenerator.generate(world, cube, effectiveStructureSettings());
         }
         indexHeights(cube);
-        return cube;
     }
 
     private boolean shouldGenerate(CubePos pos) {

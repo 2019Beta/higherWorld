@@ -37,6 +37,10 @@ public final class CubeColumn<T> {
         return cubes.remove(cubeY);
     }
 
+    public boolean remove(int cubeY, T expected) {
+        return cubes.remove(cubeY, expected);
+    }
+
     /** Returns a stable snapshot ordered from the lower cube to the higher cube. */
     public List<T> between(int minCubeY, int maxCubeY) {
         if (minCubeY > maxCubeY) {

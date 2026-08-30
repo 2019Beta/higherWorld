@@ -107,6 +107,9 @@ final class LoadedCube {
     }
 
     void tickBlockEntities(ServerWorld world) {
+        if (blockEntities.isEmpty()) {
+            return;
+        }
         for (BlockEntity blockEntity : List.copyOf(blockEntities.values())) {
             if (blockEntity.isRemoved()) {
                 if (blockEntities.remove(blockEntity.getPos(), blockEntity)) {
