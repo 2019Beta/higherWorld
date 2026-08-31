@@ -26,6 +26,7 @@ final class CubicWorldState implements AutoCloseable {
     private final ServerWorld world;
     private final CubeStorage storage;
     private final boolean generateInfinitelyDownward;
+    private final boolean customWorld;
     private final boolean generateStructures;
     private final StructureGenerationSettings structureSettings;
     private final CustomWorldSettings customWorldSettings;
@@ -39,6 +40,7 @@ final class CubicWorldState implements AutoCloseable {
         this.world = world;
         this.storage = storage;
         this.generateInfinitelyDownward = CubicWorldManager.generatesInfinitelyDownward(world);
+        this.customWorld = CubicWorldManager.generatesCustomWorld(world);
         this.generateStructures = generateStructures;
         this.structureSettings = structureSettings;
         this.customWorldSettings = customWorldSettings;
@@ -228,12 +230,18 @@ final class CubicWorldState implements AutoCloseable {
             for (BlockEntity blockEntity : CubeRecordCodec.decode(payload, cube.section(), world)) {
                 cube.putLoadedBlockEntity(blockEntity);
             }
-            if (shouldGenerate(pos) && InfiniteDownwardGenerator.upgradeLegacyTerrain(
+            // A stored custom cube is authoritative: it may contain player edits and
+            // its terrain must never be passed through the legacy upgrade pipeline.
+            if (!customWorld && shouldGenerate(pos) && InfiniteDownwardGenerator.upgradeLegacyTerrain(
                     world, cube, effectiveStructureSettings())) {
                 Higherworld.LOGGER.debug("Upgraded untouched generated terrain cube {}", pos);
             }
         } else if (shouldGenerate(pos)) {
-            InfiniteDownwardGenerator.generate(world, cube, effectiveStructureSettings());
+            if (customWorld) {
+                CustomCubeGenerator.generate(world, cube, customWorldSettings, effectiveStructureSettings());
+            } else {
+                InfiniteDownwardGenerator.generate(world, cube, effectiveStructureSettings());
+            }
         }
         indexHeights(cube);
     }

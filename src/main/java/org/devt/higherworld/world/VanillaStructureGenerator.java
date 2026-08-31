@@ -34,11 +34,23 @@ final class VanillaStructureGenerator {
 
     static void generate(
             ServerWorld world, LoadedCube cube, StructureGenerationSettings settings) {
+        generate(world, cube, settings, null);
+    }
+
+    /**
+     * Copies vanilla structure starts for a custom world.  The registry key is
+     * deliberately classified by its path instead of depending on optional
+     * StructureKeys constants: this keeps the custom flags stable when Mojang
+     * adds another structure family in a later mapping.
+     */
+    static void generate(
+            ServerWorld world, LoadedCube cube, StructureGenerationSettings settings,
+            CustomWorldSettings customSettings) {
         CubePos cubePos = cube.pos();
         ChunkPos chunkPos = new ChunkPos(cubePos.x(), cubePos.z());
         Registry<Structure> registry = world.getRegistryManager().getOrThrow(RegistryKeys.STRUCTURE);
         List<StructureStart> starts = world.getStructureAccessor().getStructureStarts(
-                chunkPos, structure -> isEnabled(registry, structure, settings));
+                chunkPos, structure -> isEnabled(registry, structure, settings, customSettings));
         if (starts.isEmpty()) {
             return;
         }
@@ -59,7 +71,8 @@ final class VanillaStructureGenerator {
             int first = Math.max(1, ceilDiv(sourceBox.getMinY() - cubeBox.getMaxY(), VERTICAL_PERIOD));
             int last = Math.floorDiv(sourceBox.getMaxY() - cubeBox.getMinY(), VERTICAL_PERIOD);
             for (int repetition = first; repetition <= last; repetition++) {
-                int offsetY = -repetition * VERTICAL_PERIOD;
+                int offsetY = -repetition * VERTICAL_PERIOD
+                        + strongholdPhase(chunkPos, source, registry, customSettings);
                 StructureStart copy = copy(source, context, world.getSeed());
                 if (copy == null) {
                     continue;
@@ -89,24 +102,77 @@ final class VanillaStructureGenerator {
     private static boolean isEnabled(
             Registry<Structure> registry, Structure structure,
             StructureGenerationSettings settings) {
+        return isEnabled(registry, structure, settings, null);
+    }
+
+    private static boolean isEnabled(
+            Registry<Structure> registry, Structure structure,
+            StructureGenerationSettings settings, CustomWorldSettings customSettings) {
         Optional<RegistryKey<Structure>> key = registry.getKey(structure);
         if (key.isEmpty()) {
             return false;
         }
         RegistryKey<Structure> value = key.get();
-        if (value.equals(StructureKeys.MINESHAFT) || value.equals(StructureKeys.MINESHAFT_MESA)) {
-            return settings.enables(UndergroundStructure.MINESHAFT);
+        String path = value.getValue().getPath();
+        if (isMineshaft(path)) {
+            return settings.enables(UndergroundStructure.MINESHAFT)
+                    && (customSettings == null || customSettings.mineshafts());
         }
-        if (value.equals(StructureKeys.STRONGHOLD)) {
-            return settings.enables(UndergroundStructure.STRONGHOLD);
+        if ("stronghold".equals(path)) {
+            return settings.enables(UndergroundStructure.STRONGHOLD)
+                    && (customSettings == null || customSettings.strongholds());
         }
-        if (value.equals(StructureKeys.ANCIENT_CITY)) {
+        if ("ancient_city".equals(path)) {
             return settings.enables(UndergroundStructure.ANCIENT_CITY);
         }
-        if (value.equals(StructureKeys.TRIAL_CHAMBERS)) {
+        if ("trial_chambers".equals(path)) {
             return settings.enables(UndergroundStructure.TRIAL_CHAMBERS);
         }
+        if (customSettings == null || settings.enabledStructures().isEmpty()) {
+            return false;
+        }
+        if (isVillage(path)) {
+            return customSettings.villages();
+        }
+        if (isTemple(path)) {
+            return customSettings.temples();
+        }
+        if ("monument".equals(path) || "ocean_monument".equals(path)) {
+            return customSettings.oceanMonuments();
+        }
+        if ("mansion".equals(path) || "woodland_mansion".equals(path)) {
+            return customSettings.woodlandMansions();
+        }
         return false;
+    }
+
+    static boolean isMineshaft(String path) {
+        return "mineshaft".equals(path) || "mineshaft_mesa".equals(path);
+    }
+
+    static boolean isVillage(String path) {
+        return "village".equals(path) || path.startsWith("village_");
+    }
+
+    static boolean isTemple(String path) {
+        return "desert_pyramid".equals(path) || "jungle_pyramid".equals(path)
+                || "swamp_hut".equals(path) || "igloo".equals(path)
+                || "ocean_ruin".equals(path) || path.startsWith("ocean_ruin_");
+    }
+
+    private static int strongholdPhase(
+            ChunkPos chunkPos, StructureStart source, Registry<Structure> registry,
+            CustomWorldSettings customSettings) {
+        if (customSettings == null || !customSettings.alternateStrongholdsPositions()) {
+            return 0;
+        }
+        Optional<RegistryKey<Structure>> key = registry.getKey(source.getStructure());
+        if (key.isEmpty() || !"stronghold".equals(key.get().getValue().getPath())) {
+            return 0;
+        }
+        long parity = (long) chunkPos.x * 0x9E3779B97F4A7C15L
+                ^ (long) chunkPos.z * 0xC2B2AE3D27D4EB4FL;
+        return (parity & 1L) == 0L ? 0 : VERTICAL_PERIOD / 2;
     }
 
     private static StructureWorldAccess cubeAccess(
