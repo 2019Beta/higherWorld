@@ -21,8 +21,6 @@ import net.minecraft.registry.RegistryKeys;
 import net.minecraft.util.Identifier;
 import net.minecraft.world.dimension.DimensionType;
 import net.minecraft.world.gen.chunk.NoiseChunkGenerator;
-import net.minecraft.world.gen.noise.NoiseConfig;
-import org.devt.higherworld.mixin.NoiseConfigAccessor;
 import org.devt.higherworld.Higherworld;
 import org.devt.higherworld.storage.CubePos;
 import org.devt.higherworld.storage.CubeStorage;
@@ -67,9 +65,6 @@ public final class CubicWorldManager {
 
     public static void close(MinecraftServer server, ServerWorld world) {
         CubeWatchManager.removeWorld(world);
-        if (world.getChunkManager().getChunkGenerator() instanceof NoiseChunkGenerator generator) {
-            InfiniteWorldgenHooks.unregister(generator);
-        }
         InfiniteDownwardGenerator.release(world);
         CubicWorldState state = WORLDS.remove(world);
         if (state == null) {
@@ -99,10 +94,7 @@ public final class CubicWorldManager {
         if (!(world.getChunkManager().getChunkGenerator() instanceof NoiseChunkGenerator generator)) {
             return;
         }
-        InfiniteWorldgenHooks.register(generator, world.getBottomY());
-        NoiseConfig noiseConfig = world.getChunkManager().getNoiseConfig();
-        ((NoiseConfigAccessor) (Object) noiseConfig).higherworld$setNoiseRouter(
-                InfiniteDownwardGenerator.removeVanillaBottomSlide(noiseConfig.getNoiseRouter()));
+        InfiniteNoiseSettings.rewriteWorldGenerator(world, generator);
     }
 
     /** Reads through the sparse cube cache without packing Y into a vanilla long key. */

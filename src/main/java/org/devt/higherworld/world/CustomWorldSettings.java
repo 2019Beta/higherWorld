@@ -931,7 +931,7 @@ public final class CustomWorldSettings {
             }
             if (spawnProbability < 0 || spawnProbability > 1) fail("ore probability must be between 0 and 1");
             if (minHeight > maxHeight) fail("ore minHeight must be <= maxHeight");
-            if (periodic && (heightStdDeviation < 0 || heightStdDeviation > 1 || heightSpacing <= 0)) fail("invalid periodic ore settings");
+            if (periodic && (heightStdDeviation <= 0 || heightStdDeviation > 1 || heightSpacing <= 0)) fail("invalid periodic ore settings");
         }
         private OreDto toDto() {
             OreDto dto = new OreDto(); dto.blockstate = blockstate; dto.biomes = biomes == null ? null : new ArrayList<>(biomes);

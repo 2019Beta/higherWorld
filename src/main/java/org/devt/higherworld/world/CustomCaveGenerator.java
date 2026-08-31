@@ -9,8 +9,6 @@ import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.server.world.ServerWorld;
-import net.minecraft.util.math.BlockPos;
-
 import org.devt.higherworld.storage.CubePos;
 
 /**
@@ -130,10 +128,12 @@ final class CustomCaveGenerator {
             if (!finalStep && walked == splitPoint && baseSize > 1.0) {
                 generateNode(random.nextLong(), cube, caveBlock, replaceable,
                         x, y, z, horizontalAngle - Math.PI / 2.0, verticalAngle / 3.0,
-                        baseSize, 1.0, walked, maximumWalked, settings);
+                        random.nextFloat() * 0.5 + 0.5, 1.0,
+                        walked, maximumWalked, settings);
                 generateNode(random.nextLong(), cube, caveBlock, replaceable,
                         x, y, z, horizontalAngle + Math.PI / 2.0, verticalAngle / 3.0,
-                        baseSize, 1.0, walked, maximumWalked, settings);
+                        random.nextFloat() * 0.5 + 0.5, 1.0,
+                        walked, maximumWalked, settings);
                 return;
             }
             if (random.nextInt(settings.carveStepRarity()) != 0 && !finalStep) {
@@ -144,10 +144,10 @@ final class CustomCaveGenerator {
             double remaining = maximumWalked - walked;
             double maxDistanceToCube = baseSize * Math.max(1.0, verticalModifier)
                     + settings.caveSizeAdd() + CubePos.SIZE;
-            if ((x - cube.pos().minBlockX() - CubePos.SIZE / 2.0) *
-                    (x - cube.pos().minBlockX() - CubePos.SIZE / 2.0)
-                    + (z - cube.pos().minBlockZ() - CubePos.SIZE / 2.0) *
-                    (z - cube.pos().minBlockZ() - CubePos.SIZE / 2.0)
+            double xDistance = x - (cube.pos().minBlockX() + CubePos.SIZE / 2.0);
+            double yDistance = y - (cube.pos().minBlockY() + CubePos.SIZE / 2.0);
+            double zDistance = z - (cube.pos().minBlockZ() + CubePos.SIZE / 2.0);
+            if (xDistance * xDistance + yDistance * yDistance + zDistance * zDistance
                     - remaining * remaining > maxDistanceToCube * maxDistanceToCube) {
                 return;
             }
@@ -168,35 +168,40 @@ final class CustomCaveGenerator {
             return;
         }
         CubePos cubePos = cube.pos();
-        int minX = Math.max(0, (int) Math.floor(centerX - radiusXZ) - cubePos.minBlockX());
-        int maxX = Math.min(CubePos.SIZE - 1, (int) Math.floor(centerX + radiusXZ) - cubePos.minBlockX());
-        int minY = Math.max(0, (int) Math.floor(centerY - radiusY) - cubePos.minBlockY());
-        int maxY = Math.min(CubePos.SIZE - 1, (int) Math.floor(centerY + radiusY) - cubePos.minBlockY());
-        int minZ = Math.max(0, (int) Math.floor(centerZ - radiusXZ) - cubePos.minBlockZ());
-        int maxZ = Math.min(CubePos.SIZE - 1, (int) Math.floor(centerZ + radiusXZ) - cubePos.minBlockZ());
-        for (int localY = minY; localY <= maxY; localY++) {
+        int minX = Math.max(0, (int) Math.floor(centerX - radiusXZ) - cubePos.minBlockX() - 1);
+        int maxX = Math.min(CubePos.SIZE, (int) Math.floor(centerX + radiusXZ)
+                - cubePos.minBlockX() + 1);
+        int minY = Math.max(0, (int) Math.floor(centerY - radiusY) - cubePos.minBlockY() - 1);
+        int maxY = Math.min(CubePos.SIZE, (int) Math.floor(centerY + radiusY)
+                - cubePos.minBlockY() + 1);
+        int minZ = Math.max(0, (int) Math.floor(centerZ - radiusXZ) - cubePos.minBlockZ() - 1);
+        int maxZ = Math.min(CubePos.SIZE, (int) Math.floor(centerZ + radiusXZ)
+                - cubePos.minBlockZ() + 1);
+        for (int localY = minY; localY < maxY; localY++) {
             double dy = (cubePos.minBlockY() + localY + 0.5 - centerY) / radiusY;
-            for (int localZ = minZ; localZ <= maxZ; localZ++) {
+            for (int localZ = minZ; localZ < maxZ; localZ++) {
                 double dz = (cubePos.minBlockZ() + localZ + 0.5 - centerZ) / radiusXZ;
-                for (int localX = minX; localX <= maxX; localX++) {
+                for (int localX = minX; localX < maxX; localX++) {
                     double dx = (cubePos.minBlockX() + localX + 0.5 - centerX) / radiusXZ;
                     double horizontal = dx * dx + dz * dz;
-                    if (horizontal >= 1.0 || dy * dy + horizontal >= 1.0 || dy <= floorDepth) {
+                    if (horizontal >= 1.0 || dy * dy + horizontal >= 1.0) {
                         continue;
                     }
-                    BlockPos blockPos = new BlockPos(
-                            cubePos.minBlockX() + localX,
-                            cubePos.minBlockY() + localY,
-                            cubePos.minBlockZ() + localZ);
                     BlockState current = cube.section().getBlockState(localX, localY, localZ);
-                    if (replaceable.contains(current.getBlock())) {
+                    if (!replaceable.contains(current.getBlock())) {
+                        continue;
+                    }
+                    if (dy > floorDepth) {
                         cube.setGeneratedBlockState(localX, localY, localZ, caveBlock);
-                        if (localY < CubePos.SIZE - 1 && current.isOf(Blocks.DIRT)) {
-                            BlockState above = cube.section().getBlockState(localX, localY + 1, localZ);
-                            if (above.isOf(Blocks.AIR)) {
-                                cube.setGeneratedBlockState(localX, localY, localZ,
-                                        Blocks.GRASS_BLOCK.getDefaultState());
-                            }
+                    } else if (current.isOf(Blocks.DIRT) && localY < CubePos.SIZE - 1) {
+                        // Vanilla's cave pass promotes dirt to grass when the
+                        // block above would be carved during this same pass.
+                        // Check the ellipsoid directly instead of inspecting
+                        // the not-yet-visited block above.
+                        double dyAbove = (cubePos.minBlockY() + localY + 1.5 - centerY) / radiusY;
+                        if (dyAbove > floorDepth && dyAbove * dyAbove + horizontal < 1.0) {
+                            cube.setGeneratedBlockState(localX, localY, localZ,
+                                    Blocks.GRASS_BLOCK.getDefaultState());
                         }
                     }
                 }
@@ -210,65 +215,124 @@ final class CustomCaveGenerator {
             return;
         }
         CubePos pos = cube.pos();
-        double centerX = pos.minBlockX() + CubePos.SIZE / 2.0;
-        double centerY = pos.minBlockY() + RAVINE_LAVA_HEIGHT_OFFSET + random.nextInt(CubePos.SIZE);
-        double centerZ = pos.minBlockZ() + CubePos.SIZE / 2.0;
-        double horizontalAngle = random.nextDouble() * Math.PI * 2.0;
-        double verticalAngle = (random.nextDouble() - 0.5) * RAVINE_VERTICAL_FACTOR;
+        double startX = pos.minBlockX() + random.nextInt(CubePos.SIZE);
+        double startY = pos.minBlockY() + random.nextInt(CubePos.SIZE);
+        double startZ = pos.minBlockZ() + random.nextInt(CubePos.SIZE);
+        double verticalAngle = random.nextDouble() * Math.PI * 2.0;
+        double horizontalAngle = (random.nextDouble() - 0.5) * 2.0 / 8.0;
+        double baseSize = (random.nextDouble() * 2.0 + random.nextDouble()) * 2.0;
+        int lavaHeight = (int) (startY - (baseSize + RAVINE_SIZE_ADD)
+                * RAVINE_VERTICAL_SIZE_FACTOR + RAVINE_LAVA_HEIGHT_OFFSET
+                + startY * RAVINE_VERTICAL_FACTOR);
+        generateRavineNode(random.nextLong(), cube, startX, startY, startZ,
+                baseSize, horizontalAngle, verticalAngle, lavaHeight);
+    }
+
+    private static void generateRavineNode(
+            long nodeSeed, LoadedCube cube, double x, double y, double z,
+            double baseSize, double horizontalAngle, double verticalAngle,
+            int lavaHeight) {
+        Random random = new Random(nodeSeed);
         double horizontalChange = 0.0;
         double verticalChange = 0.0;
-        double size = RAVINE_SIZE_ADD + random.nextDouble() * 2.0;
-        for (int step = -MAX_BLOCK_RADIUS; step <= MAX_BLOCK_RADIUS; step++) {
+        int maximumWalked = MAX_BLOCK_RADIUS
+                - random.nextInt(MAX_BLOCK_RADIUS / 4);
+        float[] widthFactors = generateRavineWidthFactors(random);
+        for (int walked = 0; walked < maximumWalked; walked++) {
+            double fraction = walked / (double) maximumWalked;
+            double horizontalSize = RAVINE_SIZE_ADD
+                    + Math.sin(fraction * Math.PI) * baseSize;
+            double verticalSize = horizontalSize * RAVINE_VERTICAL_SIZE_FACTOR;
+            horizontalSize *= random.nextDouble() * 0.25 + 0.75;
+            verticalSize *= random.nextDouble() * 0.25 + 0.75;
+
             double horizontalFactor = Math.cos(verticalAngle);
-            double pathX = centerX + Math.cos(horizontalAngle) * horizontalFactor * step;
-            double pathY = centerY + Math.sin(verticalAngle) * step;
-            double pathZ = centerZ + Math.sin(horizontalAngle) * horizontalFactor * step;
-            double radius = size * (0.75 + random.nextDouble() * 0.25)
-                    * (1.0 + Math.sin(step / (double) MAX_BLOCK_RADIUS * Math.PI) * 0.5);
-            carveRavineSection(cube, pathX, pathY, pathZ, radius);
+            double verticalFactor = Math.sin(verticalAngle);
+            x += Math.cos(horizontalAngle) * horizontalFactor;
+            y += verticalFactor;
+            z += Math.sin(horizontalAngle) * horizontalFactor;
             verticalAngle *= RAVINE_FLATTEN_FACTOR;
             verticalAngle += verticalChange * RAVINE_DIRECTION_FACTOR;
             horizontalAngle += horizontalChange * RAVINE_DIRECTION_FACTOR;
             verticalChange *= RAVINE_PREVIOUS_VERT_WEIGHT;
             horizontalChange *= RAVINE_PREVIOUS_HORIZ_WEIGHT;
-            verticalChange += (random.nextDouble() - random.nextDouble())
-                    * random.nextDouble() * RAVINE_MAX_ADD_VERT;
-            horizontalChange += (random.nextDouble() - random.nextDouble())
-                    * random.nextDouble() * RAVINE_MAX_ADD_HORIZ;
-            if (random.nextInt(RAVINE_CARVE_STEP_RARITY) != 0) {
-                step++;
+            verticalChange += (random.nextFloat() - random.nextFloat())
+                    * random.nextFloat() * RAVINE_MAX_ADD_VERT;
+            horizontalChange += (random.nextFloat() - random.nextFloat())
+                    * random.nextFloat() * RAVINE_MAX_ADD_HORIZ;
+
+            if (random.nextInt(RAVINE_CARVE_STEP_RARITY) == 0) {
+                continue;
             }
+            double remaining = maximumWalked - walked;
+            double maxDistanceToCube = baseSize + RAVINE_SIZE_ADD + CubePos.SIZE;
+            double xDistance = x - (cube.pos().minBlockX() + CubePos.SIZE / 2.0);
+            double zDistance = z - (cube.pos().minBlockZ() + CubePos.SIZE / 2.0);
+            if (xDistance * xDistance + zDistance * zDistance
+                    - remaining * remaining > maxDistanceToCube * maxDistanceToCube) {
+                return;
+            }
+            carveRavineSection(cube, x, y, z, horizontalSize, verticalSize,
+                    lavaHeight, widthFactors);
         }
     }
 
     private static void carveRavineSection(
-            LoadedCube cube, double centerX, double centerY, double centerZ, double radius) {
-        if (radius <= 0.0) {
+            LoadedCube cube, double centerX, double centerY, double centerZ,
+            double radiusXZ, double radiusY, int lavaHeight, float[] widthFactors) {
+        if (radiusXZ <= 0.0 || radiusY <= 0.0) {
             return;
         }
         CubePos pos = cube.pos();
-        int minX = Math.max(0, (int) Math.floor(centerX - radius) - pos.minBlockX());
-        int maxX = Math.min(CubePos.SIZE - 1, (int) Math.ceil(centerX + radius) - pos.minBlockX());
-        int minY = Math.max(0, (int) Math.floor(centerY - radius * RAVINE_VERTICAL_SIZE_FACTOR) - pos.minBlockY());
-        int maxY = Math.min(CubePos.SIZE - 1, (int) Math.ceil(centerY + radius * RAVINE_VERTICAL_SIZE_FACTOR) - pos.minBlockY());
-        int minZ = Math.max(0, (int) Math.floor(centerZ - radius) - pos.minBlockZ());
-        int maxZ = Math.min(CubePos.SIZE - 1, (int) Math.ceil(centerZ + radius) - pos.minBlockZ());
-        for (int y = minY; y <= maxY; y++) {
-            double dy = (pos.minBlockY() + y + 0.5 - centerY) / (radius * RAVINE_Y_STRETCH);
-            for (int z = minZ; z <= maxZ; z++) {
-                double dz = (pos.minBlockZ() + z + 0.5 - centerZ) / radius;
-                for (int x = minX; x <= maxX; x++) {
-                    double dx = (pos.minBlockX() + x + 0.5 - centerX) / radius;
-                    if (dx * dx + dz * dz + dy * dy >= 1.0) {
+        int minX = Math.max(0, (int) Math.floor(centerX - radiusXZ)
+                - pos.minBlockX() - 1);
+        int maxX = Math.min(CubePos.SIZE, (int) Math.floor(centerX + radiusXZ)
+                - pos.minBlockX() + 1);
+        int minY = Math.max(0, (int) Math.floor(centerY - radiusY)
+                - pos.minBlockY() - 1);
+        int maxY = Math.min(CubePos.SIZE, (int) Math.floor(centerY + radiusY)
+                - pos.minBlockY() + 1);
+        int minZ = Math.max(0, (int) Math.floor(centerZ - radiusXZ)
+                - pos.minBlockZ() - 1);
+        int maxZ = Math.min(CubePos.SIZE, (int) Math.floor(centerZ + radiusXZ)
+                - pos.minBlockZ() + 1);
+        for (int localX = minX; localX < maxX; localX++) {
+            double dx = (pos.minBlockX() + localX + 0.5 - centerX) / radiusXZ;
+            for (int localZ = minZ; localZ < maxZ; localZ++) {
+                double dz = (pos.minBlockZ() + localZ + 0.5 - centerZ) / radiusXZ;
+                if (dx * dx + dz * dz >= 1.0) {
+                    continue;
+                }
+                for (int localY = minY; localY < maxY; localY++) {
+                    double dy = (pos.minBlockY() + localY + 0.5 - centerY) / radiusY;
+                    int widthIndex = (pos.y() * CubePos.SIZE + localY) & 0xFF;
+                    if ((dx * dx + dz * dz) * widthFactors[widthIndex]
+                            + dy * dy / RAVINE_Y_STRETCH >= 1.0) {
                         continue;
                     }
-                    BlockState state = cube.section().getBlockState(x, y, z);
-                    if (isNatural(state)) {
-                        cube.setGeneratedBlockState(x, y, z, Blocks.AIR.getDefaultState());
+                    BlockState state = cube.section().getBlockState(localX, localY, localZ);
+                    if (!isNatural(state)) {
+                        continue;
                     }
+                    cube.setGeneratedBlockState(localX, localY, localZ,
+                            pos.minBlockY() + localY < lavaHeight
+                                    ? Blocks.LAVA.getDefaultState()
+                                    : Blocks.AIR.getDefaultState());
                 }
             }
         }
+    }
+
+    private static float[] generateRavineWidthFactors(Random random) {
+        float[] values = new float[256];
+        float value = 1.0f;
+        for (int i = 0; i < values.length; i++) {
+            if (i == 0 || random.nextInt(3) == 0) {
+                value = 1.0f + random.nextFloat() * random.nextFloat();
+            }
+            values[i] = value * value;
+        }
+        return values;
     }
 
     private static boolean isNatural(BlockState state) {

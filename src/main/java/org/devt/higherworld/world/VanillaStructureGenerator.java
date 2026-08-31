@@ -72,7 +72,7 @@ final class VanillaStructureGenerator {
             int last = Math.floorDiv(sourceBox.getMaxY() - cubeBox.getMinY(), VERTICAL_PERIOD);
             for (int repetition = first; repetition <= last; repetition++) {
                 int offsetY = -repetition * VERTICAL_PERIOD
-                        + strongholdPhase(chunkPos, source, registry, customSettings);
+                        + strongholdPhase(chunkPos, source, registry, customSettings, repetition);
                 StructureStart copy = copy(source, context, world.getSeed());
                 if (copy == null) {
                     continue;
@@ -162,7 +162,7 @@ final class VanillaStructureGenerator {
 
     private static int strongholdPhase(
             ChunkPos chunkPos, StructureStart source, Registry<Structure> registry,
-            CustomWorldSettings customSettings) {
+            CustomWorldSettings customSettings, int repetition) {
         if (customSettings == null || !customSettings.alternateStrongholdsPositions()) {
             return 0;
         }
@@ -171,7 +171,8 @@ final class VanillaStructureGenerator {
             return 0;
         }
         long parity = (long) chunkPos.x * 0x9E3779B97F4A7C15L
-                ^ (long) chunkPos.z * 0xC2B2AE3D27D4EB4FL;
+                ^ (long) chunkPos.z * 0xC2B2AE3D27D4EB4FL
+                ^ repetition;
         return (parity & 1L) == 0L ? 0 : VERTICAL_PERIOD / 2;
     }
 

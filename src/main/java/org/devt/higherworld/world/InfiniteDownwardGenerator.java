@@ -77,7 +77,10 @@ final class InfiniteDownwardGenerator {
         for (int y = 0; y < CubePos.SIZE; y++) {
             for (int z = 0; z < CubePos.SIZE; z++) {
                 for (int x = 0; x < CubePos.SIZE; x++) {
-                    if (cube.section().getBlockState(x, y, z).isOf(Blocks.GLOW_LICHEN)) {
+                    BlockState state = cube.section().getBlockState(x, y, z);
+                    if (state.isOf(Blocks.GLOW_LICHEN)
+                            || state.isOf(Blocks.POINTED_DRIPSTONE)
+                            || state.isOf(Blocks.DRIPSTONE_BLOCK)) {
                         cube.setGeneratedBlockState(x, y, z, AIR);
                     }
                 }

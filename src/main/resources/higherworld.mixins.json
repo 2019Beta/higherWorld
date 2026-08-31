@@ -7,7 +7,7 @@
     "BlockCollisionSpliteratorMixin",
     "ChunkCacheMixin",
     "EntityMixin",
-    "NoiseChunkGeneratorMixin",
+    "NoiseChunkGeneratorAccessor",
     "NoiseChunkGeneratorInvoker",
     "NoiseConfigAccessor",
     "PacketByteBufMixin",

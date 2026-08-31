@@ -84,9 +84,9 @@ final class CustomOreGenerator {
 
     /**
      * The cyclic bell curve used by PopulatorUtils/MathUtil in the reference
-     * generator.  A zero deviation is accepted for the uniform category only;
-     * periodic settings reject it only when callers choose to, so this helper
-     * still has a well-defined point-mass result for tests and presets.
+     * generator.  Periodic configuration validation rejects a zero deviation;
+     * this helper still has a well-defined point-mass result for callers that
+     * need to inspect the mathematical boundary.
      */
     static double cyclicBellCurveProbability(
             double value, double mean, double standardDeviation, double spacing) {

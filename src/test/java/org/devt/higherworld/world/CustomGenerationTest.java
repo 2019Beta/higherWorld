@@ -52,13 +52,24 @@ class CustomGenerationTest {
     void modelRejectsZeroRandomDivisors() {
         CustomWorldSettings defaults = CustomWorldSettings.customDefaults();
         CustomWorldSettings.CaveSettings cave = defaults.caves().get(0);
-        assertThrows(IllegalArgumentException.class, () -> new CustomWorldSettings.CaveSettings(
+        CustomWorldSettings.CaveSettings invalid = new CustomWorldSettings.CaveSettings(
                 cave.caveBlock(), cave.caveMinHeight(), cave.caveMaxHeight(), 0,
                 cave.maxInitNodes(), cave.largeNodeRarity(), cave.largeNodeMaxBranches(),
                 cave.bigCaveRarity(), cave.caveSizeAdd(), cave.steepStepRarity(),
                 cave.flattenFactor(), cave.steeperFlattenFactor(), cave.directionChangeFactor(),
                 cave.prevHorizDirectionChangeWeight(), cave.prevVertDirectionChangeWeight(),
                 cave.maxAddDirectionChangeHoriz(), cave.maxAddDirectionChangeVert(),
-                cave.carveStepRarity(), cave.caveFloorDepth(), cave.isBlockReplaceable()));
+                cave.carveStepRarity(), cave.caveFloorDepth(), cave.isBlockReplaceable());
+        assertThrows(IllegalArgumentException.class,
+                () -> defaults.toBuilder().caves(java.util.List.of(invalid)).build());
+
+        CustomWorldSettings.OreSettings periodic = defaults.periodicGaussianOres().get(0);
+        CustomWorldSettings.OreSettings invalidPeriodic = new CustomWorldSettings.OreSettings(
+                periodic.blockstate(), null, periodic.spawnSize(), periodic.spawnTries(),
+                periodic.spawnProbability(), periodic.minHeight(), periodic.maxHeight(),
+                periodic.heightMean(), 0.0, periodic.heightSpacing());
+        assertThrows(IllegalArgumentException.class,
+                () -> defaults.toBuilder()
+                        .periodicGaussianOres(java.util.List.of(invalidPeriodic)).build());
     }
 }

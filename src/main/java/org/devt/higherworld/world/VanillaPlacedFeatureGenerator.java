@@ -3,10 +3,12 @@ package org.devt.higherworld.world;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
-import java.util.LinkedHashSet;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.IdentityHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Predicate;
@@ -24,11 +26,16 @@ import net.minecraft.registry.entry.RegistryEntryList;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.util.math.BlockBox;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.ChunkPos;
 import net.minecraft.util.math.random.ChunkRandom;
 import net.minecraft.util.math.random.Xoroshiro128PlusPlusRandom;
+import net.minecraft.world.HeightLimitView;
 import net.minecraft.world.StructureWorldAccess;
 import net.minecraft.world.biome.Biome;
 import net.minecraft.world.biome.GenerationSettings;
+import net.minecraft.world.chunk.Chunk;
+import net.minecraft.world.chunk.ProtoChunk;
+import net.minecraft.world.chunk.UpgradeData;
 import net.minecraft.world.gen.GenerationStep;
 import net.minecraft.world.gen.chunk.ChunkGenerator;
 import net.minecraft.world.gen.feature.PlacedFeature;
@@ -39,6 +46,11 @@ final class VanillaPlacedFeatureGenerator {
     private static final int VANILLA_BOTTOM_Y = -64;
     private static final int VANILLA_HEIGHT = 384;
     private static final int REPEATED_BAND_HEIGHT = 64;
+    private static final Set<String> UNSUPPORTED_DECORATIONS = Set.of(
+            "glow_lichen",
+            "dripstone_cluster",
+            "large_dripstone",
+            "pointed_dripstone");
     private static final List<GenerationStep.Feature> SAFE_UNDERGROUND_STEPS = List.of(
             GenerationStep.Feature.RAW_GENERATION,
             GenerationStep.Feature.LOCAL_MODIFICATIONS,
@@ -80,7 +92,6 @@ final class VanillaPlacedFeatureGenerator {
         ChunkGenerator generator = world.getChunkManager().getChunkGenerator();
         Registry<PlacedFeature> registry = world.getRegistryManager()
                 .getOrThrow(RegistryKeys.PLACED_FEATURE);
-
         List<FeatureCall> features = collectFeatures(
                 world, cube, virtualMinY, generator, steps);
         ChunkRandom random = new ChunkRandom(new Xoroshiro128PlusPlusRandom(
@@ -115,6 +126,8 @@ final class VanillaPlacedFeatureGenerator {
 
         List<FeatureCall> result = new ArrayList<>();
         Set<PlacedFeature> seen = java.util.Collections.newSetFromMap(new IdentityHashMap<>());
+        Registry<PlacedFeature> registry = world.getRegistryManager()
+                .getOrThrow(RegistryKeys.PLACED_FEATURE);
         for (RegistryEntry<Biome> biome : biomes) {
             GenerationSettings settings = generator.getGenerationSettings(biome);
             List<RegistryEntryList<PlacedFeature>> steps = settings.getFeatures();
@@ -126,6 +139,12 @@ final class VanillaPlacedFeatureGenerator {
                 RegistryEntryList<PlacedFeature> entries = steps.get(stepIndex);
                 for (int index = 0; index < entries.size(); index++) {
                     PlacedFeature feature = entries.get(index).value();
+                    var id = registry.getId(feature);
+                    if (step == GenerationStep.Feature.UNDERGROUND_DECORATION
+                            && id != null && "minecraft".equals(id.getNamespace())
+                            && UNSUPPORTED_DECORATIONS.contains(id.getPath())) {
+                        continue;
+                    }
                     if (seen.add(feature)) {
                         result.add(new FeatureCall(step, index, feature));
                     }
@@ -143,20 +162,31 @@ final class VanillaPlacedFeatureGenerator {
                 cube.pos().minBlockX() + CubePos.SIZE - 1,
                 virtualMinY + CubePos.SIZE - 1,
                 cube.pos().minBlockZ() + CubePos.SIZE - 1);
+        Map<Long, Chunk> featureChunks = new HashMap<>();
         return (StructureWorldAccess) Proxy.newProxyInstance(
                 VanillaPlacedFeatureGenerator.class.getClassLoader(),
                 new Class<?>[] {StructureWorldAccess.class},
                 (proxy, method, arguments) -> invoke(
-                        world, cube, virtualCube, offsetY, legacyBoundaryReads,
+                        world, cube, virtualCube, virtualMinY, offsetY,
+                        legacyBoundaryReads, featureChunks,
                         method, arguments));
     }
 
     @SuppressWarnings("unchecked")
     private static Object invoke(
-            ServerWorld world, LoadedCube cube, BlockBox virtualCube, int offsetY,
-            boolean legacyBoundaryReads,
+            ServerWorld world, LoadedCube cube, BlockBox virtualCube,
+            int virtualMinY, int offsetY, boolean legacyBoundaryReads,
+            Map<Long, Chunk> featureChunks,
             Method method, Object[] arguments) throws Throwable {
         String name = method.getName();
+        if (!legacyBoundaryReads && "getChunk".equals(name)
+                && arguments != null && arguments.length >= 2
+                && arguments[0] instanceof Integer chunkX
+                && arguments[1] instanceof Integer chunkZ) {
+            long key = ((long) chunkX << 32) ^ (chunkZ & 0xFFFFFFFFL);
+            return featureChunks.computeIfAbsent(key, ignored ->
+                    createFeatureChunk(world, cube, virtualMinY, chunkX, chunkZ));
+        }
         if (!legacyBoundaryReads && "getTopY".equals(name)
                 && arguments != null && arguments.length == 3
                 && arguments[1] instanceof Integer x && arguments[2] instanceof Integer z) {
@@ -313,6 +343,20 @@ final class VanillaPlacedFeatureGenerator {
     private static BlockPos firstPos(Object[] arguments) {
         return arguments != null && arguments.length > 0 && arguments[0] instanceof BlockPos pos
                 ? pos : null;
+    }
+
+    private static Chunk createFeatureChunk(
+            ServerWorld world, LoadedCube cube, int virtualMinY,
+            int chunkX, int chunkZ) {
+        HeightLimitView height = HeightLimitView.create(VANILLA_BOTTOM_Y, VANILLA_HEIGHT);
+        ProtoChunk chunk = new ProtoChunk(
+                new ChunkPos(chunkX, chunkZ), UpgradeData.NO_UPGRADE_DATA,
+                height, world.getPalettesFactory(), null);
+        if (chunkX == cube.pos().x() && chunkZ == cube.pos().z()) {
+            int sectionIndex = Math.floorDiv(virtualMinY - VANILLA_BOTTOM_Y, CubePos.SIZE);
+            chunk.getSectionArray()[sectionIndex] = cube.section();
+        }
+        return chunk;
     }
 
     private static BlockPos translate(BlockPos pos, int offsetY) {

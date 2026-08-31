@@ -74,6 +74,13 @@ final class CustomCubeGenerator {
     /** Samples the migrated CustomTerrainGenerator equation at an exact point. */
     static double terrainDensity(
             ServerWorld world, CustomWorldSettings settings, int x, int y, int z) {
+        if (settings.biome() == null) {
+            // 1.21 no longer exposes baseHeight/heightVariation on Biome.  We
+            // still resolve the active biome at every sample so the terrain
+            // path uses the same world biome source as the feature filters;
+            // the replacement numeric fields below remain stable 2-D noise.
+            CustomGenerationSupport.biomeId(world, new BlockPos(x, y, z), null);
+        }
         return terrainDensity(world.getSeed(), settings, x, y, z);
     }
 
@@ -93,7 +100,12 @@ final class CustomCubeGenerator {
                 settings.highNoiseFrequencyX(), settings.highNoiseFrequencyY(),
                 settings.highNoiseFrequencyZ(), settings.highNoiseOctaves())
                 * settings.highNoiseFactor() + settings.highNoiseOffset();
-        double terrainNoise = low + (high - low) * selector;
+        // CustomTerrainGenerator adds the processed 2-D depth noise to the
+        // selector blend before applying biome volatility.  Keeping it in
+        // this term is important: depthNoise is a terrain perturbation, not
+        // an absolute height offset.
+        double terrainNoise = low + (high - low) * selector
+                + CustomNoise.depthNoise(seed ^ TERRAIN_SALT, x, z, settings);
 
         double scaleBase = Math.pow(2.0, -Math.min(1022, Math.max(0, settings.biomeSize())));
         double scaleRiver = Math.pow(2.0, -Math.min(1022, Math.max(0, settings.riverSize())));
@@ -105,11 +117,10 @@ final class CustomCubeGenerator {
                 scaleBase, scaleBase, 2);
         double volatilityBase = CustomNoise.clamp(0.5 + 0.5 * CustomNoise.octaveGradient2D(
                 seed ^ VOLATILITY_SALT, x, z, scaleRiver, scaleRiver, 2), 0.0, 1.0);
-        double depthNoise = CustomNoise.depthNoise(seed ^ TERRAIN_SALT, x, z, settings);
         // actualHeight is legacy preview/metadata, not a second density limit.
         // expectedBaseHeight/expectedHeightVariation are intentionally consumed
         // by ore conversion instead of silently changing this terrain equation.
-        double height = base * settings.heightFactor() + settings.heightOffset() + depthNoise;
+        double height = base * settings.heightFactor() + settings.heightOffset();
         if (height > y) {
             volatilityBase *= settings.specialHeightVariationFactorBelowAverageY();
         }

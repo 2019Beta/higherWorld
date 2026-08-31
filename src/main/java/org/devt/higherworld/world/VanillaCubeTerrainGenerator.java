@@ -5,7 +5,6 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 import net.minecraft.block.BlockState;
-import net.minecraft.block.Blocks;
 import net.minecraft.registry.RegistryEntryLookup;
 import net.minecraft.registry.RegistryKeys;
 import net.minecraft.registry.entry.RegistryEntry;
@@ -102,7 +101,7 @@ final class VanillaCubeTerrainGenerator {
         ChunkGeneratorSettings original = source.getSettings().value();
         NoiseRouter router = InfiniteDownwardGenerator.removeVanillaBottomSlide(
                 original.noiseRouter());
-        ChunkGeneratorSettings settings = copySettings(
+        ChunkGeneratorSettings settings = InfiniteNoiseSettings.createSparseSettings(
                 original, new GenerationShapeConfig(-128, BATCH_HEIGHT,
                         original.generationShapeConfig().horizontalSize(),
                         original.generationShapeConfig().verticalSize()), router);
@@ -120,24 +119,12 @@ final class VanillaCubeTerrainGenerator {
         GenerationShapeConfig shape = new GenerationShapeConfig(
                 minimumY, BATCH_HEIGHT,
                 originalShape.horizontalSize(), originalShape.verticalSize());
-        ChunkGeneratorSettings settings = copySettings(template, shape, template.noiseRouter());
-        return new NoiseChunkGenerator(source.getBiomeSource(), RegistryEntry.of(settings));
-    }
-
-    private static ChunkGeneratorSettings copySettings(
-            ChunkGeneratorSettings source, GenerationShapeConfig shape, NoiseRouter router) {
-        return new ChunkGeneratorSettings(
-                shape,
-                Blocks.DEEPSLATE.getDefaultState(),
-                source.defaultFluid(),
-                router,
-                source.surfaceRule(),
-                source.spawnTarget(),
-                source.seaLevel(),
-                source.mobGenerationDisabled(),
-                source.aquifers(),
-                source.oreVeins(),
-                source.usesLegacyRandom());
+        ChunkGeneratorSettings settings = InfiniteNoiseSettings.createSparseSettings(
+                template, shape, template.noiseRouter());
+        NoiseChunkGenerator generator = new NoiseChunkGenerator(
+                source.getBiomeSource(), RegistryEntry.of(settings));
+        InfiniteNoiseSettings.useContinuousAquifers(generator);
+        return generator;
     }
 
     private static final class Context {

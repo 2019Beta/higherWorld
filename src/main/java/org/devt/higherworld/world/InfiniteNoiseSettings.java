@@ -15,8 +15,6 @@ import org.devt.higherworld.mixin.NoiseConfigAccessor;
 
 /** Complete per-world noise settings for the unbounded-downward overworld. */
 final class InfiniteNoiseSettings {
-    private static final int VANILLA_LAVA_LEVEL = -54;
-
     private InfiniteNoiseSettings() {
     }
 
@@ -31,7 +29,8 @@ final class InfiniteNoiseSettings {
 
         NoiseChunkGeneratorAccessor accessor = (NoiseChunkGeneratorAccessor) (Object) generator;
         accessor.higherworld$setSettings(RegistryEntry.of(rewritten));
-        accessor.higherworld$setFluidLevelSampler(() -> dryDeepFluidSampler(rewritten));
+        accessor.higherworld$setFluidLevelSampler(() ->
+                continuousAquiferFluidSampler(rewritten));
 
         NoiseConfig noiseConfig = world.getChunkManager().getNoiseConfig();
         NoiseRouter sampledRouter = InfiniteDownwardGenerator.removeVanillaBottomSlide(
@@ -42,13 +41,14 @@ final class InfiniteNoiseSettings {
     static ChunkGeneratorSettings createSparseSettings(
             ChunkGeneratorSettings source, GenerationShapeConfig shape, NoiseRouter router) {
         return copy(source, shape, Blocks.DEEPSLATE.getDefaultState(),
-                Blocks.AIR.getDefaultState(), router, false);
+                source.defaultFluid(), router, true);
     }
 
-    static void makeSparseGeneratorDry(NoiseChunkGenerator generator) {
-        AquiferSampler.FluidLevel air = airLevel();
+    static void useContinuousAquifers(NoiseChunkGenerator generator) {
+        ChunkGeneratorSettings settings = generator.getSettings().value();
         ((NoiseChunkGeneratorAccessor) (Object) generator)
-                .higherworld$setFluidLevelSampler(() -> (x, y, z) -> air);
+                .higherworld$setFluidLevelSampler(() ->
+                        continuousAquiferFluidSampler(settings));
     }
 
     private static ChunkGeneratorSettings copy(
@@ -69,15 +69,17 @@ final class InfiniteNoiseSettings {
                 source.usesLegacyRandom());
     }
 
-    private static AquiferSampler.FluidLevelSampler dryDeepFluidSampler(
+    /**
+     * Vanilla's generator substitutes a fixed lava level below Y=-54. That
+     * state bypasses the aquifer noises entirely and becomes an infinite lava
+     * volume when the terrain has no lower bound. A single base level lets the
+     * floodedness, spread and lava-type noises decide every underground cell,
+     * so the field stays continuous across the former Y=-64 boundary.
+     */
+    private static AquiferSampler.FluidLevelSampler continuousAquiferFluidSampler(
             ChunkGeneratorSettings settings) {
-        AquiferSampler.FluidLevel air = airLevel();
-        AquiferSampler.FluidLevel water = new AquiferSampler.FluidLevel(
+        AquiferSampler.FluidLevel base = new AquiferSampler.FluidLevel(
                 settings.seaLevel(), settings.defaultFluid());
-        return (x, y, z) -> y < VANILLA_LAVA_LEVEL ? air : water;
-    }
-
-    private static AquiferSampler.FluidLevel airLevel() {
-        return new AquiferSampler.FluidLevel(Integer.MAX_VALUE, Blocks.AIR.getDefaultState());
+        return (x, y, z) -> base;
     }
 }
