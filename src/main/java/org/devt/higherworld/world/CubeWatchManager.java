@@ -24,6 +24,7 @@ public final class CubeWatchManager {
     // Cube creation runs vanilla noise and biome decoration. A small per-player
     // budget keeps initial view streaming from monopolizing the server thread.
     private static final int SENDS_PER_TICK = 2;
+    private static final int READ_AHEAD_PER_TICK = 8;
     private static final Map<UUID, WatchState> WATCHERS = new HashMap<>();
 
     private CubeWatchManager() {
@@ -31,13 +32,30 @@ public final class CubeWatchManager {
 
     public static void tick(ServerWorld world) {
         Set<UUID> present = new HashSet<>();
+        boolean watcherTicketsChanged = false;
         for (ServerPlayerEntity player : world.getPlayers()) {
             present.add(player.getUuid());
             WatchState state = WATCHERS.computeIfAbsent(player.getUuid(), ignored -> new WatchState());
-            update(player, state);
+            watcherTicketsChanged |= update(player, state);
         }
-        WATCHERS.entrySet().removeIf(entry -> !present.contains(entry.getKey())
-                && entry.getValue().world == world);
+        Iterator<Map.Entry<UUID, WatchState>> watchers = WATCHERS.entrySet().iterator();
+        while (watchers.hasNext()) {
+            Map.Entry<UUID, WatchState> entry = watchers.next();
+            if (!present.contains(entry.getKey()) && entry.getValue().world == world) {
+                watchers.remove();
+                watcherTicketsChanged = true;
+            }
+        }
+
+        if (watcherTicketsChanged) {
+            Set<CubePos> requestedReads = new HashSet<>();
+            for (WatchState state : WATCHERS.values()) {
+                if (state.world == world) {
+                    requestedReads.addAll(state.pending);
+                }
+            }
+            CubicWorldManager.retainPrefetches(world, requestedReads);
+        }
 
         // Cache eviction is maintenance, not simulation. Running the full cache
         // walk every server tick creates avoidable allocation and CPU pressure.
@@ -84,14 +102,28 @@ public final class CubeWatchManager {
         }
     }
 
-    private static void update(ServerPlayerEntity player, WatchState state) {
+    private static boolean update(ServerPlayerEntity player, WatchState state) {
         ServerWorld world = player.getEntityWorld();
         CubePos center = CubePos.fromBlock(
                 player.getBlockX(), player.getBlockY(), player.getBlockZ());
         int horizontalRadius = player.getViewDistance();
+        boolean rebuilt = false;
         if (state.world != world || !center.equals(state.center)
                 || state.horizontalRadius != horizontalRadius) {
             rebuildQueue(player, state, world, center, horizontalRadius);
+            rebuilt = true;
+        }
+
+        int prefetched = 0;
+        for (CubePos pos : state.pending) {
+            if (prefetched >= READ_AHEAD_PER_TICK) {
+                break;
+            }
+            if (withinView(pos, state.center, state.horizontalRadius)
+                    && isOutsideVanillaHeight(world, pos) && !state.sent.contains(pos)) {
+                CubicWorldManager.prefetchCubePayload(world, pos, cubePriority(pos, state.center));
+                prefetched++;
+            }
         }
 
         int processed = 0;
@@ -109,7 +141,14 @@ public final class CubeWatchManager {
                 state.pending.addFirst(pos);
                 break;
             }
-            byte[] payload = CubicWorldManager.cubePayload(world, pos);
+            byte[] payload = CubicWorldManager.tryCubePayload(
+                    world, pos, cubePriority(pos, state.center));
+            if (payload == null) {
+                // Rotate pending reads so a slow region cannot head-of-line block
+                // cubes whose IO has already completed.
+                state.pending.addLast(pos);
+                continue;
+            }
             if (payload.length != 0 && CubeDataPayload.canEncode(payload)) {
                 ServerPlayNetworking.send(player, new CubeDataPayload(pos, payload));
             }
@@ -118,13 +157,16 @@ public final class CubeWatchManager {
             // every time the player crosses a section boundary.
             state.sent.add(pos);
         }
+        return rebuilt;
     }
 
     private static void rebuildQueue(
             ServerPlayerEntity player, WatchState state, ServerWorld world, CubePos center,
             int horizontalRadius) {
         if (state.world != null && state.world != world) {
+            ServerWorld previousWorld = state.world;
             unloadAll(player, state);
+            retainWorldPrefetches(previousWorld, state);
         }
         state.world = world;
         state.center = center;
@@ -154,7 +196,7 @@ public final class CubeWatchManager {
                 }
             }
         }
-        pending.sort(Comparator.comparingInt(pos -> squaredDistance(pos, center)));
+        pending.sort(Comparator.comparingInt(pos -> cubePriority(pos, center)));
         state.pending.addAll(pending);
     }
 
@@ -168,17 +210,35 @@ public final class CubeWatchManager {
         state.pending.clear();
     }
 
-    private static boolean withinView(CubePos pos, CubePos center, int horizontalRadius) {
-        return Math.abs(pos.x() - center.x()) <= horizontalRadius
-                && Math.abs(pos.y() - center.y()) <= VERTICAL_RADIUS
-                && Math.abs(pos.z() - center.z()) <= horizontalRadius;
+    private static void retainWorldPrefetches(ServerWorld world, WatchState excluded) {
+        Set<CubePos> requestedReads = new HashSet<>();
+        for (WatchState state : WATCHERS.values()) {
+            if (state != excluded && state.world == world) {
+                requestedReads.addAll(state.pending);
+            }
+        }
+        CubicWorldManager.retainPrefetches(world, requestedReads);
     }
 
-    private static int squaredDistance(CubePos pos, CubePos center) {
-        int dx = pos.x() - center.x();
-        int dy = pos.y() - center.y();
-        int dz = pos.z() - center.z();
-        return dx * dx + dy * dy + dz * dz;
+    private static boolean withinView(CubePos pos, CubePos center, int horizontalRadius) {
+        return coordinateDistance(pos.x(), center.x()) <= horizontalRadius
+                && coordinateDistance(pos.y(), center.y()) <= VERTICAL_RADIUS
+                && coordinateDistance(pos.z(), center.z()) <= horizontalRadius;
+    }
+
+    private static int cubePriority(CubePos pos, CubePos center) {
+        long dx = coordinateDistance(pos.x(), center.x());
+        long dy = coordinateDistance(pos.y(), center.y());
+        long dz = coordinateDistance(pos.z(), center.z());
+        long horizontalShell = Math.max(dx, dz);
+        // Anisotropic priority matches the 3D ticket shape: horizontal view
+        // distance is large, while vertical demand is a narrow fixed column.
+        long priority = horizontalShell * horizontalShell * (VERTICAL_RADIUS + 1L) + dy * dy;
+        return (int) Math.min(Integer.MAX_VALUE, priority);
+    }
+
+    private static long coordinateDistance(int first, int second) {
+        return Math.abs((long) first - second);
     }
 
     private static boolean watches(ServerPlayerEntity player, CubePos pos) {

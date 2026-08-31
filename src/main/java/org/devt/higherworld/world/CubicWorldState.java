@@ -17,14 +17,17 @@ import net.minecraft.util.math.BlockPos;
 import net.minecraft.world.chunk.ChunkSection;
 import net.minecraft.world.rule.GameRules;
 import org.devt.higherworld.Higherworld;
+import org.devt.higherworld.storage.CubeIoScheduler;
 import org.devt.higherworld.storage.CubePos;
 import org.devt.higherworld.storage.CubeStorage;
 
 /** Runtime cube cache and persistence boundary for one server dimension. */
 final class CubicWorldState implements AutoCloseable {
     private static final byte[] EMPTY_PAYLOAD = new byte[0];
+    private static final int SYNCHRONOUS_IO_PRIORITY = 0;
     private final ServerWorld world;
     private final CubeStorage storage;
+    private final CubeIoScheduler ioScheduler;
     private final boolean generateInfinitelyDownward;
     private final boolean customWorld;
     private final boolean generateStructures;
@@ -39,6 +42,7 @@ final class CubicWorldState implements AutoCloseable {
             CustomWorldSettings customWorldSettings) {
         this.world = world;
         this.storage = storage;
+        this.ioScheduler = new CubeIoScheduler(storage);
         this.generateInfinitelyDownward = CubicWorldManager.generatesInfinitelyDownward(world);
         this.customWorld = CubicWorldManager.generatesCustomWorld(world);
         this.generateStructures = generateStructures;
@@ -92,7 +96,7 @@ final class CubicWorldState implements AutoCloseable {
             return loaded;
         }
 
-        return loadOrRegister(pos, storage.read(pos).orElse(null));
+        return loadOrRegister(pos, ioScheduler.read(pos, SYNCHRONOUS_IO_PRIORITY).orElse(null));
     }
 
     int loadedCubeCount() {
@@ -104,15 +108,50 @@ final class CubicWorldState implements AutoCloseable {
     }
 
     byte[] cubePayload(CubePos pos) throws IOException {
-        CubeColumn<LoadedCube> column = columns.get(new ColumnPos(pos.x(), pos.z()));
-        LoadedCube loaded = column == null ? null : column.get(pos.y());
+        LoadedCube loaded = loadedCube(pos);
         if (loaded != null) {
             return CubeRecordCodec.encode(loaded, world);
         }
 
+        Optional<byte[]> stored = ioScheduler.read(pos, SYNCHRONOUS_IO_PRIORITY);
+        return finishCubePayload(pos, stored);
+    }
+
+    void prefetchCubePayload(CubePos pos, int priority) {
+        if (loadedCube(pos) == null) {
+            ioScheduler.prefetch(pos, priority);
+        }
+    }
+
+    void retainPrefetches(Set<CubePos> retained) {
+        ioScheduler.retainPrefetches(retained);
+    }
+
+    /**
+     * Advances the IO -> live-cube boundary without ever waiting for disk on the
+     * server thread. Returns {@code null} while the deduplicated read is pending.
+     */
+    byte[] tryCubePayload(CubePos pos, int priority) throws IOException {
+        LoadedCube loaded = loadedCube(pos);
+        if (loaded != null) {
+            return CubeRecordCodec.encode(loaded, world);
+        }
+
+        CubeIoScheduler.ReadResult result = ioScheduler.poll(pos, priority);
+        if (!result.ready()) {
+            return null;
+        }
+        return finishCubePayload(pos, result.payload());
+    }
+
+    private LoadedCube loadedCube(CubePos pos) {
+        CubeColumn<LoadedCube> column = columns.get(new ColumnPos(pos.x(), pos.z()));
+        return column == null ? null : column.get(pos.y());
+    }
+
+    private byte[] finishCubePayload(CubePos pos, Optional<byte[]> stored) throws IOException {
         // A missing sparse cube is implicitly air unless this world's selected
         // preset asks HigherWorld to lazily generate the terrain below it.
-        Optional<byte[]> stored = storage.read(pos);
         if (stored.isEmpty()) {
             if (!shouldGenerate(pos)) {
                 return EMPTY_PAYLOAD;
@@ -351,6 +390,8 @@ final class CubicWorldState implements AutoCloseable {
 
     @Override
     public void close() throws IOException {
+        // No storage handle is closed while an asynchronous read can still own it.
+        ioScheduler.close();
         IOException failure = null;
         for (LoadedCube cube : List.copyOf(loadedCubes())) {
             try {

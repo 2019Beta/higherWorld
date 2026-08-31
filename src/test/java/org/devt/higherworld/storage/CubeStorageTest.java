@@ -8,6 +8,10 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.nio.file.Files;
 import java.nio.file.StandardOpenOption;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.Executors;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -66,6 +70,28 @@ class CubeStorageTest {
             assertEquals(64, storage.openRegionCount());
             assertArrayEquals(new byte[] {0}, storage.read(new CubePos(0, 0, 0)).orElseThrow());
             assertEquals(64, storage.openRegionCount());
+        }
+    }
+
+    @Test
+    void supportsConcurrentIoAcrossIndependentRegions() throws Exception {
+        try (CubeStorage storage = new CubeStorage(directory);
+                var executor = Executors.newFixedThreadPool(4)) {
+            List<Callable<Void>> operations = new ArrayList<>();
+            for (int region = 0; region < 24; region++) {
+                int id = region;
+                operations.add(() -> {
+                    CubePos pos = new CubePos(id * CubePos.REGION_DIAMETER, id, -id);
+                    byte[] payload = new byte[] {(byte) id, (byte) (id * 3)};
+                    storage.write(pos, payload);
+                    assertArrayEquals(payload, storage.read(pos).orElseThrow());
+                    return null;
+                });
+            }
+            for (var future : executor.invokeAll(operations)) {
+                future.get();
+            }
+            assertTrue(storage.openRegionCount() <= 64);
         }
     }
 }

@@ -35,6 +35,8 @@ public final class CustomWorldScreen extends Screen {
     private CustomWorldSettings draft;
     private Page page = Page.BASIC;
     private CustomSettingsList settingsList;
+    private CustomTerrainPreviewWidget previewWidget;
+    private CustomWorldSettings lastPreviewSettings;
     private final Map<String, TextFieldWidget> fields = new LinkedHashMap<>();
     private final Set<String> invalidFields = new LinkedHashSet<>();
     private String error;
@@ -43,6 +45,7 @@ public final class CustomWorldScreen extends Screen {
         super(Text.translatable("screen.higherworld.custom.title"));
         this.parent = parent;
         this.draft = CustomWorldSettings.clientSelection();
+        this.lastPreviewSettings = this.draft;
     }
 
     @Override
@@ -51,12 +54,57 @@ public final class CustomWorldScreen extends Screen {
         invalidFields.clear();
         int contentTop = 80;
         int footerTop = height - 54;
-        int listWidth = Math.min(760, Math.max(300, width - 20));
-        int listHeight = Math.max(40, footerTop - contentTop);
+        int listTop = contentTop;
+        int listWidth;
+        int listHeight;
+        int listX;
+        previewWidget = null;
+        if (page == Page.ADVANCED && width >= 760) {
+            int gap = 12;
+            int available = Math.max(0, width - 20);
+            int previewWidth = Math.min(300, Math.max(240, available / 3));
+            listWidth = Math.max(360, available - previewWidth - gap);
+            int totalWidth = listWidth + gap + previewWidth;
+            if (totalWidth > available) {
+                listWidth = Math.max(1, available - gap - previewWidth);
+                totalWidth = listWidth + gap + previewWidth;
+            }
+            listX = Math.max(0, (width - totalWidth) / 2);
+            listHeight = Math.max(40, footerTop - listTop);
+            int previewHeight = Math.max(40, Math.min(listHeight, 360));
+            previewWidget = new CustomTerrainPreviewWidget(
+                    listX + listWidth + gap, contentTop, previewWidth, previewHeight,
+                    this::previewSettings);
+        } else if (page == Page.ADVANCED) {
+            int available = Math.max(40, footerTop - contentTop);
+            int previewHeight = available >= 160
+                    ? Math.min(140, Math.max(110, available / 3))
+                    : Math.max(1, available / 2);
+            int remaining = available - previewHeight - 10;
+            if (remaining < 40 && available >= 51) {
+                previewHeight = available - 50;
+                remaining = 40;
+            }
+            listTop = contentTop + previewHeight + 10;
+            listWidth = Math.max(1, width - 20);
+            listHeight = Math.max(40, remaining);
+            listX = (width - listWidth) / 2;
+            previewWidget = new CustomTerrainPreviewWidget(
+                    listX, contentTop, listWidth, previewHeight,
+                    this::previewSettings);
+        } else {
+            listWidth = Math.min(760, Math.max(300, width - 20));
+            listHeight = Math.max(40, footerTop - listTop);
+            listX = (width - listWidth) / 2;
+        }
         settingsList = new CustomSettingsList(
-                client, listWidth, listHeight, contentTop, CustomSettingsList.ROW_HEIGHT);
-        settingsList.setX((width - listWidth) / 2);
+                client, listWidth, listHeight, listTop, CustomSettingsList.ROW_HEIGHT);
+        settingsList.setX(listX);
         addDrawableChild(settingsList);
+        if (previewWidget != null) {
+            previewWidget.setTooltip(Tooltip.of(Text.translatable("custom.preview.description")));
+            addDrawableChild(previewWidget);
+        }
         buildTabs();
         buildPage();
         buildFooter();
@@ -329,6 +377,9 @@ public final class CustomWorldScreen extends Screen {
         field.setMaxLength(4096);
         field.setText(value);
         field.setTooltip(Tooltip.of(Text.translatable(labelKey + ".tooltip")));
+        if (page == Page.ADVANCED) {
+            field.setChangedListener(ignored -> markPreviewDirty());
+        }
         fields.put(id, field);
         settingsList.addRow(Text.translatable(labelKey), field);
     }
@@ -351,6 +402,7 @@ public final class CustomWorldScreen extends Screen {
                         default -> throw new IllegalStateException("unknown sample size " + id);
                     }
                     draft = builder.build();
+                    markPreviewDirty();
                 });
         button.setWidth(230);
         settingsList.addRow(Text.translatable("custom.field." + id), button);
@@ -362,9 +414,10 @@ public final class CustomWorldScreen extends Screen {
             TextFieldWidget x = fields.get(prefix + "FrequencyX");
             TextFieldWidget z = fields.get(prefix + "FrequencyZ");
             if (x != null && z != null) {
-                x.setText(z.getText());
+                z.setText(x.getText());
             }
         }
+        markPreviewDirty();
     }
 
     private void switchPage(Page target) {
@@ -410,6 +463,34 @@ public final class CustomWorldScreen extends Screen {
                     ? Text.translatable("custom.error.invalid").getString()
                     : exception.getMessage();
             return false;
+        }
+    }
+
+    /**
+     * Builds a temporary valid snapshot for the preview without committing the
+     * form.  While a field is incomplete or invalid, the preview stays at its
+     * last valid snapshot and the form remains responsible for showing errors.
+     */
+    private CustomWorldSettings previewSettings() {
+        if (page != Page.ADVANCED || fields.isEmpty()) {
+            return lastPreviewSettings == null ? draft : lastPreviewSettings;
+        }
+        try {
+            CustomWorldSettings.Builder builder = draft.toBuilder();
+            for (Map.Entry<String, TextFieldWidget> entry : fields.entrySet()) {
+                applyAdvancedNumber(builder, entry.getKey(), entry.getValue().getText());
+            }
+            CustomWorldSettings value = builder.build();
+            lastPreviewSettings = value;
+            return value;
+        } catch (RuntimeException ignored) {
+            return lastPreviewSettings == null ? draft : lastPreviewSettings;
+        }
+    }
+
+    private void markPreviewDirty() {
+        if (previewWidget != null) {
+            previewWidget.markDirty();
         }
     }
 
@@ -564,12 +645,16 @@ public final class CustomWorldScreen extends Screen {
 
     void applyPreset(CustomWorldSettings value) {
         draft = value;
+        lastPreviewSettings = value;
+        markPreviewDirty();
         error = null;
         clearAndInit();
     }
 
     private void resetDraft() {
         draft = CustomWorldSettings.customDefaults();
+        lastPreviewSettings = draft;
+        markPreviewDirty();
         error = null;
         clearAndInit();
     }

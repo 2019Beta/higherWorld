@@ -187,6 +187,40 @@ public final class CubicWorldManager {
         }
     }
 
+    /** Queues disk IO for a watched cube without touching live world state. */
+    public static void prefetchCubePayload(ServerWorld world, CubePos pos, int priority) {
+        CubicWorldState state = WORLDS.get(world);
+        if (state != null) {
+            state.prefetchCubePayload(pos, priority);
+        }
+    }
+
+    /** Drops queued read-ahead work after its last 3D watcher ticket disappears. */
+    public static void retainPrefetches(ServerWorld world, Set<CubePos> retained) {
+        CubicWorldState state = WORLDS.get(world);
+        if (state != null) {
+            state.retainPrefetches(retained);
+        }
+    }
+
+    /**
+     * Returns {@code null} while asynchronous IO is pending. Generation and
+     * serialization still run on the server thread once the read completes.
+     */
+    public static byte[] tryCubePayload(ServerWorld world, CubePos pos, int priority) {
+        CubicWorldState state = WORLDS.get(world);
+        if (state == null) {
+            return new byte[0];
+        }
+        try {
+            return state.tryCubePayload(pos, priority);
+        } catch (IOException | RuntimeException exception) {
+            Higherworld.LOGGER.error("Cannot asynchronously load cube {} in {}",
+                    pos, world.getRegistryKey().getValue(), exception);
+            return new byte[0];
+        }
+    }
+
     public static void flushDirty(ServerWorld world) {
         CubicWorldState state = WORLDS.get(world);
         if (state == null) {
