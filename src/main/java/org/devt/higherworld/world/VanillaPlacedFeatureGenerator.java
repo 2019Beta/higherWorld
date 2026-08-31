@@ -46,11 +46,7 @@ final class VanillaPlacedFeatureGenerator {
     private static final int VANILLA_BOTTOM_Y = -64;
     private static final int VANILLA_HEIGHT = 384;
     private static final int REPEATED_BAND_HEIGHT = 64;
-    private static final Set<String> UNSUPPORTED_DECORATIONS = Set.of(
-            "glow_lichen",
-            "dripstone_cluster",
-            "large_dripstone",
-            "pointed_dripstone");
+    private static final int FEATURE_ORIGIN_RADIUS = 1;
     private static final List<GenerationStep.Feature> SAFE_UNDERGROUND_STEPS = List.of(
             GenerationStep.Feature.RAW_GENERATION,
             GenerationStep.Feature.LOCAL_MODIFICATIONS,
@@ -83,40 +79,54 @@ final class VanillaPlacedFeatureGenerator {
             ServerWorld world, LoadedCube cube, List<GenerationStep.Feature> steps,
             boolean legacyBoundaryReads) {
         int depthIndex = world.getBottomSectionCoord() - 1 - cube.pos().y();
+        int sectionsPerBand = REPEATED_BAND_HEIGHT / CubePos.SIZE;
+        int virtualSectionIndex = sectionsPerBand - 1
+                - Math.floorMod(depthIndex, sectionsPerBand);
         int virtualMinY = VANILLA_BOTTOM_Y
-                + Math.floorMod(depthIndex, REPEATED_BAND_HEIGHT / CubePos.SIZE) * CubePos.SIZE;
+                + virtualSectionIndex * CubePos.SIZE;
         int offsetY = cube.pos().minBlockY() - virtualMinY;
-        long repeatedBand = Math.floorDiv(depthIndex, REPEATED_BAND_HEIGHT / CubePos.SIZE);
-        StructureWorldAccess access = translatedAccess(
-                world, cube, virtualMinY, offsetY, legacyBoundaryReads);
+        long repeatedBand = Math.floorDiv(depthIndex, sectionsPerBand);
         ChunkGenerator generator = world.getChunkManager().getChunkGenerator();
         Registry<PlacedFeature> registry = world.getRegistryManager()
                 .getOrThrow(RegistryKeys.PLACED_FEATURE);
-        List<FeatureCall> features = collectFeatures(
-                world, cube, virtualMinY, generator, steps);
-        ChunkRandom random = new ChunkRandom(new Xoroshiro128PlusPlusRandom(
-                world.getSeed() ^ repeatedBand * 0x9E3779B97F4A7C15L));
-        long populationSeed = random.setPopulationSeed(
-                world.getSeed() ^ repeatedBand * 0xD1B54A32D192ED03L,
-                cube.pos().minBlockX(), cube.pos().minBlockZ());
-        BlockPos origin = new BlockPos(
-                cube.pos().minBlockX(), VANILLA_BOTTOM_Y, cube.pos().minBlockZ());
+        long bandSeed = world.getSeed() ^ repeatedBand * 0xD1B54A32D192ED03L;
 
-        for (FeatureCall call : features) {
-            PlacedFeature feature = call.feature();
-            int registryId = registry.getRawId(feature);
-            int decoratorIndex = registryId >= 0 ? registryId : call.index();
-            random.setDecoratorSeed(populationSeed, decoratorIndex, call.step().ordinal());
-            feature.generate(access, generator, random, origin);
+        // Vanilla decorates a chunk region and permits features to spill into
+        // neighbouring chunks. Sparse cubes have no writable ChunkRegion, so
+        // replay every nearby source chunk and retain only writes intersecting
+        // this cube. Each cube reconstructs the same complete feature boundary.
+        for (int chunkZ = cube.pos().z() - FEATURE_ORIGIN_RADIUS;
+                chunkZ <= cube.pos().z() + FEATURE_ORIGIN_RADIUS; chunkZ++) {
+            for (int chunkX = cube.pos().x() - FEATURE_ORIGIN_RADIUS;
+                    chunkX <= cube.pos().x() + FEATURE_ORIGIN_RADIUS; chunkX++) {
+                int originX = chunkX * CubePos.SIZE;
+                int originZ = chunkZ * CubePos.SIZE;
+                List<FeatureCall> features = collectFeatures(
+                        world, originX, originZ, virtualMinY, generator, steps);
+                StructureWorldAccess access = translatedAccess(
+                        world, cube, virtualMinY, offsetY, legacyBoundaryReads);
+                ChunkRandom random = new ChunkRandom(new Xoroshiro128PlusPlusRandom(
+                        world.getSeed() ^ repeatedBand * 0x9E3779B97F4A7C15L));
+                long populationSeed = random.setPopulationSeed(
+                        bandSeed, originX, originZ);
+                BlockPos origin = new BlockPos(originX, VANILLA_BOTTOM_Y, originZ);
+
+                for (FeatureCall call : features) {
+                    PlacedFeature feature = call.feature();
+                    int registryId = registry.getRawId(feature);
+                    int decoratorIndex = registryId >= 0 ? registryId : call.index();
+                    random.setDecoratorSeed(
+                            populationSeed, decoratorIndex, call.step().ordinal());
+                    feature.generate(access, generator, random, origin);
+                }
+            }
         }
     }
 
     private static List<FeatureCall> collectFeatures(
-            ServerWorld world, LoadedCube cube, int virtualMinY, ChunkGenerator generator,
-            List<GenerationStep.Feature> allowedSteps) {
+            ServerWorld world, int baseX, int baseZ, int virtualMinY,
+            ChunkGenerator generator, List<GenerationStep.Feature> allowedSteps) {
         Set<RegistryEntry<Biome>> biomes = new LinkedHashSet<>();
-        int baseX = cube.pos().minBlockX();
-        int baseZ = cube.pos().minBlockZ();
         for (int z = 2; z < CubePos.SIZE; z += 4) {
             for (int x = 2; x < CubePos.SIZE; x += 4) {
                 biomes.add(world.getBiome(new BlockPos(
@@ -126,8 +136,6 @@ final class VanillaPlacedFeatureGenerator {
 
         List<FeatureCall> result = new ArrayList<>();
         Set<PlacedFeature> seen = java.util.Collections.newSetFromMap(new IdentityHashMap<>());
-        Registry<PlacedFeature> registry = world.getRegistryManager()
-                .getOrThrow(RegistryKeys.PLACED_FEATURE);
         for (RegistryEntry<Biome> biome : biomes) {
             GenerationSettings settings = generator.getGenerationSettings(biome);
             List<RegistryEntryList<PlacedFeature>> steps = settings.getFeatures();
@@ -139,12 +147,6 @@ final class VanillaPlacedFeatureGenerator {
                 RegistryEntryList<PlacedFeature> entries = steps.get(stepIndex);
                 for (int index = 0; index < entries.size(); index++) {
                     PlacedFeature feature = entries.get(index).value();
-                    var id = registry.getId(feature);
-                    if (step == GenerationStep.Feature.UNDERGROUND_DECORATION
-                            && id != null && "minecraft".equals(id.getNamespace())
-                            && UNSUPPORTED_DECORATIONS.contains(id.getPath())) {
-                        continue;
-                    }
                     if (seen.add(feature)) {
                         result.add(new FeatureCall(step, index, feature));
                     }
@@ -190,18 +192,18 @@ final class VanillaPlacedFeatureGenerator {
         if (!legacyBoundaryReads && "getTopY".equals(name)
                 && arguments != null && arguments.length == 3
                 && arguments[1] instanceof Integer x && arguments[2] instanceof Integer z) {
-            return getVirtualTopY(cube, virtualCube, x, z);
+            return getVirtualTopY(world, cube, virtualCube, x, z);
         }
         if (!legacyBoundaryReads && "getTopY".equals(name)
                 && arguments != null && arguments.length == 2
                 && arguments[1] instanceof BlockPos pos) {
-            return getVirtualTopY(cube, virtualCube, pos.getX(), pos.getZ());
+            return getVirtualTopY(world, cube, virtualCube, pos.getX(), pos.getZ());
         }
         if (!legacyBoundaryReads && "getTopPosition".equals(name)
                 && arguments != null && arguments.length == 2
                 && arguments[1] instanceof BlockPos pos) {
             return new BlockPos(pos.getX(),
-                    getVirtualTopY(cube, virtualCube, pos.getX(), pos.getZ()), pos.getZ());
+                    getVirtualTopY(world, cube, virtualCube, pos.getX(), pos.getZ()), pos.getZ());
         }
         BlockPos virtualPos = firstPos(arguments);
         if ("setBlockState".equals(name) && virtualPos != null
@@ -232,17 +234,19 @@ final class VanillaPlacedFeatureGenerator {
             if (virtualCube.contains(virtualPos)) {
                 return cube.getBlockState(translate(virtualPos, offsetY));
             }
-            if (!legacyBoundaryReads || !isInVanillaHeight(virtualPos)) {
-                return Blocks.AIR.getDefaultState();
+            if (isInVanillaHeight(virtualPos)) {
+                return world.getBlockState(virtualPos);
             }
+            return Blocks.AIR.getDefaultState();
         }
         if ("getFluidState".equals(name) && virtualPos != null) {
             if (virtualCube.contains(virtualPos)) {
                 return cube.getFluidState(translate(virtualPos, offsetY));
             }
-            if (!legacyBoundaryReads || !isInVanillaHeight(virtualPos)) {
-                return Fluids.EMPTY.getDefaultState();
+            if (isInVanillaHeight(virtualPos)) {
+                return world.getFluidState(virtualPos);
             }
+            return Fluids.EMPTY.getDefaultState();
         }
         if ("getBlockEntity".equals(name) && virtualPos != null && virtualCube.contains(virtualPos)) {
             BlockEntity blockEntity = cube.getBlockEntity(translate(virtualPos, offsetY));
@@ -253,14 +257,24 @@ final class VanillaPlacedFeatureGenerator {
             return blockEntity;
         }
         if ("getBlockEntity".equals(name) && virtualPos != null
-                && (!legacyBoundaryReads || !isInVanillaHeight(virtualPos))) {
+                && !virtualCube.contains(virtualPos)) {
+            if (isInVanillaHeight(virtualPos)) {
+                if (arguments.length == 2) {
+                    BlockEntity blockEntity = world.getBlockEntity(virtualPos);
+                    return blockEntity != null
+                            && arguments[1] instanceof net.minecraft.block.entity.BlockEntityType<?> type
+                            && blockEntity.getType() == type
+                            ? Optional.of(blockEntity) : Optional.empty();
+                }
+                return world.getBlockEntity(virtualPos);
+            }
             return arguments.length == 2 ? Optional.empty() : null;
         }
         if ("testBlockState".equals(name) && virtualPos != null
                 && arguments[1] instanceof Predicate<?> predicate) {
             BlockState state = virtualCube.contains(virtualPos)
                     ? cube.getBlockState(translate(virtualPos, offsetY))
-                    : legacyBoundaryReads && isInVanillaHeight(virtualPos)
+                    : isInVanillaHeight(virtualPos)
                             ? world.getBlockState(virtualPos)
                             : Blocks.AIR.getDefaultState();
             return ((Predicate<BlockState>) predicate).test(state);
@@ -269,7 +283,7 @@ final class VanillaPlacedFeatureGenerator {
                 && arguments[1] instanceof Predicate<?> predicate) {
             FluidState state = virtualCube.contains(virtualPos)
                     ? cube.getFluidState(translate(virtualPos, offsetY))
-                    : legacyBoundaryReads && isInVanillaHeight(virtualPos)
+                    : isInVanillaHeight(virtualPos)
                             ? world.getFluidState(virtualPos)
                             : Fluids.EMPTY.getDefaultState();
             return ((Predicate<FluidState>) predicate).test(state);
@@ -294,7 +308,10 @@ final class VanillaPlacedFeatureGenerator {
         }
         if (("isValidForSetBlock".equals(name) || "isInBuildLimit".equals(name)
                 || "isInLoadLimit".equals(name)) && virtualPos != null) {
-            return virtualCube.contains(virtualPos);
+            // The feature may be centred in an adjacent 16-block section while
+            // still intersecting this target cube. Limit only by the virtual
+            // world's height; setBlockState remains clipped to the target cube.
+            return isInVanillaHeight(virtualPos);
         }
         if ("markBlockForPostProcessing".equals(name)) {
             // ProtoChunk post-processing lists do not exist for sparse cubes.
@@ -329,8 +346,7 @@ final class VanillaPlacedFeatureGenerator {
             return y < VANILLA_BOTTOM_Y || y >= VANILLA_BOTTOM_Y + VANILLA_HEIGHT;
         }
         if (("scheduleBlockTick".equals(name) || "scheduleFluidTick".equals(name)
-                || "scheduleTick".equals(name)) && virtualPos != null
-                && virtualCube.contains(virtualPos)) {
+                || "scheduleTick".equals(name)) && virtualPos != null) {
             return null;
         }
         try {
@@ -364,9 +380,17 @@ final class VanillaPlacedFeatureGenerator {
     }
 
     private static int getVirtualTopY(
-            LoadedCube cube, BlockBox virtualCube, int blockX, int blockZ) {
+            ServerWorld world, LoadedCube cube, BlockBox virtualCube,
+            int blockX, int blockZ) {
         if (blockX < virtualCube.getMinX() || blockX > virtualCube.getMaxX()
                 || blockZ < virtualCube.getMinZ() || blockZ > virtualCube.getMaxZ()) {
+            BlockPos.Mutable mutable = new BlockPos.Mutable();
+            for (int y = virtualCube.getMaxY(); y >= virtualCube.getMinY(); y--) {
+                mutable.set(blockX, y, blockZ);
+                if (!world.getBlockState(mutable).isAir()) {
+                    return y + 1;
+                }
+            }
             return virtualCube.getMinY();
         }
         int localX = blockX - virtualCube.getMinX();

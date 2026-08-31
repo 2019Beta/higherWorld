@@ -128,7 +128,7 @@ final class VanillaStructureGenerator {
         if ("trial_chambers".equals(path)) {
             return settings.enables(UndergroundStructure.TRIAL_CHAMBERS);
         }
-        if (customSettings == null || settings.enabledStructures().isEmpty()) {
+        if (customSettings == null) {
             return false;
         }
         if (isVillage(path)) {

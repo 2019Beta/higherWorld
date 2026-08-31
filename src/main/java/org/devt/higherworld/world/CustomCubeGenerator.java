@@ -22,13 +22,15 @@ final class CustomCubeGenerator {
 
     static void generate(
             ServerWorld world, LoadedCube cube, CustomWorldSettings settings,
-            StructureGenerationSettings structureSettings) {
+            StructureGenerationSettings structureSettings, boolean generateStructures) {
         fillTerrain(world, cube, settings);
         CustomCaveGenerator.generate(world, cube, settings.caves());
         if (settings.ravines()) {
             CustomCaveGenerator.generateRavine(world, cube);
         }
-        VanillaStructureGenerator.generate(world, cube, structureSettings, settings);
+        if (generateStructures) {
+            VanillaStructureGenerator.generate(world, cube, structureSettings, settings);
+        }
         CustomLakeGenerator.generate(world, cube, settings);
         CustomDungeonGenerator.generate(world, cube, settings);
         CustomOreGenerator.generateUniform(world, cube, settings);

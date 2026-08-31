@@ -48,7 +48,6 @@ final class InfiniteDownwardGenerator {
         }
         VanillaStructureGenerator.generate(world, cube, structureSettings);
         VanillaPlacedFeatureGenerator.generate(world, cube);
-        removeUnsupportedDecorations(cube);
         cube.setGenerationVersion(GENERATION_VERSION);
         cube.markDirty();
     }

@@ -67,11 +67,16 @@ final class CustomOreGenerator {
             }
             int y = minY + random.nextInt(maxY - minY + 1);
             if (periodic) {
-                double mean = settings.expectedBaseHeight()
-                        + ore.heightMean() * settings.expectedHeightVariation();
+                // PopulatorUtils converted the normalized values through float
+                // configuration fields and rounded the resulting world heights.
+                // Keep that legacy conversion here so a periodic distribution is
+                // identical for fractional means/spacings as well.
+                double mean = Math.round((float) (settings.expectedBaseHeight()
+                        + ore.heightMean() * settings.expectedHeightVariation()));
                 double standardDeviation = ore.heightStdDeviation()
                         * settings.expectedHeightVariation();
-                double spacing = ore.heightSpacing() * settings.expectedHeightVariation();
+                double spacing = Math.round((float) (ore.heightSpacing()
+                        * settings.expectedHeightVariation()));
                 double cyclicProbability = cyclicBellCurveProbability(
                         y, mean, standardDeviation, spacing);
                 if (random.nextDouble() >= cyclicProbability) {

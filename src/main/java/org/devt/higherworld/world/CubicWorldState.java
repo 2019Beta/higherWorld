@@ -238,7 +238,8 @@ final class CubicWorldState implements AutoCloseable {
             }
         } else if (shouldGenerate(pos)) {
             if (customWorld) {
-                CustomCubeGenerator.generate(world, cube, customWorldSettings, effectiveStructureSettings());
+                CustomCubeGenerator.generate(world, cube, customWorldSettings, structureSettings,
+                        generateStructures);
             } else {
                 InfiniteDownwardGenerator.generate(world, cube, effectiveStructureSettings());
             }
