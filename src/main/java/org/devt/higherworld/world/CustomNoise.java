@@ -30,7 +30,7 @@ final class CustomNoise {
             fy *= 2.0;
             fz *= 2.0;
         }
-        return amplitudeSum == 0.0 ? 0.0 : result / amplitudeSum;
+        return amplitudeSum == 0.0 ? 0.0 : clamp(result / amplitudeSum, -1.0, 1.0);
     }
 
     static double octaveGradient2D(long seed, double x, double z,

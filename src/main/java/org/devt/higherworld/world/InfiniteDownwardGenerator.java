@@ -15,7 +15,7 @@ import org.devt.higherworld.storage.CubePos;
 
 /** Lazily extends Overworld terrain below the vanilla generation band. */
 final class InfiniteDownwardGenerator {
-    static final int GENERATION_VERSION = 13;
+    static final int GENERATION_VERSION = 14;
     private static final BlockState AIR = Blocks.AIR.getDefaultState();
     private static final BlockState DEEPSLATE = Blocks.DEEPSLATE.getDefaultState();
     private static final int NOISE_CELL_SIZE = 4;
@@ -48,7 +48,6 @@ final class InfiniteDownwardGenerator {
         }
         VanillaStructureGenerator.generate(world, cube, structureSettings);
         VanillaPlacedFeatureGenerator.generate(world, cube);
-        removeGeneratedFluids(cube);
         removeUnsupportedDecorations(cube);
         cube.setGenerationVersion(GENERATION_VERSION);
         cube.markDirty();
@@ -57,9 +56,9 @@ final class InfiniteDownwardGenerator {
     /**
      * Vanilla's fluid-level sampler hard-codes lava below Y=-54. Reusing the
      * noise chunk generator at arbitrary negative heights would consequently
-     * turn every density opening into a lava ocean. Run this after structures
-     * and placed features as a final invariant: sparse caves are dry unless a
-     * player adds fluid later.
+     * turn every density opening into a lava ocean. New cubes now prevent that
+     * in {@link InfiniteNoiseSettings}; this method remains only to migrate
+     * records generated before the noise settings were rewritten.
      */
     private static void removeGeneratedFluids(LoadedCube cube) {
         for (int y = 0; y < CubePos.SIZE; y++) {
@@ -154,6 +153,13 @@ final class InfiniteDownwardGenerator {
             ServerWorld world, LoadedCube cube, StructureGenerationSettings structureSettings) {
         if (cube.generationVersion() >= GENERATION_VERSION) {
             return false;
+        }
+        if (cube.generationVersion() == 13) {
+            removeGeneratedFluids(cube);
+            removeUnsupportedDecorations(cube);
+            cube.setGenerationVersion(GENERATION_VERSION);
+            cube.markDirty();
+            return true;
         }
         if (cube.generationVersion() == 12) {
             if (cube.blockEntities().isEmpty()

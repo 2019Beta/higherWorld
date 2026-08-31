@@ -95,6 +95,10 @@ class CustomWorldSettingsTest {
                 "{\"standardOres\":[{\"blockstate\":\"not valid id\"}]}"));
         assertThrows(IllegalArgumentException.class, () -> CustomWorldSettings.fromJson(
                 "{\"standardOres\":[{\"blockstate\":\"minecraft:stone\",\"spawnProbability\":\"NaN\"}]}"));
+        assertThrows(IllegalArgumentException.class, () -> CustomWorldSettings.fromJson(
+                "{\"standardOres\":[{\"blockstate\":\"minecraft:stone\",\"minHeight\":\"Infinity\"}]}"));
+        assertThrows(IllegalArgumentException.class, () -> CustomWorldSettings.fromJson(
+                "{\"standardOres\":[{\"blockstate\":\"minecraft:stone\",\"maxHeight\":\"-Infinity\"}]}"));
     }
 
     @Test

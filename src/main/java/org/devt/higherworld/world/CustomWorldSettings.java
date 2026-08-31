@@ -923,7 +923,12 @@ public final class CustomWorldSettings {
         private void validate(boolean periodic) {
             validateIdentifier(blockstate, "ore.blockstate"); validateStringList(biomes, "ore.biomes");
             if (spawnSize <= 0 || spawnTries < 0) fail("ore spawnSize must be positive and spawnTries cannot be negative");
-            validateDoubles(spawnProbability, minHeight, maxHeight, heightMean, heightStdDeviation, heightSpacing);
+            validateDoubles(spawnProbability, heightMean, heightStdDeviation, heightSpacing);
+            if (Double.isNaN(minHeight) || Double.isNaN(maxHeight)
+                    || minHeight == Double.POSITIVE_INFINITY
+                    || maxHeight == Double.NEGATIVE_INFINITY) {
+                fail("ore height bounds must be finite or use the matching unbounded sentinel");
+            }
             if (spawnProbability < 0 || spawnProbability > 1) fail("ore probability must be between 0 and 1");
             if (minHeight > maxHeight) fail("ore minHeight must be <= maxHeight");
             if (periodic && (heightStdDeviation < 0 || heightStdDeviation > 1 || heightSpacing <= 0)) fail("invalid periodic ore settings");
