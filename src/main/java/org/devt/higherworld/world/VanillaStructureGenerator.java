@@ -8,6 +8,7 @@ import java.util.Optional;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.BlockEntityProvider;
 import net.minecraft.block.entity.BlockEntity;
+import net.minecraft.fluid.Fluids;
 import net.minecraft.nbt.NbtCompound;
 import net.minecraft.registry.Registry;
 import net.minecraft.registry.RegistryKey;
@@ -193,17 +194,25 @@ final class VanillaStructureGenerator {
                 && arguments[1] instanceof BlockState state) {
             return setBlockState(world, cube, cubeBox, pos, state);
         }
-        if ("getBlockState".equals(name) && firstPos(arguments) instanceof BlockPos pos
-                && cubeBox.contains(pos)) {
-            return cube.getBlockState(pos);
+        if ("getBlockState".equals(name) && firstPos(arguments) instanceof BlockPos pos) {
+            return cubeBox.contains(pos)
+                    ? cube.getBlockState(pos)
+                    : net.minecraft.block.Blocks.AIR.getDefaultState();
         }
-        if ("getFluidState".equals(name) && firstPos(arguments) instanceof BlockPos pos
-                && cubeBox.contains(pos)) {
-            return cube.getFluidState(pos);
+        if ("getFluidState".equals(name) && firstPos(arguments) instanceof BlockPos pos) {
+            return cubeBox.contains(pos)
+                    ? cube.getFluidState(pos)
+                    : Fluids.EMPTY.getDefaultState();
         }
-        if ("getBlockEntity".equals(name) && firstPos(arguments) instanceof BlockPos pos
-                && cubeBox.contains(pos)) {
-            return cube.getBlockEntity(pos);
+        if ("getBlockEntity".equals(name) && firstPos(arguments) instanceof BlockPos pos) {
+            BlockEntity blockEntity = cubeBox.contains(pos) ? cube.getBlockEntity(pos) : null;
+            if (arguments.length == 2) {
+                return blockEntity != null
+                        && arguments[1] instanceof net.minecraft.block.entity.BlockEntityType<?> type
+                        && blockEntity.getType() == type
+                        ? Optional.of(blockEntity) : Optional.empty();
+            }
+            return blockEntity;
         }
         if (("removeBlock".equals(name) || "breakBlock".equals(name))
                 && firstPos(arguments) instanceof BlockPos pos && cubeBox.contains(pos)) {
@@ -213,6 +222,20 @@ final class VanillaStructureGenerator {
         if (("isValidForSetBlock".equals(name) || "isInBuildLimit".equals(name)
                 || "isInLoadLimit".equals(name)) && firstPos(arguments) instanceof BlockPos pos) {
             return cubeBox.contains(pos);
+        }
+        if ("markBlockForPostProcessing".equals(name)
+                || "scheduleBlockTick".equals(name)
+                || "scheduleFluidTick".equals(name)
+                || "scheduleTick".equals(name)) {
+            // Sparse cubes do not have vanilla post-processing or tick lists.
+            // Forwarding these calls mutates the unrelated ServerWorld and emits
+            // hundreds of warnings while a cube is being generated.
+            return null;
+        }
+        if ("spawnEntity".equals(name)) {
+            // Entities need a translated sparse-cube tracker. Never spawn a
+            // structure entity at the proxy's untranslated coordinates.
+            return false;
         }
         if ("getBottomY".equals(name)) {
             return cubeBox.getMinY();

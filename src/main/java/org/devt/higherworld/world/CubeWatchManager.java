@@ -6,6 +6,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -21,9 +22,13 @@ import org.devt.higherworld.storage.CubePos;
 /** Maintains a bounded three-dimensional cube view around every player. */
 public final class CubeWatchManager {
     private static final int VERTICAL_RADIUS = 4;
-    // Cube creation runs vanilla noise and biome decoration. A small per-player
+    // Cube creation runs vanilla noise and biome decoration. A small world-wide
     // budget keeps initial view streaming from monopolizing the server thread.
-    private static final int SENDS_PER_TICK = 2;
+    // Generation and decoding cross into Minecraft code and must stay on the
+    // server thread. Share this budget across all players so additional players
+    // cannot multiply the amount of synchronous cube work in a single tick.
+    private static final int CUBE_WORK_PER_WORLD_TICK = 1;
+    private static final int POLL_ATTEMPTS_PER_PLAYER_TICK = 2;
     private static final int READ_AHEAD_PER_TICK = 8;
     private static final Map<UUID, WatchState> WATCHERS = new HashMap<>();
 
@@ -33,10 +38,15 @@ public final class CubeWatchManager {
     public static void tick(ServerWorld world) {
         Set<UUID> present = new HashSet<>();
         boolean watcherTicketsChanged = false;
-        for (ServerPlayerEntity player : world.getPlayers()) {
+        CubeWorkBudget workBudget = new CubeWorkBudget(CUBE_WORK_PER_WORLD_TICK);
+        List<ServerPlayerEntity> players = world.getPlayers();
+        int playerCount = players.size();
+        int firstPlayer = playerCount == 0 ? 0 : Math.floorMod(world.getTime(), playerCount);
+        for (int index = 0; index < playerCount; index++) {
+            ServerPlayerEntity player = players.get((firstPlayer + index) % playerCount);
             present.add(player.getUuid());
             WatchState state = WATCHERS.computeIfAbsent(player.getUuid(), ignored -> new WatchState());
-            watcherTicketsChanged |= update(player, state);
+            watcherTicketsChanged |= update(player, state, workBudget);
         }
         Iterator<Map.Entry<UUID, WatchState>> watchers = WATCHERS.entrySet().iterator();
         while (watchers.hasNext()) {
@@ -102,7 +112,8 @@ public final class CubeWatchManager {
         }
     }
 
-    private static boolean update(ServerPlayerEntity player, WatchState state) {
+    private static boolean update(
+            ServerPlayerEntity player, WatchState state, CubeWorkBudget workBudget) {
         ServerWorld world = player.getEntityWorld();
         CubePos center = CubePos.fromBlock(
                 player.getBlockX(), player.getBlockY(), player.getBlockZ());
@@ -126,10 +137,11 @@ public final class CubeWatchManager {
             }
         }
 
-        int processed = 0;
-        while (processed < SENDS_PER_TICK && !state.pending.isEmpty()) {
+        int pollAttempts = 0;
+        while (workBudget.hasRemaining() && pollAttempts < POLL_ATTEMPTS_PER_PLAYER_TICK
+                && !state.pending.isEmpty()) {
             CubePos pos = state.pending.removeFirst();
-            processed++;
+            pollAttempts++;
             if (!withinView(pos, state.center, state.horizontalRadius)
                     || !isOutsideVanillaHeight(world, pos)
                     || state.sent.contains(pos)) {
@@ -149,6 +161,7 @@ public final class CubeWatchManager {
                 state.pending.addLast(pos);
                 continue;
             }
+            workBudget.consume();
             if (payload.length != 0 && CubeDataPayload.canEncode(payload)) {
                 ServerPlayNetworking.send(player, new CubeDataPayload(pos, payload));
             }
@@ -256,5 +269,21 @@ public final class CubeWatchManager {
         private int horizontalRadius;
         private final Set<CubePos> sent = new HashSet<>();
         private final ArrayDeque<CubePos> pending = new ArrayDeque<>();
+    }
+
+    private static final class CubeWorkBudget {
+        private int remaining;
+
+        private CubeWorkBudget(int remaining) {
+            this.remaining = remaining;
+        }
+
+        private boolean hasRemaining() {
+            return remaining > 0;
+        }
+
+        private void consume() {
+            remaining--;
+        }
     }
 }
