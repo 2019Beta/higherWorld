@@ -15,7 +15,7 @@ import org.devt.higherworld.storage.CubePos;
 
 /** Lazily extends Overworld terrain below the vanilla generation band. */
 final class InfiniteDownwardGenerator {
-    static final int GENERATION_VERSION = 12;
+    static final int GENERATION_VERSION = 13;
     private static final BlockState AIR = Blocks.AIR.getDefaultState();
     private static final BlockState DEEPSLATE = Blocks.DEEPSLATE.getDefaultState();
     private static final int NOISE_CELL_SIZE = 4;
@@ -46,9 +46,10 @@ final class InfiniteDownwardGenerator {
         if (!VanillaCubeTerrainGenerator.generate(world, cube)) {
             generateVanillaNoiseTerrain(world, cube);
         }
-        removeAquiferFluids(cube);
         VanillaStructureGenerator.generate(world, cube, structureSettings);
         VanillaPlacedFeatureGenerator.generate(world, cube);
+        removeGeneratedFluids(cube);
+        removeUnsupportedDecorations(cube);
         cube.setGenerationVersion(GENERATION_VERSION);
         cube.markDirty();
     }
@@ -56,16 +57,28 @@ final class InfiniteDownwardGenerator {
     /**
      * Vanilla's fluid-level sampler hard-codes lava below Y=-54. Reusing the
      * noise chunk generator at arbitrary negative heights would consequently
-     * turn every density opening into a lava ocean. Strip only this terrain
-     * pass here; placed features run afterwards and can still create ordinary
-     * springs and lakes.
+     * turn every density opening into a lava ocean. Run this after structures
+     * and placed features as a final invariant: sparse caves are dry unless a
+     * player adds fluid later.
      */
-    private static void removeAquiferFluids(LoadedCube cube) {
+    private static void removeGeneratedFluids(LoadedCube cube) {
         for (int y = 0; y < CubePos.SIZE; y++) {
             for (int z = 0; z < CubePos.SIZE; z++) {
                 for (int x = 0; x < CubePos.SIZE; x++) {
                     BlockState state = cube.section().getBlockState(x, y, z);
                     if (!state.getFluidState().isEmpty()) {
+                        cube.setGeneratedBlockState(x, y, z, AIR);
+                    }
+                }
+            }
+        }
+    }
+
+    private static void removeUnsupportedDecorations(LoadedCube cube) {
+        for (int y = 0; y < CubePos.SIZE; y++) {
+            for (int z = 0; z < CubePos.SIZE; z++) {
+                for (int x = 0; x < CubePos.SIZE; x++) {
+                    if (cube.section().getBlockState(x, y, z).isOf(Blocks.GLOW_LICHEN)) {
                         cube.setGeneratedBlockState(x, y, z, AIR);
                     }
                 }
@@ -140,6 +153,17 @@ final class InfiniteDownwardGenerator {
     static boolean upgradeLegacyTerrain(
             ServerWorld world, LoadedCube cube, StructureGenerationSettings structureSettings) {
         if (cube.generationVersion() >= GENERATION_VERSION) {
+            return false;
+        }
+        if (cube.generationVersion() == 12) {
+            if (cube.blockEntities().isEmpty()
+                    && matchesVersion12(world, cube, structureSettings)) {
+                clear(cube);
+                generate(world, cube, structureSettings);
+                return true;
+            }
+            cube.setGenerationVersion(GENERATION_VERSION);
+            cube.markDirty();
             return false;
         }
         if (cube.generationVersion() == 11) {
@@ -234,7 +258,24 @@ final class InfiniteDownwardGenerator {
             generateVanillaNoiseTerrain(world, expected);
         }
         VanillaStructureGenerator.generate(world, expected, structureSettings);
-        VanillaPlacedFeatureGenerator.generate(world, expected);
+        VanillaPlacedFeatureGenerator.generateVersion12(world, expected);
+        return matchesGeneratedCube(cube, expected);
+    }
+
+    private static boolean matchesVersion12(
+            ServerWorld world, LoadedCube cube, StructureGenerationSettings structureSettings) {
+        LoadedCube expected = new LoadedCube(
+                cube.pos(), new net.minecraft.world.chunk.ChunkSection(world.getPalettesFactory()));
+        if (!VanillaCubeTerrainGenerator.generate(world, expected)) {
+            generateVanillaNoiseTerrain(world, expected);
+        }
+        removeGeneratedFluids(expected);
+        VanillaStructureGenerator.generate(world, expected, structureSettings);
+        VanillaPlacedFeatureGenerator.generateVersion12(world, expected);
+        return matchesGeneratedCube(cube, expected);
+    }
+
+    private static boolean matchesGeneratedCube(LoadedCube cube, LoadedCube expected) {
         for (int y = 0; y < CubePos.SIZE; y++) {
             for (int z = 0; z < CubePos.SIZE; z++) {
                 for (int x = 0; x < CubePos.SIZE; x++) {

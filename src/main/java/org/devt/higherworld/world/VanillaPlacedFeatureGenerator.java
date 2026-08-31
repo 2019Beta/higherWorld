@@ -39,7 +39,13 @@ final class VanillaPlacedFeatureGenerator {
     private static final int VANILLA_BOTTOM_Y = -64;
     private static final int VANILLA_HEIGHT = 384;
     private static final int REPEATED_BAND_HEIGHT = 64;
-    private static final List<GenerationStep.Feature> UNDERGROUND_STEPS = List.of(
+    private static final List<GenerationStep.Feature> SAFE_UNDERGROUND_STEPS = List.of(
+            GenerationStep.Feature.RAW_GENERATION,
+            GenerationStep.Feature.LOCAL_MODIFICATIONS,
+            GenerationStep.Feature.UNDERGROUND_STRUCTURES,
+            GenerationStep.Feature.UNDERGROUND_ORES,
+            GenerationStep.Feature.UNDERGROUND_DECORATION);
+    private static final List<GenerationStep.Feature> LEGACY_UNDERGROUND_STEPS = List.of(
             GenerationStep.Feature.RAW_GENERATION,
             GenerationStep.Feature.LAKES,
             GenerationStep.Feature.LOCAL_MODIFICATIONS,
@@ -53,17 +59,30 @@ final class VanillaPlacedFeatureGenerator {
     }
 
     static void generate(ServerWorld world, LoadedCube cube) {
+        generate(world, cube, SAFE_UNDERGROUND_STEPS, false);
+    }
+
+    /** Reproduces the version-12 pass exactly enough to identify untouched cubes. */
+    static void generateVersion12(ServerWorld world, LoadedCube cube) {
+        generate(world, cube, LEGACY_UNDERGROUND_STEPS, true);
+    }
+
+    private static void generate(
+            ServerWorld world, LoadedCube cube, List<GenerationStep.Feature> steps,
+            boolean legacyBoundaryReads) {
         int depthIndex = world.getBottomSectionCoord() - 1 - cube.pos().y();
         int virtualMinY = VANILLA_BOTTOM_Y
                 + Math.floorMod(depthIndex, REPEATED_BAND_HEIGHT / CubePos.SIZE) * CubePos.SIZE;
         int offsetY = cube.pos().minBlockY() - virtualMinY;
         long repeatedBand = Math.floorDiv(depthIndex, REPEATED_BAND_HEIGHT / CubePos.SIZE);
-        StructureWorldAccess access = translatedAccess(world, cube, virtualMinY, offsetY);
+        StructureWorldAccess access = translatedAccess(
+                world, cube, virtualMinY, offsetY, legacyBoundaryReads);
         ChunkGenerator generator = world.getChunkManager().getChunkGenerator();
         Registry<PlacedFeature> registry = world.getRegistryManager()
                 .getOrThrow(RegistryKeys.PLACED_FEATURE);
 
-        List<FeatureCall> features = collectFeatures(world, cube, virtualMinY, generator);
+        List<FeatureCall> features = collectFeatures(
+                world, cube, virtualMinY, generator, steps);
         ChunkRandom random = new ChunkRandom(new Xoroshiro128PlusPlusRandom(
                 world.getSeed() ^ repeatedBand * 0x9E3779B97F4A7C15L));
         long populationSeed = random.setPopulationSeed(
@@ -82,7 +101,8 @@ final class VanillaPlacedFeatureGenerator {
     }
 
     private static List<FeatureCall> collectFeatures(
-            ServerWorld world, LoadedCube cube, int virtualMinY, ChunkGenerator generator) {
+            ServerWorld world, LoadedCube cube, int virtualMinY, ChunkGenerator generator,
+            List<GenerationStep.Feature> allowedSteps) {
         Set<RegistryEntry<Biome>> biomes = new LinkedHashSet<>();
         int baseX = cube.pos().minBlockX();
         int baseZ = cube.pos().minBlockZ();
@@ -98,7 +118,7 @@ final class VanillaPlacedFeatureGenerator {
         for (RegistryEntry<Biome> biome : biomes) {
             GenerationSettings settings = generator.getGenerationSettings(biome);
             List<RegistryEntryList<PlacedFeature>> steps = settings.getFeatures();
-            for (GenerationStep.Feature step : UNDERGROUND_STEPS) {
+            for (GenerationStep.Feature step : allowedSteps) {
                 int stepIndex = step.ordinal();
                 if (stepIndex >= steps.size()) {
                     continue;
@@ -116,7 +136,8 @@ final class VanillaPlacedFeatureGenerator {
     }
 
     private static StructureWorldAccess translatedAccess(
-            ServerWorld world, LoadedCube cube, int virtualMinY, int offsetY) {
+            ServerWorld world, LoadedCube cube, int virtualMinY, int offsetY,
+            boolean legacyBoundaryReads) {
         BlockBox virtualCube = new BlockBox(
                 cube.pos().minBlockX(), virtualMinY, cube.pos().minBlockZ(),
                 cube.pos().minBlockX() + CubePos.SIZE - 1,
@@ -126,14 +147,32 @@ final class VanillaPlacedFeatureGenerator {
                 VanillaPlacedFeatureGenerator.class.getClassLoader(),
                 new Class<?>[] {StructureWorldAccess.class},
                 (proxy, method, arguments) -> invoke(
-                        world, cube, virtualCube, offsetY, method, arguments));
+                        world, cube, virtualCube, offsetY, legacyBoundaryReads,
+                        method, arguments));
     }
 
     @SuppressWarnings("unchecked")
     private static Object invoke(
             ServerWorld world, LoadedCube cube, BlockBox virtualCube, int offsetY,
+            boolean legacyBoundaryReads,
             Method method, Object[] arguments) throws Throwable {
         String name = method.getName();
+        if (!legacyBoundaryReads && "getTopY".equals(name)
+                && arguments != null && arguments.length == 3
+                && arguments[1] instanceof Integer x && arguments[2] instanceof Integer z) {
+            return getVirtualTopY(cube, virtualCube, x, z);
+        }
+        if (!legacyBoundaryReads && "getTopY".equals(name)
+                && arguments != null && arguments.length == 2
+                && arguments[1] instanceof BlockPos pos) {
+            return getVirtualTopY(cube, virtualCube, pos.getX(), pos.getZ());
+        }
+        if (!legacyBoundaryReads && "getTopPosition".equals(name)
+                && arguments != null && arguments.length == 2
+                && arguments[1] instanceof BlockPos pos) {
+            return new BlockPos(pos.getX(),
+                    getVirtualTopY(cube, virtualCube, pos.getX(), pos.getZ()), pos.getZ());
+        }
         BlockPos virtualPos = firstPos(arguments);
         if ("setBlockState".equals(name) && virtualPos != null
                 && arguments.length >= 2 && arguments[1] instanceof BlockState state) {
@@ -163,7 +202,7 @@ final class VanillaPlacedFeatureGenerator {
             if (virtualCube.contains(virtualPos)) {
                 return cube.getBlockState(translate(virtualPos, offsetY));
             }
-            if (!isInVanillaHeight(virtualPos)) {
+            if (!legacyBoundaryReads || !isInVanillaHeight(virtualPos)) {
                 return Blocks.AIR.getDefaultState();
             }
         }
@@ -171,7 +210,7 @@ final class VanillaPlacedFeatureGenerator {
             if (virtualCube.contains(virtualPos)) {
                 return cube.getFluidState(translate(virtualPos, offsetY));
             }
-            if (!isInVanillaHeight(virtualPos)) {
+            if (!legacyBoundaryReads || !isInVanillaHeight(virtualPos)) {
                 return Fluids.EMPTY.getDefaultState();
             }
         }
@@ -183,14 +222,15 @@ final class VanillaPlacedFeatureGenerator {
             }
             return blockEntity;
         }
-        if ("getBlockEntity".equals(name) && virtualPos != null && !isInVanillaHeight(virtualPos)) {
+        if ("getBlockEntity".equals(name) && virtualPos != null
+                && (!legacyBoundaryReads || !isInVanillaHeight(virtualPos))) {
             return arguments.length == 2 ? Optional.empty() : null;
         }
         if ("testBlockState".equals(name) && virtualPos != null
                 && arguments[1] instanceof Predicate<?> predicate) {
             BlockState state = virtualCube.contains(virtualPos)
                     ? cube.getBlockState(translate(virtualPos, offsetY))
-                    : isInVanillaHeight(virtualPos)
+                    : legacyBoundaryReads && isInVanillaHeight(virtualPos)
                             ? world.getBlockState(virtualPos)
                             : Blocks.AIR.getDefaultState();
             return ((Predicate<BlockState>) predicate).test(state);
@@ -199,7 +239,7 @@ final class VanillaPlacedFeatureGenerator {
                 && arguments[1] instanceof Predicate<?> predicate) {
             FluidState state = virtualCube.contains(virtualPos)
                     ? cube.getFluidState(translate(virtualPos, offsetY))
-                    : isInVanillaHeight(virtualPos)
+                    : legacyBoundaryReads && isInVanillaHeight(virtualPos)
                             ? world.getFluidState(virtualPos)
                             : Fluids.EMPTY.getDefaultState();
             return ((Predicate<FluidState>) predicate).test(state);
@@ -225,6 +265,12 @@ final class VanillaPlacedFeatureGenerator {
         if (("isValidForSetBlock".equals(name) || "isInBuildLimit".equals(name)
                 || "isInLoadLimit".equals(name)) && virtualPos != null) {
             return virtualCube.contains(virtualPos);
+        }
+        if ("markBlockForPostProcessing".equals(name)) {
+            // ProtoChunk post-processing lists do not exist for sparse cubes.
+            // Forwarding this to the vanilla ChunkRegion only emits warnings
+            // and records a position in the unrelated virtual-height chunk.
+            return null;
         }
         if ("getBottomY".equals(name)) {
             return VANILLA_BOTTOM_Y;
@@ -271,6 +317,22 @@ final class VanillaPlacedFeatureGenerator {
 
     private static BlockPos translate(BlockPos pos, int offsetY) {
         return new BlockPos(pos.getX(), pos.getY() + offsetY, pos.getZ());
+    }
+
+    private static int getVirtualTopY(
+            LoadedCube cube, BlockBox virtualCube, int blockX, int blockZ) {
+        if (blockX < virtualCube.getMinX() || blockX > virtualCube.getMaxX()
+                || blockZ < virtualCube.getMinZ() || blockZ > virtualCube.getMaxZ()) {
+            return virtualCube.getMinY();
+        }
+        int localX = blockX - virtualCube.getMinX();
+        int localZ = blockZ - virtualCube.getMinZ();
+        for (int localY = CubePos.SIZE - 1; localY >= 0; localY--) {
+            if (!cube.section().getBlockState(localX, localY, localZ).isAir()) {
+                return virtualCube.getMinY() + localY + 1;
+            }
+        }
+        return virtualCube.getMinY();
     }
 
     private static boolean isInVanillaHeight(BlockPos pos) {

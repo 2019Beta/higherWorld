@@ -21,7 +21,7 @@ public final class CustomWorldSettings {
     private static final List<Integer> DEPTH_OPTIONS = List.of(128, 256, 512, 1024, UNLIMITED_DEPTH);
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
 
-    private static CustomWorldSettings clientSelection = new CustomWorldSettings(UNLIMITED_DEPTH);
+    private static CustomWorldSettings clientSelection = new CustomWorldSettings(DEFAULT_CUSTOM_DEPTH);
     private static CustomWorldSettings pendingWorldSelection;
 
     private final int generationDepth;
