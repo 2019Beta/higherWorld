@@ -1,5 +1,12 @@
 {
   "generator.higherworld.infinite_downward": "Infinite Downward",
+  "generator.higherworld.custom": "Custom World",
+  "screen.higherworld.custom.title": "Custom World",
+  "screen.higherworld.custom.description": "Adjust how far terrain generates below the vanilla world floor",
+  "option.higherworld.generation_depth": "Underground Generation Depth",
+  "option.higherworld.generation_depth.blocks": "%s blocks",
+  "option.higherworld.generation_depth.unlimited": "Unlimited",
+  "option.higherworld.generation_depth.tooltip": "Choose the maximum depth generated below the vanilla world floor",
   "button.higherworld.structure_settings": "Structure Generation Settings...",
   "button.higherworld.structure_settings.tooltip": "Choose structures that may generate below Y=-64",
   "screen.higherworld.structures.title": "Underground Structure Generation",

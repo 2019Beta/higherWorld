@@ -1,14 +1,12 @@
 package org.devt.higherworld.world;
 
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.util.math.BlockPos;
-import net.minecraft.world.chunk.WorldChunk;
 import net.minecraft.world.gen.chunk.ChunkGeneratorSettings;
 import net.minecraft.world.gen.densityfunction.DensityFunction;
 import net.minecraft.world.gen.densityfunction.DensityFunctionTypes;
@@ -17,7 +15,7 @@ import org.devt.higherworld.storage.CubePos;
 
 /** Lazily extends Overworld terrain below the vanilla generation band. */
 final class InfiniteDownwardGenerator {
-    static final int GENERATION_VERSION = 11;
+    static final int GENERATION_VERSION = 12;
     private static final BlockState AIR = Blocks.AIR.getDefaultState();
     private static final BlockState DEEPSLATE = Blocks.DEEPSLATE.getDefaultState();
     private static final int NOISE_CELL_SIZE = 4;
@@ -33,8 +31,6 @@ final class InfiniteDownwardGenerator {
     private static final Map<ServerWorld, DensityFunction> LEGACY_CAVE_DENSITIES = new ConcurrentHashMap<>();
     private static final Map<ServerWorld, DensityFunction> EXTENDED_OVERWORLD_DENSITIES =
             new ConcurrentHashMap<>();
-    private static final Map<ServerWorld, Set<Long>> REWRITTEN_FLOOR_CHUNKS =
-            new ConcurrentHashMap<>();
 
     private InfiniteDownwardGenerator() {
     }
@@ -42,7 +38,6 @@ final class InfiniteDownwardGenerator {
     static void release(ServerWorld world) {
         LEGACY_CAVE_DENSITIES.remove(world);
         EXTENDED_OVERWORLD_DENSITIES.remove(world);
-        REWRITTEN_FLOOR_CHUNKS.remove(world);
         VanillaCubeTerrainGenerator.release(world);
     }
 
@@ -51,10 +46,31 @@ final class InfiniteDownwardGenerator {
         if (!VanillaCubeTerrainGenerator.generate(world, cube)) {
             generateVanillaNoiseTerrain(world, cube);
         }
+        removeAquiferFluids(cube);
         VanillaStructureGenerator.generate(world, cube, structureSettings);
         VanillaPlacedFeatureGenerator.generate(world, cube);
         cube.setGenerationVersion(GENERATION_VERSION);
         cube.markDirty();
+    }
+
+    /**
+     * Vanilla's fluid-level sampler hard-codes lava below Y=-54. Reusing the
+     * noise chunk generator at arbitrary negative heights would consequently
+     * turn every density opening into a lava ocean. Strip only this terrain
+     * pass here; placed features run afterwards and can still create ordinary
+     * springs and lakes.
+     */
+    private static void removeAquiferFluids(LoadedCube cube) {
+        for (int y = 0; y < CubePos.SIZE; y++) {
+            for (int z = 0; z < CubePos.SIZE; z++) {
+                for (int x = 0; x < CubePos.SIZE; x++) {
+                    BlockState state = cube.section().getBlockState(x, y, z);
+                    if (!state.getFluidState().isEmpty()) {
+                        cube.setGeneratedBlockState(x, y, z, AIR);
+                    }
+                }
+            }
+        }
     }
 
     private static void generateVanillaNoiseTerrain(ServerWorld world, LoadedCube cube) {
@@ -126,6 +142,17 @@ final class InfiniteDownwardGenerator {
         if (cube.generationVersion() >= GENERATION_VERSION) {
             return false;
         }
+        if (cube.generationVersion() == 11) {
+            if (cube.blockEntities().isEmpty()
+                    && matchesVersion11(world, cube, structureSettings)) {
+                clear(cube);
+                generate(world, cube, structureSettings);
+                return true;
+            }
+            cube.setGenerationVersion(GENERATION_VERSION);
+            cube.markDirty();
+            return false;
+        }
         if (cube.generationVersion() == 10) {
             if (cube.section().isEmpty() && cube.blockEntities().isEmpty()) {
                 generate(world, cube, structureSettings);
@@ -136,18 +163,12 @@ final class InfiniteDownwardGenerator {
             return false;
         }
         if (cube.generationVersion() == 9) {
-            if (cube.pos().y() == world.getBottomSectionCoord() - 1) {
-                migratePreviouslyReplacedFloor(world, cube.pos());
-            }
             VanillaPlacedFeatureGenerator.generate(world, cube);
             cube.setGenerationVersion(GENERATION_VERSION);
             cube.markDirty();
             return true;
         }
         if (cube.generationVersion() == 8) {
-            if (cube.pos().y() == world.getBottomSectionCoord() - 1) {
-                migratePreviouslyReplacedFloor(world, cube.pos());
-            }
             VanillaPlacedFeatureGenerator.generate(world, cube);
             cube.setGenerationVersion(GENERATION_VERSION);
             cube.markDirty();
@@ -200,11 +221,39 @@ final class InfiniteDownwardGenerator {
             cube.markDirty();
             return false;
         }
-        if (cube.pos().y() == world.getBottomSectionCoord() - 1) {
-            migratePreviouslyReplacedFloor(world, cube.pos());
-        }
         clear(cube);
         generate(world, cube, structureSettings);
+        return true;
+    }
+
+    private static boolean matchesVersion11(
+            ServerWorld world, LoadedCube cube, StructureGenerationSettings structureSettings) {
+        LoadedCube expected = new LoadedCube(
+                cube.pos(), new net.minecraft.world.chunk.ChunkSection(world.getPalettesFactory()));
+        if (!VanillaCubeTerrainGenerator.generate(world, expected)) {
+            generateVanillaNoiseTerrain(world, expected);
+        }
+        VanillaStructureGenerator.generate(world, expected, structureSettings);
+        VanillaPlacedFeatureGenerator.generate(world, expected);
+        for (int y = 0; y < CubePos.SIZE; y++) {
+            for (int z = 0; z < CubePos.SIZE; z++) {
+                for (int x = 0; x < CubePos.SIZE; x++) {
+                    BlockState actual = cube.section().getBlockState(x, y, z);
+                    BlockState generated = expected.section().getBlockState(x, y, z);
+                    if (actual.equals(generated)) {
+                        continue;
+                    }
+                    boolean naturalFluidChange = !actual.getFluidState().isEmpty()
+                            && (generated.isAir()
+                                    || (!generated.getFluidState().isEmpty()
+                                            && actual.getFluidState().getFluid()
+                                                    == generated.getFluidState().getFluid()));
+                    if (!naturalFluidChange) {
+                        return false;
+                    }
+                }
+            }
+        }
         return true;
     }
 
@@ -677,71 +726,6 @@ final class InfiniteDownwardGenerator {
     }
 
     private record BoundaryField(double[] density) {
-    }
-
-    static void openVanillaFloor(ServerWorld world, WorldChunk chunk) {
-        boolean firstLoad = REWRITTEN_FLOOR_CHUNKS
-                .computeIfAbsent(world, ignored -> ConcurrentHashMap.newKeySet())
-                .add(chunk.getPos().toLong());
-        rewriteVanillaFloor(world, chunk, firstLoad);
-    }
-
-    private static void migratePreviouslyReplacedFloor(ServerWorld world, CubePos pos) {
-        rewriteVanillaFloor(world, world.getChunk(pos.x(), pos.z()), true);
-    }
-
-    private static void rewriteVanillaFloor(
-            ServerWorld world, WorldChunk chunk, boolean replaceLegacyDeepslate) {
-        int bottomY = world.getBottomY();
-        int baseX = chunk.getPos().getStartX();
-        int baseZ = chunk.getPos().getStartZ();
-        BlockPos.Mutable mutable = new BlockPos.Mutable();
-        boolean needsRewrite = false;
-        for (int localZ = 0; localZ < CubePos.SIZE && !needsRewrite; localZ++) {
-            for (int localX = 0; localX < CubePos.SIZE && !needsRewrite; localX++) {
-                for (int y = bottomY; y < bottomY + 5; y++) {
-                    mutable.set(baseX + localX, y, baseZ + localZ);
-                    BlockState state = chunk.getBlockState(mutable);
-                    if (state.isOf(Blocks.BEDROCK)
-                            || (replaceLegacyDeepslate
-                                    && (state.isAir() || state.isOf(Blocks.DEEPSLATE)))) {
-                        needsRewrite = true;
-                    }
-                }
-            }
-        }
-        if (!needsRewrite) {
-            return;
-        }
-
-        LoadedCube generatedFloor = new LoadedCube(
-                new CubePos(chunk.getPos().x, world.getBottomSectionCoord(), chunk.getPos().z),
-                new net.minecraft.world.chunk.ChunkSection(world.getPalettesFactory()));
-        // Chunk-load callbacks can run inside the vanilla generation worker pool.
-        // Use the synchronous vanilla-density fallback here, never the invoker or a future.
-        generateVanillaNoiseTerrain(world, generatedFloor);
-        boolean changed = false;
-        for (int localZ = 0; localZ < CubePos.SIZE; localZ++) {
-            for (int localX = 0; localX < CubePos.SIZE; localX++) {
-                for (int y = bottomY; y < bottomY + 5; y++) {
-                    mutable.set(baseX + localX, y, baseZ + localZ);
-                    BlockState current = chunk.getBlockState(mutable);
-                    if (current.isOf(Blocks.BEDROCK)
-                            || (replaceLegacyDeepslate
-                                    && (current.isAir() || current.isOf(Blocks.DEEPSLATE)))) {
-                        BlockState generated = generatedFloor.section().getBlockState(
-                                localX, y - bottomY, localZ);
-                        if (!current.equals(generated)) {
-                            chunk.setBlockState(mutable, generated, 0);
-                            changed = true;
-                        }
-                    }
-                }
-            }
-        }
-        if (changed) {
-            chunk.markNeedsSaving();
-        }
     }
 
     private static DensityFunction extendedOverworldDensity(ServerWorld world) {

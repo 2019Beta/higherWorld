@@ -28,17 +28,20 @@ final class CubicWorldState implements AutoCloseable {
     private final boolean generateInfinitelyDownward;
     private final boolean generateStructures;
     private final StructureGenerationSettings structureSettings;
+    private final CustomWorldSettings customWorldSettings;
     private final ConcurrentMap<ColumnPos, CubeColumn<LoadedCube>> columns = new ConcurrentHashMap<>();
     private final ConcurrentMap<BlockColumnPos, Integer> highestBlocks = new ConcurrentHashMap<>();
 
     CubicWorldState(
             ServerWorld world, CubeStorage storage, boolean generateStructures,
-            StructureGenerationSettings structureSettings) {
+            StructureGenerationSettings structureSettings,
+            CustomWorldSettings customWorldSettings) {
         this.world = world;
         this.storage = storage;
         this.generateInfinitelyDownward = CubicWorldManager.generatesInfinitelyDownward(world);
         this.generateStructures = generateStructures;
         this.structureSettings = structureSettings;
+        this.customWorldSettings = customWorldSettings;
     }
 
     BlockState getBlockState(BlockPos pos) throws IOException {
@@ -236,7 +239,11 @@ final class CubicWorldState implements AutoCloseable {
     }
 
     private boolean shouldGenerate(CubePos pos) {
-        return generateInfinitelyDownward && pos.y() < world.getBottomSectionCoord();
+        if (!generateInfinitelyDownward || pos.y() >= world.getBottomSectionCoord()) {
+            return false;
+        }
+        return customWorldSettings.isUnlimited()
+                || world.getBottomY() - pos.minBlockY() <= customWorldSettings.generationDepth();
     }
 
     private StructureGenerationSettings effectiveStructureSettings() {

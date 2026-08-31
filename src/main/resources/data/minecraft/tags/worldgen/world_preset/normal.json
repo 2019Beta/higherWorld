@@ -1,6 +1,7 @@
 {
   "replace": false,
   "values": [
-    "higherworld:infinite_downward"
+    "higherworld:infinite_downward",
+    "higherworld:custom"
   ]
 }

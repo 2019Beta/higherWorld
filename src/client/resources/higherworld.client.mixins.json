@@ -10,6 +10,7 @@
     "ClientWorldMixin",
     "CreateWorldScreenMixin",
     "CreateWorldWorldTabMixin",
+    "LevelScreenProviderMixin",
     "RenderableChunksMixin",
     "RenderedChunkMixin"
   ],

@@ -11,6 +11,7 @@ import net.minecraft.registry.RegistryKeys;
 import net.minecraft.text.Text;
 import net.minecraft.util.Identifier;
 import net.minecraft.world.gen.WorldPreset;
+import org.devt.higherworld.Higherworld;
 import org.devt.higherworld.client.StructureGenerationScreen;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -45,6 +46,7 @@ abstract class CreateWorldWorldTabMixin extends GridScreenTab {
     private static boolean higherworld$isInfiniteDownward(WorldCreator creator) {
         WorldCreator.WorldType type = creator.getWorldType();
         return type != null && type.preset() != null
-                && type.preset().matchesKey(HIGHERWORLD_INFINITE_DOWNWARD);
+                && (type.preset().matchesKey(HIGHERWORLD_INFINITE_DOWNWARD)
+                        || type.preset().matchesKey(Higherworld.CUSTOM_WORLD));
     }
 }

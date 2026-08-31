@@ -20,15 +20,15 @@ import net.minecraft.registry.RegistryKey;
 import net.minecraft.registry.RegistryKeys;
 import net.minecraft.util.Identifier;
 import net.minecraft.world.dimension.DimensionType;
-import net.minecraft.world.chunk.WorldChunk;
+import net.minecraft.world.gen.chunk.NoiseChunkGenerator;
+import net.minecraft.world.gen.noise.NoiseConfig;
+import org.devt.higherworld.mixin.NoiseConfigAccessor;
 import org.devt.higherworld.Higherworld;
 import org.devt.higherworld.storage.CubePos;
 import org.devt.higherworld.storage.CubeStorage;
 
 /** Owns sparse cube state outside the vanilla dimension height range. */
 public final class CubicWorldManager {
-    private static final RegistryKey<DimensionType> INFINITE_OVERWORLD = RegistryKey.of(
-            RegistryKeys.DIMENSION_TYPE, Identifier.of(Higherworld.MOD_ID, "infinite_overworld"));
     private static final Map<ServerWorld, CubicWorldState> WORLDS = new ConcurrentHashMap<>();
 
     private CubicWorldManager() {
@@ -42,13 +42,20 @@ public final class CubicWorldManager {
                 .resolve("region3d");
         try {
             boolean infiniteDownward = generatesInfinitelyDownward(world);
+            if (infiniteDownward) {
+                configureInfiniteGenerator(world);
+            }
             StructureGenerationSettings structureSettings = infiniteDownward
                     ? StructureGenerationSettings.load(cubicRoot, true)
                     : StructureGenerationSettings.defaults();
+            CustomWorldSettings customWorldSettings = generatesCustomWorld(world)
+                    ? CustomWorldSettings.load(cubicRoot, true)
+                    : CustomWorldSettings.defaults();
             boolean generateStructures = server.getSaveProperties()
                     .getGeneratorOptions().shouldGenerateStructures();
             CubicWorldState previous = WORLDS.put(world, new CubicWorldState(
-                    world, new CubeStorage(root), generateStructures, structureSettings));
+                    world, new CubeStorage(root), generateStructures, structureSettings,
+                    customWorldSettings));
             if (previous != null) {
                 previous.close();
             }
@@ -60,6 +67,9 @@ public final class CubicWorldManager {
 
     public static void close(MinecraftServer server, ServerWorld world) {
         CubeWatchManager.removeWorld(world);
+        if (world.getChunkManager().getChunkGenerator() instanceof NoiseChunkGenerator generator) {
+            InfiniteWorldgenHooks.unregister(generator);
+        }
         InfiniteDownwardGenerator.release(world);
         CubicWorldState state = WORLDS.remove(world);
         if (state == null) {
@@ -77,14 +87,22 @@ public final class CubicWorldManager {
     }
 
     static boolean generatesInfinitelyDownward(ServerWorld world) {
-        return world.getDimensionEntry().matchesKey(INFINITE_OVERWORLD);
+        return world.getDimensionEntry().matchesKey(Higherworld.INFINITE_OVERWORLD)
+                || world.getDimensionEntry().matchesKey(Higherworld.CUSTOM_OVERWORLD);
     }
 
-    /** Removes the obsolete vanilla floor for both new and already-created chunks. */
-    public static void onChunkLoad(ServerWorld world, WorldChunk chunk) {
-        if (generatesInfinitelyDownward(world)) {
-            InfiniteDownwardGenerator.openVanillaFloor(world, chunk);
+    static boolean generatesCustomWorld(ServerWorld world) {
+        return world.getDimensionEntry().matchesKey(Higherworld.CUSTOM_OVERWORLD);
+    }
+
+    private static void configureInfiniteGenerator(ServerWorld world) {
+        if (!(world.getChunkManager().getChunkGenerator() instanceof NoiseChunkGenerator generator)) {
+            return;
         }
+        InfiniteWorldgenHooks.register(generator, world.getBottomY());
+        NoiseConfig noiseConfig = world.getChunkManager().getNoiseConfig();
+        ((NoiseConfigAccessor) (Object) noiseConfig).higherworld$setNoiseRouter(
+                InfiniteDownwardGenerator.removeVanillaBottomSlide(noiseConfig.getNoiseRouter()));
     }
 
     /** Reads through the sparse cube cache without packing Y into a vanilla long key. */

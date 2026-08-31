@@ -1,5 +1,12 @@
 {
   "generator.higherworld.infinite_downward": "无限向下",
+  "generator.higherworld.custom": "自定义世界",
+  "screen.higherworld.custom.title": "自定义世界",
+  "screen.higherworld.custom.description": "调整自定义世界在原版世界底部下方生成的深度",
+  "option.higherworld.generation_depth": "地下生成深度",
+  "option.higherworld.generation_depth.blocks": "%s 格",
+  "option.higherworld.generation_depth.unlimited": "无限",
+  "option.higherworld.generation_depth.tooltip": "选择原版世界底部下方生成地形的最大深度",
   "button.higherworld.structure_settings": "生成结构设置...",
   "button.higherworld.structure_settings.tooltip": "选择可在 Y=-64 以下生成的结构",
   "screen.higherworld.structures.title": "地下结构生成设置",
