@@ -1,5 +1,6 @@
 package org.devt.higherworld.client;
 
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -105,8 +106,11 @@ public final class CustomSettingsParsers {
             throw new IllegalArgumentException(field + " is required");
         }
         try {
-            return Integer.parseInt(text.trim());
-        } catch (NumberFormatException exception) {
+            // BigDecimal accepts the same decimal/scientific forms as the
+            // floating-point fields, while intValueExact still enforces the
+            // model's integral/32-bit constraint.
+            return new BigDecimal(text.trim()).intValueExact();
+        } catch (NumberFormatException | ArithmeticException exception) {
             throw new IllegalArgumentException(field + " must be an integer", exception);
         }
     }
