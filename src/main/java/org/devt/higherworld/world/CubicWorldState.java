@@ -40,8 +40,10 @@ final class CubicWorldState implements AutoCloseable {
     private final CustomWorldSettings customWorldSettings;
     private final ConcurrentMap<ColumnPos, CubeColumn<LoadedCube>> columns = new ConcurrentHashMap<>();
     private final ConcurrentMap<CubePos, LoadedCube> cubes = new ConcurrentHashMap<>();
+    private final ConcurrentMap<CubePos, LoadContext> loadContexts = new ConcurrentHashMap<>();
     private final ConcurrentMap<BlockColumnPos, Integer> highestBlocks = new ConcurrentHashMap<>();
     private final SparseCubeLightEngine lightEngine = new SparseCubeLightEngine(new LightAccess());
+    private final ThreadLocal<Boolean> committingFeatures = ThreadLocal.withInitial(() -> false);
 
     CubicWorldState(
             ServerWorld world, CubeStorage storage, boolean generateStructures,
@@ -59,11 +61,31 @@ final class CubicWorldState implements AutoCloseable {
     }
 
     BlockState getBlockState(BlockPos pos) throws IOException {
-        return cube(pos).getBlockState(pos);
+        return cubeForRead(pos).getBlockState(pos);
     }
 
     FluidState getFluidState(BlockPos pos) throws IOException {
-        return cube(pos).getFluidState(pos);
+        return cubeForRead(pos).getFluidState(pos);
+    }
+
+    /**
+     * Feature callbacks such as mob-spawner dirty notifications may query a
+     * neighbouring block through {@code World}.  Advancing that neighbour all
+     * the way to FULL would start its features while the current feature is
+     * still running, recursively repeating the callback until the stack is
+     * exhausted.  Terrain is sufficient for generation-time reads and is also
+     * the declared prerequisite for neighbouring features.
+     */
+    private LoadedCube cubeForRead(BlockPos blockPos) throws IOException {
+        if (!committingFeatures.get()) return cube(blockPos);
+        CubePos pos = CubePos.fromBlock(blockPos.getX(), blockPos.getY(), blockPos.getZ());
+        LoadedCube loaded = loadedCube(pos);
+        if (loaded != null) {
+            LoadContext context = loadContexts.get(pos);
+            if (context != null && context.committing) return loaded;
+            if (taskScheduler.holder(pos).status().isAtLeast(CubeStatus.TERRAIN)) return loaded;
+        }
+        return ensureStage(pos, CubeStatus.TERRAIN, SYNCHRONOUS_IO_PRIORITY, null);
     }
 
     BlockChange setBlockState(BlockPos pos, BlockState state) throws IOException {
@@ -105,12 +127,18 @@ final class CubicWorldState implements AutoCloseable {
         CubeColumn<LoadedCube> column = columns.get(columnPos);
         LoadedCube loaded = column == null ? null : column.get(pos.y());
         if (loaded != null) {
-            taskScheduler.adoptLoaded(loaded);
-            return loaded;
+            LoadContext context = loadContexts.get(pos);
+            if (context != null && context.committing) return loaded;
+            if (context != null && context.full) {
+                taskScheduler.adoptLoaded(loaded);
+                return loaded;
+            }
+            CubeHolder holder = taskScheduler.holder(pos);
+            if (holder.status().isAtLeast(CubeStatus.FULL)) return loaded;
+            return ensureStage(pos, CubeStatus.FULL, SYNCHRONOUS_IO_PRIORITY, null);
         }
 
-        CubeHolder holder = taskScheduler.request(pos, CubeStatus.FULL, SYNCHRONOUS_IO_PRIORITY);
-        return loadOrRegister(pos, holder.ioFuture().join().orElse(null));
+        return ensureStage(pos, CubeStatus.FULL, SYNCHRONOUS_IO_PRIORITY, null);
     }
 
     int loadedCubeCount() {
@@ -137,7 +165,17 @@ final class CubicWorldState implements AutoCloseable {
     byte[] cubePayload(CubePos pos) throws IOException {
         LoadedCube loaded = loadedCube(pos);
         if (loaded != null) {
-            taskScheduler.adoptLoaded(loaded);
+            LoadContext context = loadContexts.get(pos);
+            if (context != null && context.full) {
+                taskScheduler.adoptLoaded(loaded);
+                return CubeRecordCodec.encode(loaded, world);
+            }
+            CubeHolder holder = taskScheduler.holder(pos);
+            if (!holder.status().isAtLeast(CubeStatus.FULL)) {
+                loaded = ensureStage(pos, CubeStatus.FULL, SYNCHRONOUS_IO_PRIORITY, null);
+            } else {
+                taskScheduler.adoptLoaded(loaded);
+            }
             return CubeRecordCodec.encode(loaded, world);
         }
 
@@ -151,7 +189,14 @@ final class CubicWorldState implements AutoCloseable {
         if (loaded == null) {
             taskScheduler.request(pos, CubeStatus.FULL, priority);
         } else {
-            taskScheduler.adoptLoaded(loaded);
+            LoadContext context = loadContexts.get(pos);
+            if (context != null && context.full) {
+                taskScheduler.adoptLoaded(loaded);
+                return;
+            }
+            CubeHolder holder = taskScheduler.holder(pos);
+            if (holder.status().isAtLeast(CubeStatus.FULL)) taskScheduler.adoptLoaded(loaded);
+            else taskScheduler.request(pos, CubeStatus.FULL, priority);
         }
     }
 
@@ -166,7 +211,18 @@ final class CubicWorldState implements AutoCloseable {
     byte[] tryCubePayload(CubePos pos, int priority) throws IOException {
         LoadedCube loaded = loadedCube(pos);
         if (loaded != null) {
-            taskScheduler.adoptLoaded(loaded);
+            LoadContext context = loadContexts.get(pos);
+            if (context != null && context.full) {
+                taskScheduler.adoptLoaded(loaded);
+                return CubeRecordCodec.encode(loaded, world);
+            }
+            CubeHolder holder = taskScheduler.holder(pos);
+            if (!holder.status().isAtLeast(CubeStatus.FULL)) {
+                advanceReadyTasks(2_000_000L);
+                if (!holder.fullFuture().isDone()) return null;
+            } else {
+                taskScheduler.adoptLoaded(loaded);
+            }
             return CubeRecordCodec.encode(loaded, world);
         }
 
@@ -210,24 +266,32 @@ final class CubicWorldState implements AutoCloseable {
                     return null;
                 }
             }
-            if (allowPending && !taskScheduler.neighbourDependenciesReady(
-                    holder, CubeStatus.LIGHT, priority)) {
-                return null;
+            LoadedCube generated;
+            if (allowPending) {
+                advanceReadyTasks(2_000_000L);
+                Optional<LoadedCube> completed = holder.fullFuture().getNow(null);
+                if (completed == null) return null;
+                generated = completed.orElse(null);
+                if (generated == null) return EMPTY_PAYLOAD;
+            } else {
+                generated = ensureStage(pos, CubeStatus.FULL, priority, Optional.empty());
             }
-            // We already know storage has no record. Construct directly instead
-            // of making cube(pos) perform the same disk lookup a second time.
-            LoadedCube generated = loadOrRegister(pos, null);
             return CubeRecordCodec.encode(generated, world);
         }
 
         // Real stored cubes still enter the runtime so their block entities and
         // random-ticking blocks continue to simulate while watched.
         CubeHolder holder = taskScheduler.request(pos, CubeStatus.FULL, priority);
-        if (allowPending && !taskScheduler.neighbourDependenciesReady(
-                holder, CubeStatus.LIGHT, priority)) {
-            return null;
+        LoadedCube created;
+        if (allowPending) {
+            advanceReadyTasks(2_000_000L);
+            Optional<LoadedCube> completed = holder.fullFuture().getNow(null);
+            if (completed == null) return null;
+            created = completed.orElse(null);
+            if (created == null) return EMPTY_PAYLOAD;
+        } else {
+            created = ensureStage(pos, CubeStatus.FULL, priority, stored);
         }
-        LoadedCube created = loadOrRegister(pos, stored.get());
         return created.isDirty() ? CubeRecordCodec.encode(created, world) : stored.get();
     }
 
@@ -269,6 +333,7 @@ final class CubicWorldState implements AutoCloseable {
                     save(cube, false, true);
                     column.remove(cube.pos().y());
                     cubes.remove(cube.pos(), cube);
+                    loadContexts.remove(cube.pos());
                     removeIndexedHeights(cube);
                     removedAny = true;
                     removedFromColumn = true;
@@ -301,6 +366,7 @@ final class CubicWorldState implements AutoCloseable {
         int randomTickSpeed = world.getGameRules().getValue(GameRules.RANDOM_TICK_SPEED);
         for (CubeColumn<LoadedCube> column : columns.values()) {
             column.forEach(cube -> {
+                if (!taskScheduler.holder(cube.pos()).status().isAtLeast(CubeStatus.FULL)) return;
                 cube.tickBlockEntities(world);
                 cube.tickRandomly(world, randomTickSpeed);
             });
@@ -310,11 +376,10 @@ final class CubicWorldState implements AutoCloseable {
     /** Commits completed worker terrain during a bounded mid-tick slice. */
     void advanceReadyTasks(long budgetNanos) {
         long deadline = System.nanoTime() + Math.max(0L, budgetNanos);
-        for (CubeHolder holder : taskScheduler.readyTerrain(32)) {
+        for (CubeHolder holder : taskScheduler.readyForCommit(64)) {
             if (System.nanoTime() >= deadline) break;
-            if (!taskScheduler.isTicketed(holder.pos()) || loadedCube(holder.pos()) != null) continue;
             try {
-                loadOrRegister(holder.pos(), null);
+                tryAdvance(holder, taskScheduler.priority(holder.pos()));
             } catch (IOException | RuntimeException exception) {
                 holder.fail(exception);
                 Higherworld.LOGGER.error("Cannot finish asynchronous cube {}", holder.pos(), exception);
@@ -334,7 +399,7 @@ final class CubicWorldState implements AutoCloseable {
         return pos.y() < world.getBottomSectionCoord() || pos.y() >= world.getTopSectionCoord();
     }
 
-    private LoadedCube loadOrRegister(CubePos pos, byte[] payload) throws IOException {
+    private LoadedCube registerPlaceholder(CubePos pos) {
         ColumnPos columnPos = new ColumnPos(pos.x(), pos.z());
         while (true) {
             LoadedCube alreadyLoaded = cubes.get(pos);
@@ -354,81 +419,186 @@ final class CubicWorldState implements AutoCloseable {
                 continue;
             }
 
-            try {
-                load(created, payload);
-                return created;
-            } catch (IOException | RuntimeException | Error exception) {
-                column.remove(pos.y(), created);
-                cubes.remove(pos, created);
-                if (column.isEmpty()) {
-                    columns.remove(columnPos, column);
-                }
-                throw exception;
-            }
+            return created;
         }
     }
 
-    private void load(LoadedCube cube, byte[] payload) throws IOException {
-        CubePos pos = cube.pos();
-        CubeHolder holder = taskScheduler.holder(pos);
-        holder.advance(CubeStatus.IO_READY);
-        boolean hasSavedLight = false;
-        if (payload != null) {
-            cube.setGenerationVersion(CubeRecordCodec.generationVersion(payload));
-            CubeRecordCodec.DecodedCube decoded = CubeRecordCodec.decode(payload, cube.section(), world);
-            for (BlockEntity blockEntity : decoded.blockEntities()) {
-                cube.putLoadedBlockEntity(blockEntity);
-            }
-            if (decoded.hasLight()) {
-                cube.light().load(decoded.light());
-                hasSavedLight = true;
-            }
-            // A stored custom cube is authoritative: it may contain player edits and
-            // its terrain must never be passed through the legacy upgrade pipeline.
-            if (!customWorld && shouldGenerate(pos) && InfiniteDownwardGenerator.upgradeLegacyTerrain(
-                    world, cube, effectiveStructureSettings())) {
-                Higherworld.LOGGER.debug("Upgraded untouched generated terrain cube {}", pos);
-            }
-            holder.advance(CubeStatus.FEATURES);
-        } else if (shouldGenerate(pos)) {
-            if (customWorld) {
-                try {
-                    CustomCubeGenerator.TerrainSnapshot snapshot = taskScheduler.prepareTerrain(
-                            holder, world.getSeed(), customWorldSettings,
-                            SYNCHRONOUS_IO_PRIORITY).join();
-                    try (CubeSpatialLock.Scope ignored = generationLocks.lock(
-                            pos, CubeStatus.FEATURES.dependencyRadius())) {
-                        CustomCubeGenerator.applyTerrain(cube, snapshot);
-                        holder.advance(CubeStatus.TERRAIN);
-                        taskScheduler.awaitDependencies(
-                                holder, CubeStatus.FEATURES, SYNCHRONOUS_IO_PRIORITY);
-                        CustomCubeGenerator.finishGeneration(world, cube, customWorldSettings,
-                                structureSettings, generateStructures);
-                        holder.advance(CubeStatus.FEATURES);
-                    }
-                } catch (CompletionException exception) {
-                    Throwable cause = exception.getCause();
-                    if (cause instanceof RuntimeException runtime) throw runtime;
-                    throw new IOException("Cannot prepare terrain for cube " + pos, cause);
-                }
-            } else {
-                taskScheduler.awaitNeighbourDependencies(
-                        holder, CubeStatus.FEATURES, SYNCHRONOUS_IO_PRIORITY);
-                try (CubeSpatialLock.Scope ignored = generationLocks.lock(
-                        pos, CubeStatus.FEATURES.dependencyRadius())) {
-                    InfiniteDownwardGenerator.generate(world, cube, effectiveStructureSettings());
-                    holder.advance(CubeStatus.FEATURES);
-                }
-            }
-        } else {
-            holder.advance(CubeStatus.FEATURES);
+    private LoadedCube ensureStage(
+            CubePos pos, CubeStatus target, int priority, Optional<byte[]> knownPayload)
+            throws IOException {
+        CubeHolder holder = taskScheduler.request(pos, target, priority);
+        Optional<byte[]> payload = knownPayload == null ? joinIo(pos, holder) : knownPayload;
+        LoadContext context = context(holder, payload);
+        if (target.isAtLeast(CubeStatus.TERRAIN) && !holder.status().isAtLeast(CubeStatus.TERRAIN)) {
+            commitTerrain(holder, context, priority, true);
         }
-        indexHeights(cube);
-        taskScheduler.awaitDependencies(holder, CubeStatus.LIGHT, SYNCHRONOUS_IO_PRIORITY);
-        lightEngine.queueCube(pos, !hasSavedLight);
+        if (target.isAtLeast(CubeStatus.FEATURES) && !holder.status().isAtLeast(CubeStatus.FEATURES)) {
+            CubeStatus.FEATURES.dependencyRadius().forEach(pos, dependency -> {
+                try {
+                    ensureStage(dependency, CubeStatus.TERRAIN, priority + 1, null);
+                } catch (IOException exception) {
+                    throw new CompletionException(exception);
+                }
+            });
+            commitFeatures(holder, context);
+        }
+        if (target.isAtLeast(CubeStatus.LIGHT) && !holder.status().isAtLeast(CubeStatus.LIGHT)) {
+            CubeStatus.LIGHT.dependencyRadius().forEach(pos, dependency -> {
+                try {
+                    ensureStage(dependency, CubeStatus.FEATURES, priority + 1, null);
+                } catch (IOException exception) {
+                    throw new CompletionException(exception);
+                }
+            });
+            commitLight(holder, context);
+        }
+        if (target == CubeStatus.FULL && !holder.fullFuture().isDone()) {
+            holder.complete(context.cube);
+            context.full = true;
+        } else if (target == CubeStatus.FULL
+                && holder.fullFuture().getNow(Optional.empty()).isEmpty()) {
+            holder.materialize(context.cube);
+            context.full = true;
+        }
+        return context.cube;
+    }
+
+    private boolean tryAdvance(CubeHolder holder, int priority) throws IOException {
+        Optional<byte[]> payload = holder.ioFuture().getNow(null);
+        if (payload == null) return false;
+        LoadContext context = context(holder, payload);
+        if (!holder.status().isAtLeast(CubeStatus.TERRAIN)) {
+            return commitTerrain(holder, context, priority, false);
+        }
+        if (!holder.status().isAtLeast(CubeStatus.FEATURES)) {
+            if (!taskScheduler.dependenciesReady(holder, CubeStatus.FEATURES, priority)) return false;
+            commitFeatures(holder, context);
+            return true;
+        }
+        if (!holder.status().isAtLeast(CubeStatus.LIGHT)) {
+            if (!taskScheduler.dependenciesReady(holder, CubeStatus.LIGHT, priority)) return false;
+            commitLight(holder, context);
+            return true;
+        }
+        if (holder.target() == CubeStatus.FULL && !holder.fullFuture().isDone()) {
+            holder.complete(context.cube);
+            context.full = true;
+            return true;
+        }
+        return false;
+    }
+
+    private Optional<byte[]> joinIo(CubePos pos, CubeHolder holder) throws IOException {
+        try {
+            return holder.ioFuture().join();
+        } catch (CompletionException exception) {
+            Throwable cause = exception.getCause();
+            if (cause instanceof IOException io) throw io;
+            throw new IOException("Cannot read cube " + pos, cause);
+        }
+    }
+
+    private LoadContext context(CubeHolder holder, Optional<byte[]> payload) throws IOException {
+        CubePos pos = holder.pos();
+        LoadContext existing = loadContexts.get(pos);
+        if (existing != null && (existing.epoch == holder.epoch() || existing.full)) return existing;
+        if (existing != null && loadContexts.remove(pos, existing)) {
+            CubeColumn<LoadedCube> column = columns.get(new ColumnPos(pos.x(), pos.z()));
+            if (column != null) {
+                column.remove(pos.y(), existing.cube);
+                if (column.isEmpty()) columns.remove(new ColumnPos(pos.x(), pos.z()), column);
+            }
+            cubes.remove(pos, existing.cube);
+            removeIndexedHeights(existing.cube);
+        }
+        LoadedCube cube = registerPlaceholder(pos);
+        LoadContext created = new LoadContext(cube, payload.orElse(null), holder.epoch());
+        LoadContext raced = loadContexts.putIfAbsent(pos, created);
+        return raced == null ? created : raced;
+    }
+
+    private boolean commitTerrain(
+            CubeHolder holder, LoadContext context, int priority, boolean wait) throws IOException {
+        CubePos pos = holder.pos();
+        if (context.payload != null) {
+            context.committing = true;
+            try {
+                context.cube.setGenerationVersion(CubeRecordCodec.generationVersion(context.payload));
+                CubeRecordCodec.DecodedCube decoded = CubeRecordCodec.decode(
+                        context.payload, context.cube.section(), world);
+                for (BlockEntity blockEntity : decoded.blockEntities()) {
+                    context.cube.putLoadedBlockEntity(blockEntity);
+                }
+                if (decoded.hasLight()) {
+                    context.cube.light().load(decoded.light());
+                    context.hasSavedLight = true;
+                }
+                if (!customWorld && shouldGenerate(pos)
+                        && InfiniteDownwardGenerator.upgradeLegacyTerrain(
+                                world, context.cube, effectiveStructureSettings())) {
+                    Higherworld.LOGGER.debug("Upgraded untouched generated terrain cube {}", pos);
+                }
+            } finally {
+                context.committing = false;
+            }
+        } else if (shouldGenerate(pos) && customWorld) {
+            CompletableFuture<CustomCubeGenerator.TerrainSnapshot> preparation =
+                    taskScheduler.prepareTerrain(holder, world.getSeed(), customWorldSettings, priority);
+            if (!wait && !preparation.isDone()) return false;
+            try {
+                context.committing = true;
+                try {
+                    CustomCubeGenerator.applyTerrain(context.cube, preparation.join());
+                } finally {
+                    context.committing = false;
+                }
+            } catch (CompletionException exception) {
+                Throwable cause = exception.getCause();
+                if (cause instanceof RuntimeException runtime) throw runtime;
+                throw new IOException("Cannot prepare terrain for cube " + pos, cause);
+            }
+        } else if (shouldGenerate(pos)) {
+            context.committing = true;
+            try {
+                InfiniteDownwardGenerator.generateTerrain(world, context.cube);
+            } finally {
+                context.committing = false;
+            }
+        }
+        holder.advance(CubeStatus.TERRAIN);
+        return true;
+    }
+
+    private void commitFeatures(CubeHolder holder, LoadContext context) {
+        boolean alreadyCommittingFeatures = committingFeatures.get();
+        committingFeatures.set(true);
+        context.committing = true;
+        try {
+            if (context.payload == null && shouldGenerate(holder.pos())) {
+                try (CubeSpatialLock.Scope ignored = generationLocks.lock(
+                        holder.pos(), CubeStatus.FEATURES.dependencyRadius())) {
+                    if (customWorld) {
+                        CustomCubeGenerator.finishGeneration(world, context.cube, customWorldSettings,
+                                structureSettings, generateStructures);
+                    } else {
+                        InfiniteDownwardGenerator.generateFeatures(
+                                world, context.cube, effectiveStructureSettings());
+                    }
+                }
+            }
+            holder.advance(CubeStatus.FEATURES);
+        } finally {
+            context.committing = false;
+            if (alreadyCommittingFeatures) committingFeatures.set(true);
+            else committingFeatures.remove();
+        }
+    }
+
+    private void commitLight(CubeHolder holder, LoadContext context) {
+        indexHeights(context.cube);
+        lightEngine.queueCube(holder.pos(), !context.hasSavedLight);
         lightEngine.propagate(1_000_000);
         holder.advance(CubeStatus.LIGHT);
-        holder.complete(cube);
     }
 
     private boolean shouldGenerate(CubePos pos) {
@@ -516,6 +686,8 @@ final class CubicWorldState implements AutoCloseable {
     }
 
     private void save(LoadedCube cube, boolean force, boolean wait) throws IOException {
+        LoadContext context = loadContexts.get(cube.pos());
+        if (context != null && !context.full) return;
         boolean wasDirty = cube.takeDirty();
         if (!force && !wasDirty) {
             return;
@@ -543,7 +715,6 @@ final class CubicWorldState implements AutoCloseable {
 
     @Override
     public void close() throws IOException {
-        taskScheduler.close();
         IOException failure = null;
         for (LoadedCube cube : List.copyOf(loadedCubes())) {
             try {
@@ -556,6 +727,7 @@ final class CubicWorldState implements AutoCloseable {
                 }
             }
         }
+        taskScheduler.close();
         try {
             ioScheduler.close();
         } catch (IOException exception) {
@@ -573,6 +745,7 @@ final class CubicWorldState implements AutoCloseable {
         }
         columns.clear();
         cubes.clear();
+        loadContexts.clear();
         if (failure != null) {
             throw failure;
         }
@@ -582,6 +755,21 @@ final class CubicWorldState implements AutoCloseable {
     }
 
     private record BlockColumnPos(int x, int z) {
+    }
+
+    private static final class LoadContext {
+        private final LoadedCube cube;
+        private final byte[] payload;
+        private final long epoch;
+        private boolean hasSavedLight;
+        private boolean committing;
+        private boolean full;
+
+        private LoadContext(LoadedCube cube, byte[] payload, long epoch) {
+            this.cube = cube;
+            this.payload = payload;
+            this.epoch = epoch;
+        }
     }
 
     /** Re-evaluates only loaded cells in one sparse vertical block column. */

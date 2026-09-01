@@ -31,7 +31,11 @@ public enum CubeStatus {
     }
 
     public CubeStatus neighbourPrerequisite() {
-        return this == FEATURES || this == LIGHT ? IO_READY : null;
+        return switch (this) {
+            case FEATURES -> TERRAIN;
+            case LIGHT -> FEATURES;
+            default -> null;
+        };
     }
 
     public boolean isAtLeast(CubeStatus other) {

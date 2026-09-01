@@ -43,9 +43,18 @@ final class InfiniteDownwardGenerator {
 
     static void generate(
             ServerWorld world, LoadedCube cube, StructureGenerationSettings structureSettings) {
+        generateTerrain(world, cube);
+        generateFeatures(world, cube, structureSettings);
+    }
+
+    static void generateTerrain(ServerWorld world, LoadedCube cube) {
         if (!VanillaCubeTerrainGenerator.generate(world, cube)) {
             generateVanillaNoiseTerrain(world, cube);
         }
+    }
+
+    static void generateFeatures(
+            ServerWorld world, LoadedCube cube, StructureGenerationSettings structureSettings) {
         VanillaStructureGenerator.generate(world, cube, structureSettings);
         VanillaPlacedFeatureGenerator.generate(world, cube);
         cube.setGenerationVersion(GENERATION_VERSION);

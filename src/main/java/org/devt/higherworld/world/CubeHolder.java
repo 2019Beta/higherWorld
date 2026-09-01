@@ -20,6 +20,7 @@ final class CubeHolder {
     CubePos pos() { return pos; }
     CubeStatus status() { return lifecycle.status; }
     CubeStatus target() { return lifecycle.target; }
+    boolean failed() { return lifecycle.failed; }
     long epoch() { return lifecycle.epoch; }
     CompletableFuture<Optional<byte[]>> ioFuture() { return lifecycle.ioFuture; }
     CompletableFuture<CustomCubeGenerator.TerrainSnapshot> terrainPreparationFuture() {
@@ -105,6 +106,7 @@ final class CubeHolder {
     void fail(long epoch, Throwable throwable) {
         Lifecycle current = lifecycle;
         if (current.epoch != epoch || current.cancelled) return;
+        current.failed = true;
         current.stageFutures.values().forEach(future -> future.completeExceptionally(throwable));
         current.fullFuture.completeExceptionally(throwable);
     }
@@ -144,6 +146,7 @@ final class CubeHolder {
         private volatile CubeStatus status = CubeStatus.EMPTY;
         private volatile CubeStatus target = CubeStatus.EMPTY;
         private volatile boolean cancelled;
+        private volatile boolean failed;
         private volatile CompletableFuture<Optional<byte[]>> ioFuture;
         private volatile CompletableFuture<CustomCubeGenerator.TerrainSnapshot> terrainPreparationFuture;
 

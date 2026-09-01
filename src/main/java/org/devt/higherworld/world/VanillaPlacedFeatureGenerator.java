@@ -165,12 +165,13 @@ final class VanillaPlacedFeatureGenerator {
                 virtualMinY + CubePos.SIZE - 1,
                 cube.pos().minBlockZ() + CubePos.SIZE - 1);
         Map<Long, Chunk> featureChunks = new HashMap<>();
+        Map<BlockPos, BlockEntity> clippedBlockEntities = new HashMap<>();
         return (StructureWorldAccess) Proxy.newProxyInstance(
                 VanillaPlacedFeatureGenerator.class.getClassLoader(),
                 new Class<?>[] {StructureWorldAccess.class},
                 (proxy, method, arguments) -> invoke(
                         world, cube, virtualCube, virtualMinY, offsetY,
-                        legacyBoundaryReads, featureChunks,
+                        legacyBoundaryReads, featureChunks, clippedBlockEntities,
                         method, arguments));
     }
 
@@ -178,10 +179,19 @@ final class VanillaPlacedFeatureGenerator {
     private static Object invoke(
             ServerWorld world, LoadedCube cube, BlockBox virtualCube,
             int virtualMinY, int offsetY, boolean legacyBoundaryReads,
-            Map<Long, Chunk> featureChunks,
+            Map<Long, Chunk> featureChunks, Map<BlockPos, BlockEntity> clippedBlockEntities,
             Method method, Object[] arguments) throws Throwable {
         String name = method.getName();
         if (!legacyBoundaryReads && "getChunk".equals(name)
+                && arguments != null && arguments.length >= 1
+                && arguments[0] instanceof BlockPos pos) {
+            int chunkX = Math.floorDiv(pos.getX(), CubePos.SIZE);
+            int chunkZ = Math.floorDiv(pos.getZ(), CubePos.SIZE);
+            long key = ((long) chunkX << 32) ^ (chunkZ & 0xFFFFFFFFL);
+            return featureChunks.computeIfAbsent(key, ignored ->
+                    createFeatureChunk(world, cube, virtualMinY, chunkX, chunkZ));
+        }
+        if (!legacyBoundaryReads && ("getChunk".equals(name) || "getChunkAsView".equals(name))
                 && arguments != null && arguments.length >= 2
                 && arguments[0] instanceof Integer chunkX
                 && arguments[1] instanceof Integer chunkZ) {
@@ -209,7 +219,20 @@ final class VanillaPlacedFeatureGenerator {
         if ("setBlockState".equals(name) && virtualPos != null
                 && arguments.length >= 2 && arguments[1] instanceof BlockState state) {
             if (!virtualCube.contains(virtualPos)) {
-                return false;
+                // Features from the eight neighbouring origins are replayed so
+                // their writes can spill into this cube. Keep writes outside the
+                // target in a tiny per-origin scratch view: generators such as
+                // DungeonFeature immediately fetch and configure the block
+                // entity they just placed, and returning false/null otherwise
+                // emits an error for every replay.
+                if (state.hasBlockEntity() && state.getBlock() instanceof BlockEntityProvider provider) {
+                    BlockPos stablePos = virtualPos.toImmutable();
+                    BlockEntity blockEntity = provider.createBlockEntity(stablePos, state);
+                    if (blockEntity != null) clippedBlockEntities.put(stablePos, blockEntity);
+                } else {
+                    clippedBlockEntities.remove(virtualPos);
+                }
+                return true;
             }
             BlockPos actualPos = translate(virtualPos, offsetY);
             BlockState previous = cube.getBlockState(actualPos);
@@ -258,6 +281,14 @@ final class VanillaPlacedFeatureGenerator {
         }
         if ("getBlockEntity".equals(name) && virtualPos != null
                 && !virtualCube.contains(virtualPos)) {
+            BlockEntity clipped = clippedBlockEntities.get(virtualPos);
+            if (clipped != null) {
+                if (arguments.length == 2) {
+                    return arguments[1] instanceof net.minecraft.block.entity.BlockEntityType<?> type
+                            && clipped.getType() == type ? Optional.of(clipped) : Optional.empty();
+                }
+                return clipped;
+            }
             if (isInVanillaHeight(virtualPos)) {
                 if (arguments.length == 2) {
                     BlockEntity blockEntity = world.getBlockEntity(virtualPos);
@@ -313,7 +344,7 @@ final class VanillaPlacedFeatureGenerator {
             // world's height; setBlockState remains clipped to the target cube.
             return isInVanillaHeight(virtualPos);
         }
-        if ("markBlockForPostProcessing".equals(name)) {
+        if ("markBlockForPostProcessing".equals(name) || "markForPostProcessing".equals(name)) {
             // ProtoChunk post-processing lists do not exist for sparse cubes.
             // Forwarding this to the vanilla ChunkRegion only emits warnings
             // and records a position in the unrelated virtual-height chunk.

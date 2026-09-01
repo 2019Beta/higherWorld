@@ -3,7 +3,9 @@ package org.devt.higherworld.world;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.BlockEntityProvider;
@@ -22,6 +24,10 @@ import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.ChunkPos;
 import net.minecraft.util.math.random.Random;
 import net.minecraft.world.StructureWorldAccess;
+import net.minecraft.world.HeightLimitView;
+import net.minecraft.world.chunk.Chunk;
+import net.minecraft.world.chunk.ProtoChunk;
+import net.minecraft.world.chunk.UpgradeData;
 import net.minecraft.world.gen.structure.Structure;
 import net.minecraft.world.gen.structure.StructureKeys;
 import org.devt.higherworld.storage.CubePos;
@@ -179,16 +185,31 @@ final class VanillaStructureGenerator {
 
     private static StructureWorldAccess cubeAccess(
             ServerWorld world, LoadedCube cube, BlockBox cubeBox) {
+        Map<Long, Chunk> structureChunks = new HashMap<>();
         return (StructureWorldAccess) Proxy.newProxyInstance(
                 VanillaStructureGenerator.class.getClassLoader(),
                 new Class<?>[] {StructureWorldAccess.class},
-                (proxy, method, arguments) -> invoke(world, cube, cubeBox, method, arguments));
+                (proxy, method, arguments) -> invoke(
+                        world, cube, cubeBox, structureChunks, method, arguments));
     }
 
     private static Object invoke(
             ServerWorld world, LoadedCube cube, BlockBox cubeBox,
+            Map<Long, Chunk> structureChunks,
             Method method, Object[] arguments) throws Throwable {
         String name = method.getName();
+        if ("getChunk".equals(name) && arguments != null && arguments.length >= 1
+                && arguments[0] instanceof BlockPos pos) {
+            return structureChunk(world, cube, structureChunks,
+                    Math.floorDiv(pos.getX(), CubePos.SIZE),
+                    Math.floorDiv(pos.getZ(), CubePos.SIZE));
+        }
+        if (("getChunk".equals(name) || "getChunkAsView".equals(name))
+                && arguments != null && arguments.length >= 2
+                && arguments[0] instanceof Integer chunkX
+                && arguments[1] instanceof Integer chunkZ) {
+            return structureChunk(world, cube, structureChunks, chunkX, chunkZ);
+        }
         if ("setBlockState".equals(name) && arguments != null
                 && arguments.length >= 2 && arguments[0] instanceof BlockPos pos
                 && arguments[1] instanceof BlockState state) {
@@ -223,7 +244,7 @@ final class VanillaStructureGenerator {
                 || "isInLoadLimit".equals(name)) && firstPos(arguments) instanceof BlockPos pos) {
             return cubeBox.contains(pos);
         }
-        if ("markBlockForPostProcessing".equals(name)
+        if (("markBlockForPostProcessing".equals(name) || "markForPostProcessing".equals(name))
                 || "scheduleBlockTick".equals(name)
                 || "scheduleFluidTick".equals(name)
                 || "scheduleTick".equals(name)) {
@@ -297,6 +318,22 @@ final class VanillaStructureGenerator {
             }
         }
         return previous != state;
+    }
+
+    private static Chunk structureChunk(
+            ServerWorld world, LoadedCube cube, Map<Long, Chunk> chunks,
+            int chunkX, int chunkZ) {
+        long key = ((long) chunkX << 32) ^ (chunkZ & 0xFFFFFFFFL);
+        return chunks.computeIfAbsent(key, ignored -> {
+            HeightLimitView height = HeightLimitView.create(cube.pos().minBlockY(), CubePos.SIZE);
+            ProtoChunk chunk = new ProtoChunk(
+                    new ChunkPos(chunkX, chunkZ), UpgradeData.NO_UPGRADE_DATA,
+                    height, world.getPalettesFactory(), null);
+            if (chunkX == cube.pos().x() && chunkZ == cube.pos().z()) {
+                chunk.getSectionArray()[0] = cube.section();
+            }
+            return chunk;
+        });
     }
 
     private static int ceilDiv(int dividend, int divisor) {

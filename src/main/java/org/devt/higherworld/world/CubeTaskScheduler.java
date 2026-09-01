@@ -77,6 +77,10 @@ final class CubeTaskScheduler implements AutoCloseable {
         return tickets.isActive(pos);
     }
 
+    int priority(CubePos pos) {
+        return tickets.priority(pos);
+    }
+
     Set<CubePos> activePositions() {
         return tickets.activePositions();
     }
@@ -163,9 +167,24 @@ final class CubeTaskScheduler implements AutoCloseable {
                 .filter(holder -> !holder.terrainPreparationFuture().isCancelled()
                         && !holder.terrainPreparationFuture().isCompletedExceptionally())
                 .filter(holder -> !holder.status().isAtLeast(CubeStatus.TERRAIN))
-                .filter(holder -> neighbourDependenciesReady(holder, CubeStatus.FEATURES,
-                        tickets.priority(holder.pos())))
                 .sorted(Comparator.comparingInt(holder -> tickets.priority(holder.pos())))
+                .limit(limit)
+                .toList();
+    }
+
+    /**
+     * Returns lifecycle nodes that have finished IO but still need server-thread
+     * stage commits. Dependencies are requested recursively by {@link #request}.
+     */
+    List<CubeHolder> readyForCommit(int limit) {
+        return holders.values().stream()
+                .filter(holder -> !holder.failed())
+                .filter(holder -> holder.target().isAtLeast(CubeStatus.TERRAIN))
+                .filter(holder -> holder.status().isAtLeast(CubeStatus.IO_READY))
+                .filter(holder -> !holder.status().isAtLeast(holder.target()))
+                .sorted(Comparator
+                        .comparingInt((CubeHolder holder) -> tickets.priority(holder.pos()))
+                        .thenComparingInt(holder -> holder.status().ordinal()))
                 .limit(limit)
                 .toList();
     }

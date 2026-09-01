@@ -127,6 +127,25 @@ class CubeSchedulingTest {
     }
 
     @Test
+    void failedLifecycleStaysTerminalUntilCancellation() {
+        CubeHolder holder = new CubeHolder(new CubePos(7, 8, 9));
+        holder.request(CubeStatus.FULL);
+        long failedEpoch = holder.epoch();
+        holder.fail(new IllegalStateException("generation failed"));
+
+        assertTrue(holder.failed());
+        assertTrue(holder.fullFuture().isCompletedExceptionally());
+        holder.request(CubeStatus.TERRAIN);
+        assertEquals(failedEpoch, holder.epoch());
+        assertTrue(holder.failed());
+
+        holder.cancel();
+        holder.request(CubeStatus.TERRAIN);
+        assertEquals(failedEpoch + 1L, holder.epoch());
+        assertFalse(holder.failed());
+    }
+
+    @Test
     void featureAndLightStagesWaitForLocalAndNeighbourPrerequisites() throws Exception {
         CubePos center = new CubePos(0, -10, 0);
         try (CubeStorage storage = new CubeStorage(directory);
@@ -134,32 +153,38 @@ class CubeSchedulingTest {
                 CubeTaskScheduler scheduler = new CubeTaskScheduler(io)) {
             CubeHolder holder = scheduler.request(center, CubeStatus.FULL, 0);
             holder.ioFuture().join();
-            scheduler.neighbourDependenciesFuture(holder, CubeStatus.FEATURES, 0).join();
-
             CompletableFuture<Void> features = scheduler.dependenciesFuture(
                     holder, CubeStatus.FEATURES, 0);
             assertFalse(features.isDone());
             holder.advance(CubeStatus.TERRAIN);
+            assertFalse(features.isDone());
+            CubeDependencyRadius radius = CubeStatus.FEATURES.dependencyRadius();
+            radius.forEach(center, pos -> scheduler.holder(pos).advance(CubeStatus.TERRAIN));
             features.join();
             assertTrue(features.isDone());
 
             CompletableFuture<Void> light = scheduler.dependenciesFuture(holder, CubeStatus.LIGHT, 0);
             assertFalse(light.isDone());
-            holder.advance(CubeStatus.FEATURES);
+            CubeStatus.LIGHT.dependencyRadius().forEach(
+                    center, pos -> scheduler.holder(pos).advance(CubeStatus.FEATURES));
             light.join();
             assertTrue(light.isDone());
-            assertEquals(CubeStatus.IO_READY,
+            assertEquals(CubeStatus.FEATURES,
                     scheduler.holder(new CubePos(1, -10, 0)).target());
         }
     }
 
     @Test
-    void statusMetadataUsesAcyclicLocalAndIoNeighbourDependencies() {
+    void statusMetadataUsesStrictlyLowerNeighbourStages() {
         assertEquals(CubeStatus.IO_READY, CubeStatus.TERRAIN.localPrerequisite());
         assertEquals(CubeStatus.TERRAIN, CubeStatus.FEATURES.localPrerequisite());
         assertEquals(CubeStatus.FEATURES, CubeStatus.LIGHT.localPrerequisite());
-        assertEquals(CubeStatus.IO_READY, CubeStatus.FEATURES.neighbourPrerequisite());
-        assertEquals(CubeStatus.IO_READY, CubeStatus.LIGHT.neighbourPrerequisite());
+        assertEquals(CubeStatus.TERRAIN, CubeStatus.FEATURES.neighbourPrerequisite());
+        assertEquals(CubeStatus.FEATURES, CubeStatus.LIGHT.neighbourPrerequisite());
+        assertTrue(CubeStatus.FEATURES.neighbourPrerequisite().ordinal()
+                < CubeStatus.FEATURES.ordinal());
+        assertTrue(CubeStatus.LIGHT.neighbourPrerequisite().ordinal()
+                < CubeStatus.LIGHT.ordinal());
         assertEquals(CubeDependencyRadius.NONE, CubeStatus.TERRAIN.dependencyRadius());
     }
 }
