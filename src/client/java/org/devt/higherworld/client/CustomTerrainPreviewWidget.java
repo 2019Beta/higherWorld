@@ -22,8 +22,11 @@ import org.devt.higherworld.world.CustomWorldSettings;
  */
 public final class CustomTerrainPreviewWidget extends ClickableWidget {
     public static final long PREVIEW_SEED = 0x484947484552574CL;
-    private static final int SAMPLE_WIDTH = 144;
-    private static final int SAMPLE_HEIGHT = 96;
+    // This is an editing aid rather than a block-accurate map.  A deliberately
+    // coarse grid keeps both terrain-noise evaluation and per-frame GUI draw
+    // calls cheap while still showing the overall terrain silhouette.
+    private static final int SAMPLE_WIDTH = 48;
+    private static final int SAMPLE_HEIGHT = 32;
     private static final double X_MIN = -256.0;
     private static final double X_MAX = 256.0;
     private static final long DEBOUNCE_NANOS = 150_000_000L;
@@ -33,6 +36,7 @@ public final class CustomTerrainPreviewWidget extends ClickableWidget {
     private int[] pixels = new int[SAMPLE_WIDTH * SAMPLE_HEIGHT];
     private String observedKey;
     private boolean dirty = true;
+    private boolean settingsCaptureRequested = true;
     private long dirtyAtNanos;
     private CustomWorldSettings lastSettings;
     private double minY = -64.0;
@@ -47,19 +51,19 @@ public final class CustomTerrainPreviewWidget extends ClickableWidget {
         this.dirtyAtNanos = System.nanoTime();
     }
 
-    /** Marks the cached image dirty; sampling is debounced on the render thread. */
+    /** Requests one settings capture; changed settings are sampled after the debounce. */
     public void markDirty() {
-        dirty = true;
-        dirtyAtNanos = System.nanoTime();
+        settingsCaptureRequested = true;
     }
 
     @Override
     protected void renderWidget(DrawContext context, int mouseX, int mouseY, float delta) {
         CustomWorldSettings settings = lastSettings;
         long now = System.nanoTime();
-        if (dirty || observedKey == null) {
+        if (settingsCaptureRequested || observedKey == null) {
             settings = readSettings();
             String key = settings.toJson();
+            settingsCaptureRequested = false;
             if (!key.equals(observedKey)) {
                 observedKey = key;
                 dirty = true;
