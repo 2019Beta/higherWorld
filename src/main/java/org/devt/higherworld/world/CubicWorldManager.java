@@ -187,6 +187,11 @@ public final class CubicWorldManager {
         }
     }
 
+    public static long cubeRevision(ServerWorld world, CubePos pos) {
+        CubicWorldState state = WORLDS.get(world);
+        return state == null ? 0L : state.cubeRevision(pos);
+    }
+
     /** Queues disk IO for a watched cube without touching live world state. */
     public static void prefetchCubePayload(ServerWorld world, CubePos pos, int priority) {
         CubicWorldState state = WORLDS.get(world);
@@ -201,6 +206,21 @@ public final class CubicWorldManager {
         if (state != null) {
             state.retainPrefetches(retained);
         }
+    }
+
+    static void replaceTicket(ServerWorld world, CubeTicket ticket) {
+        CubicWorldState state = WORLDS.get(world);
+        if (state != null) state.replaceTicket(ticket);
+    }
+
+    static void removeTicket(ServerWorld world, Object key) {
+        CubicWorldState state = WORLDS.get(world);
+        if (state != null) state.removeTicket(key);
+    }
+
+    public static void advanceReadyTasks(ServerWorld world, long budgetNanos) {
+        CubicWorldState state = WORLDS.get(world);
+        if (state != null) state.advanceReadyTasks(budgetNanos);
     }
 
     /**

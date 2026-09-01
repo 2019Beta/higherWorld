@@ -1,6 +1,7 @@
 package org.devt.higherworld.world;
 
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -20,6 +21,7 @@ final class LoadedCube {
     private final CubePos pos;
     private final ChunkSection section;
     private final AtomicBoolean dirty = new AtomicBoolean();
+    private final AtomicLong revision = new AtomicLong();
     private int generationVersion;
     private final Map<BlockPos, BlockEntity> blockEntities = new ConcurrentHashMap<>();
 
@@ -40,6 +42,10 @@ final class LoadedCube {
         return generationVersion;
     }
 
+    long revision() {
+        return revision.get();
+    }
+
     void setGenerationVersion(int generationVersion) {
         this.generationVersion = generationVersion;
     }
@@ -57,6 +63,7 @@ final class LoadedCube {
                 local(blockPos.getX()), local(blockPos.getY()), local(blockPos.getZ()), state);
         if (previous != state) {
             dirty.set(true);
+            revision.incrementAndGet();
         }
         return previous;
     }
@@ -67,6 +74,7 @@ final class LoadedCube {
 
     void markDirty() {
         dirty.set(true);
+        revision.incrementAndGet();
     }
 
     boolean takeDirty() {
@@ -88,6 +96,7 @@ final class LoadedCube {
     void putBlockEntity(BlockEntity blockEntity) {
         blockEntities.put(blockEntity.getPos().toImmutable(), blockEntity);
         dirty.set(true);
+        revision.incrementAndGet();
     }
 
     void putLoadedBlockEntity(BlockEntity blockEntity) {
@@ -98,6 +107,7 @@ final class LoadedCube {
         BlockEntity removed = blockEntities.remove(pos);
         if (removed != null) {
             dirty.set(true);
+            revision.incrementAndGet();
         }
         return removed;
     }

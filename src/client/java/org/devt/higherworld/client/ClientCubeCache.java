@@ -15,12 +15,11 @@ import net.minecraft.util.math.BlockPos;
 import net.minecraft.world.chunk.ChunkSection;
 import net.minecraft.block.entity.BlockEntity;
 import org.devt.higherworld.storage.CubePos;
-import org.devt.higherworld.world.CubeColumn;
 import org.devt.higherworld.world.CubeRecordCodec;
 
 /** Sparse client-side mirror of the cubes sent by the server. */
 public final class ClientCubeCache {
-    private static final ConcurrentMap<ColumnPos, CubeColumn<ChunkSection>> COLUMNS = new ConcurrentHashMap<>();
+    private static final ConcurrentMap<CubePos, CubeEntry> CUBES = new ConcurrentHashMap<>();
     private static volatile ClientWorld owner;
     private static final ConcurrentMap<BlockPos, BlockEntity> BLOCK_ENTITIES = new ConcurrentHashMap<>();
 
@@ -28,7 +27,15 @@ public final class ClientCubeCache {
     }
 
     public static void put(ClientWorld world, CubePos pos, byte[] payload) {
+        put(world, pos, 0L, payload);
+    }
+
+    public static void put(ClientWorld world, CubePos pos, long revision, byte[] payload) {
         ensureOwner(world);
+        CubeEntry current = CUBES.get(pos);
+        if (current != null && current.revision() > revision) {
+            return;
+        }
         ChunkSection section = new ChunkSection(world.getPalettesFactory());
         List<BlockEntity> blockEntities;
         try {
@@ -36,10 +43,8 @@ public final class ClientCubeCache {
         } catch (java.io.IOException exception) {
             throw new IllegalArgumentException("Invalid cube payload for " + pos, exception);
         }
-        CubeColumn<ChunkSection> column = COLUMNS.computeIfAbsent(
-                new ColumnPos(pos.x(), pos.z()), ignored -> new CubeColumn<>());
-        column.remove(pos.y());
-        column.put(pos.y(), section);
+        CUBES.compute(pos, (ignored, existing) -> existing != null && existing.revision() > revision
+                ? existing : new CubeEntry(section, revision));
         removeBlockEntities(pos);
         for (BlockEntity blockEntity : blockEntities) {
             BLOCK_ENTITIES.put(blockEntity.getPos().toImmutable(), blockEntity);
@@ -49,14 +54,7 @@ public final class ClientCubeCache {
 
     public static void unload(ClientWorld world, CubePos pos) {
         ensureOwner(world);
-        ColumnPos columnPos = new ColumnPos(pos.x(), pos.z());
-        CubeColumn<ChunkSection> column = COLUMNS.get(columnPos);
-        if (column != null) {
-            column.remove(pos.y());
-            if (column.isEmpty()) {
-                COLUMNS.remove(columnPos, column);
-            }
-        }
+        CUBES.remove(pos);
         removeBlockEntities(pos);
         scheduleRenderNeighborhood(pos);
     }
@@ -76,11 +74,13 @@ public final class ClientCubeCache {
     public static boolean setBlockState(ClientWorld world, BlockPos pos, BlockState state) {
         ensureOwner(world);
         CubePos cubePos = CubePos.fromBlock(pos.getX(), pos.getY(), pos.getZ());
-        CubeColumn<ChunkSection> column = COLUMNS.computeIfAbsent(
-                new ColumnPos(cubePos.x(), cubePos.z()), ignored -> new CubeColumn<>());
-        ChunkSection section = column.getOrCreate(cubePos.y(), ignored -> new ChunkSection(world.getPalettesFactory()));
+        CubeEntry entry = CUBES.computeIfAbsent(cubePos,
+                ignored -> new CubeEntry(new ChunkSection(world.getPalettesFactory()), 0L));
+        ChunkSection section = entry.section();
         BlockState previous = section.setBlockState(local(pos.getX()), local(pos.getY()), local(pos.getZ()), state);
         if (previous != state) {
+            CUBES.computeIfPresent(cubePos,
+                    (ignored, current) -> new CubeEntry(current.section(), current.revision() + 1L));
             scheduleRenderNeighborhood(cubePos);
             return true;
         }
@@ -88,13 +88,13 @@ public final class ClientCubeCache {
     }
 
     public static void clear() {
-        COLUMNS.clear();
+        CUBES.clear();
         BLOCK_ENTITIES.clear();
         owner = null;
     }
 
     public static int loadedCubeCount() {
-        return COLUMNS.values().stream().mapToInt(CubeColumn::size).sum();
+        return CUBES.size();
     }
 
     public static ChunkSection getSection(ClientWorld world, int sectionX, int sectionY, int sectionZ) {
@@ -121,17 +121,15 @@ public final class ClientCubeCache {
 
     public static Integer highestBlockY(ClientWorld world, int blockX, int blockZ) {
         ensureOwner(world);
-        CubeColumn<ChunkSection> column = COLUMNS.get(new ColumnPos(
-                Math.floorDiv(blockX, CubePos.SIZE), Math.floorDiv(blockZ, CubePos.SIZE)));
-        if (column == null) {
-            return null;
-        }
+        int cubeX = Math.floorDiv(blockX, CubePos.SIZE);
+        int cubeZ = Math.floorDiv(blockZ, CubePos.SIZE);
         int localX = local(blockX);
         int localZ = local(blockZ);
         Integer highest = null;
-        for (Map.Entry<Integer, ChunkSection> entry : column.entries()) {
-            int sectionY = entry.getKey();
-            ChunkSection section = entry.getValue();
+        for (Map.Entry<CubePos, CubeEntry> entry : CUBES.entrySet()) {
+            if (entry.getKey().x() != cubeX || entry.getKey().z() != cubeZ) continue;
+            int sectionY = entry.getKey().y();
+            ChunkSection section = entry.getValue().section();
             for (int localY = CubePos.SIZE - 1; localY >= 0; localY--) {
                 if (!section.getBlockState(localX, localY, localZ).isAir()) {
                     int y = Math.addExact(Math.multiplyExact(sectionY, CubePos.SIZE), localY);
@@ -145,15 +143,15 @@ public final class ClientCubeCache {
 
     private static ChunkSection section(ClientWorld world, CubePos pos) {
         ensureOwner(world);
-        CubeColumn<ChunkSection> column = COLUMNS.get(new ColumnPos(pos.x(), pos.z()));
-        return column == null ? null : column.get(pos.y());
+        CubeEntry entry = CUBES.get(pos);
+        return entry == null ? null : entry.section();
     }
 
     private static void ensureOwner(ClientWorld world) {
         if (owner != world) {
             synchronized (ClientCubeCache.class) {
                 if (owner != world) {
-                    COLUMNS.clear();
+                    CUBES.clear();
                     BLOCK_ENTITIES.clear();
                     owner = world;
                 }
@@ -193,6 +191,5 @@ public final class ClientCubeCache {
         return Math.floorMod(coordinate, CubePos.SIZE);
     }
 
-    private record ColumnPos(int x, int z) {
-    }
+    private record CubeEntry(ChunkSection section, long revision) {}
 }

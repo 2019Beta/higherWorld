@@ -11,6 +11,7 @@ import java.io.RandomAccessFile;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Optional;
+import java.util.Map;
 import java.util.zip.CRC32;
 import java.util.zip.DeflaterOutputStream;
 import java.util.zip.InflaterInputStream;
@@ -61,6 +62,18 @@ final class CubeRegionFile implements Closeable {
     }
 
     synchronized void write(int slot, byte[] payload) throws IOException {
+        append(slot, payload);
+        file.getFD().sync();
+    }
+
+    synchronized void writeBatch(Map<Integer, byte[]> payloads) throws IOException {
+        for (Map.Entry<Integer, byte[]> entry : payloads.entrySet()) {
+            append(entry.getKey(), entry.getValue());
+        }
+        if (!payloads.isEmpty()) file.getFD().sync();
+    }
+
+    private void append(int slot, byte[] payload) throws IOException {
         validateSlot(slot);
         if (payload.length > MAX_UNCOMPRESSED_BYTES) {
             throw new IOException("Cube payload is too large: " + payload.length);
@@ -82,8 +95,6 @@ final class CubeRegionFile implements Closeable {
         file.writeInt((int) crc.getValue());
         long payloadOffset = file.getFilePointer();
         file.write(compressed);
-        file.getFD().sync();
-
         offsets[slot] = payloadOffset;
         compressedLengths[slot] = compressed.length;
         uncompressedLengths[slot] = payload.length;

@@ -23,25 +23,12 @@ final class CustomCubeGenerator {
     static void generate(
             ServerWorld world, LoadedCube cube, CustomWorldSettings settings,
             StructureGenerationSettings structureSettings, boolean generateStructures) {
-        fillTerrain(world, cube, settings);
-        CustomCaveGenerator.generate(world, cube, settings.caves());
-        if (settings.ravines()) {
-            CustomCaveGenerator.generateRavine(world, cube);
-        }
-        if (generateStructures) {
-            VanillaStructureGenerator.generate(world, cube, structureSettings, settings);
-        }
-        CustomLakeGenerator.generate(world, cube, settings);
-        CustomDungeonGenerator.generate(world, cube, settings);
-        CustomOreGenerator.generateUniform(world, cube, settings);
-        CustomOreGenerator.generatePeriodic(world, cube, settings);
-        cube.setGenerationVersion(GENERATION_VERSION);
-        cube.markDirty();
+        applyTerrain(cube, prepareTerrain(world.getSeed(), cube.pos(), settings));
+        finishGeneration(world, cube, settings, structureSettings, generateStructures);
     }
 
-    private static void fillTerrain(
-            ServerWorld world, LoadedCube cube, CustomWorldSettings settings) {
-        CubePos pos = cube.pos();
+    /** CPU-only phase. It is safe to run on a generation worker. */
+    static TerrainSnapshot prepareTerrain(long seed, CubePos pos, CustomWorldSettings settings) {
         int stepX = settings.noiseSampleSizeX();
         int stepY = settings.noiseSampleSizeY();
         int stepZ = settings.noiseSampleSizeZ();
@@ -55,22 +42,55 @@ final class CustomCubeGenerator {
                     int x = pos.minBlockX() + gridX * stepX;
                     int y = pos.minBlockY() + gridY * stepY;
                     int z = pos.minBlockZ() + gridZ * stepZ;
-                    samples[index(gridX, gridY, gridZ, cellsX, cellsZ)] = terrainDensity(
-                            world, settings, x, y, z);
+                    samples[index(gridX, gridY, gridZ, cellsX, cellsZ)] =
+                            terrainDensity(seed, settings, x, y, z);
                 }
             }
         }
+        boolean[] solid = new boolean[CubePos.SIZE * CubePos.SIZE * CubePos.SIZE];
         for (int localY = 0; localY < CubePos.SIZE; localY++) {
             for (int localZ = 0; localZ < CubePos.SIZE; localZ++) {
                 for (int localX = 0; localX < CubePos.SIZE; localX++) {
                     double density = interpolate(samples, localX, localY, localZ,
                             stepX, stepY, stepZ, cellsX, cellsY, cellsZ);
+                    solid[blockIndex(localX, localY, localZ)] = density > 0.0;
+                }
+            }
+        }
+        return new TerrainSnapshot(solid);
+    }
+
+    /** Main-thread commit of the immutable worker result. */
+    static void applyTerrain(LoadedCube cube, TerrainSnapshot snapshot) {
+        for (int localY = 0; localY < CubePos.SIZE; localY++) {
+            for (int localZ = 0; localZ < CubePos.SIZE; localZ++) {
+                for (int localX = 0; localX < CubePos.SIZE; localX++) {
                     cube.setGeneratedBlockState(localX, localY, localZ,
-                            density > 0.0 ? Blocks.DEEPSLATE.getDefaultState()
+                            snapshot.solid()[blockIndex(localX, localY, localZ)]
+                                    ? Blocks.DEEPSLATE.getDefaultState()
                                     : Blocks.AIR.getDefaultState());
                 }
             }
         }
+    }
+
+    /** World-aware feature phase; invoked only by a server-thread commit. */
+    static void finishGeneration(
+            ServerWorld world, LoadedCube cube, CustomWorldSettings settings,
+            StructureGenerationSettings structureSettings, boolean generateStructures) {
+        CustomCaveGenerator.generate(world, cube, settings.caves());
+        if (settings.ravines()) {
+            CustomCaveGenerator.generateRavine(world, cube);
+        }
+        if (generateStructures) {
+            VanillaStructureGenerator.generate(world, cube, structureSettings, settings);
+        }
+        CustomLakeGenerator.generate(world, cube, settings);
+        CustomDungeonGenerator.generate(world, cube, settings);
+        CustomOreGenerator.generateUniform(world, cube, settings);
+        CustomOreGenerator.generatePeriodic(world, cube, settings);
+        cube.setGenerationVersion(GENERATION_VERSION);
+        cube.markDirty();
     }
 
     /** Samples the migrated CustomTerrainGenerator equation at an exact point. */
@@ -156,7 +176,19 @@ final class CustomCubeGenerator {
         return (y * (cellsZ + 1) + z) * (cellsX + 1) + x;
     }
 
+    private static int blockIndex(int x, int y, int z) {
+        return (y * CubePos.SIZE + z) * CubePos.SIZE + x;
+    }
+
     private static double lerp(double first, double second, double amount) {
         return first + (second - first) * amount;
+    }
+
+    record TerrainSnapshot(boolean[] solid) {
+        TerrainSnapshot {
+            if (solid.length != CubePos.SIZE * CubePos.SIZE * CubePos.SIZE) {
+                throw new IllegalArgumentException("A terrain snapshot must contain exactly 4096 blocks");
+            }
+        }
     }
 }

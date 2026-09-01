@@ -10,6 +10,8 @@ import java.nio.file.Files;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.Executors;
 
@@ -92,6 +94,18 @@ class CubeStorageTest {
                 future.get();
             }
             assertTrue(storage.openRegionCount() <= 64);
+        }
+    }
+
+    @Test
+    void readsOneRegionAsABatch() throws Exception {
+        CubePos first = new CubePos(1, 2, 3);
+        CubePos second = new CubePos(4, 5, 6);
+        try (CubeStorage storage = new CubeStorage(directory)) {
+            storage.write(first, new byte[] {1});
+            Map<CubePos, java.util.Optional<byte[]>> result = storage.readBatch(Set.of(first, second));
+            assertArrayEquals(new byte[] {1}, result.get(first).orElseThrow());
+            assertTrue(result.get(second).isEmpty());
         }
     }
 }

@@ -61,6 +61,35 @@ class CubeIoSchedulerTest {
         }
     }
 
+    @Test
+    void coalescesWritesAndProvidesReadAfterWriteConsistency() throws Exception {
+        CubePos pos = new CubePos(-4, -500, 9);
+        byte[] first = "first queued value".getBytes(StandardCharsets.UTF_8);
+        byte[] latest = "latest queued value".getBytes(StandardCharsets.UTF_8);
+        try (CubeStorage storage = new CubeStorage(directory);
+                CubeIoScheduler scheduler = new CubeIoScheduler(storage, 1)) {
+            scheduler.write(pos, first);
+            scheduler.write(pos, latest);
+
+            assertArrayEquals(latest, scheduler.read(pos, 0).orElseThrow());
+            assertTrue(scheduler.pendingWriteCount() <= 1);
+            scheduler.flushWrites();
+            assertArrayEquals(latest, storage.read(pos).orElseThrow());
+        }
+    }
+
+    @Test
+    void aWriteInvalidatesTheMissingCubeCache() throws Exception {
+        CubePos pos = new CubePos(8, -90, 12);
+        byte[] payload = "created after miss".getBytes(StandardCharsets.UTF_8);
+        try (CubeStorage storage = new CubeStorage(directory);
+                CubeIoScheduler scheduler = new CubeIoScheduler(storage, 1)) {
+            assertTrue(awaitReady(scheduler, pos).payload().isEmpty());
+            scheduler.write(pos, payload);
+            assertArrayEquals(payload, scheduler.read(pos, 0).orElseThrow());
+        }
+    }
+
     private static CubeIoScheduler.ReadResult awaitReady(CubeIoScheduler scheduler, CubePos pos)
             throws Exception {
         long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();

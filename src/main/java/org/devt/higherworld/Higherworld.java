@@ -35,6 +35,7 @@ public class Higherworld implements ModInitializer {
 
         ServerWorldEvents.LOAD.register(CubicWorldManager::open);
         ServerWorldEvents.UNLOAD.register(CubicWorldManager::close);
+        ServerTickEvents.START_WORLD_TICK.register(CubeWatchManager::midTick);
         ServerTickEvents.END_WORLD_TICK.register(CubeWatchManager::tick);
 
         LOGGER.info("HigherWorld sparse cubic runtime is enabled");

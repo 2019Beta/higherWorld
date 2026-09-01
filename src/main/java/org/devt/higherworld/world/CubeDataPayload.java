@@ -8,7 +8,7 @@ import org.devt.higherworld.Higherworld;
 import org.devt.higherworld.storage.CubePos;
 
 /** Full block and biome palette data for one 16-cubed cube. */
-public record CubeDataPayload(CubePos pos, byte[] data) implements CustomPayload {
+public record CubeDataPayload(CubePos pos, long revision, byte[] data) implements CustomPayload {
     private static final int MAX_PAYLOAD_BYTES = 2 * 1024 * 1024;
     public static final Id<CubeDataPayload> ID = new Id<>(Identifier.of(Higherworld.MOD_ID, "cube_data"));
     public static final PacketCodec<RegistryByteBuf, CubeDataPayload> CODEC = CustomPayload.codecOf(
@@ -18,12 +18,17 @@ public record CubeDataPayload(CubePos pos, byte[] data) implements CustomPayload
         buffer.writeInt(pos.x());
         buffer.writeInt(pos.y());
         buffer.writeInt(pos.z());
+        buffer.writeVarLong(revision);
         buffer.writeByteArray(data);
     }
 
     private static CubeDataPayload read(RegistryByteBuf buffer) {
         CubePos pos = new CubePos(buffer.readInt(), buffer.readInt(), buffer.readInt());
-        return new CubeDataPayload(pos, buffer.readByteArray(MAX_PAYLOAD_BYTES));
+        return new CubeDataPayload(pos, buffer.readVarLong(), buffer.readByteArray(MAX_PAYLOAD_BYTES));
+    }
+
+    public CubeDataPayload(CubePos pos, byte[] data) {
+        this(pos, 0L, data);
     }
 
     public static boolean canEncode(byte[] data) {

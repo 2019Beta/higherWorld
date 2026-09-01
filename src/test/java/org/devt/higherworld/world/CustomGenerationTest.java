@@ -2,6 +2,7 @@ package org.devt.higherworld.world;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
@@ -9,6 +10,17 @@ import org.junit.jupiter.api.Test;
 
 /** Pure checks for the custom generation math; no Minecraft client bootstrap is required. */
 class CustomGenerationTest {
+    @Test
+    void workerTerrainSnapshotIsDeterministicAndContainsOneCube() {
+        CustomWorldSettings settings = CustomWorldSettings.defaults();
+        var first = CustomCubeGenerator.prepareTerrain(
+                42L, new org.devt.higherworld.storage.CubePos(2, -10, 3), settings);
+        var second = CustomCubeGenerator.prepareTerrain(
+                42L, new org.devt.higherworld.storage.CubePos(2, -10, 3), settings);
+        assertEquals(4096, first.solid().length);
+        assertArrayEquals(first.solid(), second.solid());
+    }
+
     @Test
     void terrainNoiseIsDeterministicAndParametersMatter() {
         CustomWorldSettings defaults = CustomWorldSettings.customDefaults();

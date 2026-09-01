@@ -14,7 +14,7 @@ public class HigherworldClient implements ClientModInitializer {
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> ClientCubeCache.clear());
         ClientPlayNetworking.registerGlobalReceiver(CubeDataPayload.ID, (payload, context) -> {
             if (context.client().world != null) {
-                ClientCubeCache.put(context.client().world, payload.pos(), payload.data());
+                ClientCubeCache.put(context.client().world, payload.pos(), payload.revision(), payload.data());
             }
         });
         ClientPlayNetworking.registerGlobalReceiver(CubeUnloadPayload.ID, (payload, context) -> {

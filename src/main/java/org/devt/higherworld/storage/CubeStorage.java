@@ -5,6 +5,8 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Optional;
+import java.util.Collection;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -32,6 +34,27 @@ public final class CubeStorage implements Closeable {
         }
     }
 
+    /** Appends a same-region write group and performs one durability sync. */
+    public void writeBatch(Map<CubePos, byte[]> payloads) throws IOException {
+        if (payloads.isEmpty()) return;
+        Iterator<CubePos> iterator = payloads.keySet().iterator();
+        CubePos first = iterator.next();
+        RegionPos region = first.region();
+        while (iterator.hasNext()) {
+            if (!iterator.next().region().equals(region)) {
+                throw new IllegalArgumentException("A cube write batch must belong to one region");
+            }
+        }
+        RegionHandle handle = acquire(region, true);
+        try {
+            Map<Integer, byte[]> localPayloads = new LinkedHashMap<>(payloads.size());
+            payloads.forEach((pos, payload) -> localPayloads.put(pos.localIndex(), payload));
+            handle.file.writeBatch(localPayloads);
+        } finally {
+            release(handle);
+        }
+    }
+
     public Optional<byte[]> read(CubePos pos) throws IOException {
         RegionHandle handle = acquire(pos.region(), false);
         if (handle == null) {
@@ -39,6 +62,36 @@ public final class CubeStorage implements Closeable {
         }
         try {
             return handle.file.read(pos.localIndex());
+        } finally {
+            release(handle);
+        }
+    }
+
+    /** Reads cubes from one region while acquiring the region handle only once. */
+    public Map<CubePos, Optional<byte[]>> readBatch(Collection<CubePos> positions) throws IOException {
+        if (positions.isEmpty()) {
+            return Map.of();
+        }
+        Iterator<CubePos> iterator = positions.iterator();
+        CubePos first = iterator.next();
+        RegionPos region = first.region();
+        while (iterator.hasNext()) {
+            if (!iterator.next().region().equals(region)) {
+                throw new IllegalArgumentException("A cube batch must belong to one region");
+            }
+        }
+
+        Map<CubePos, Optional<byte[]>> result = new HashMap<>(positions.size());
+        RegionHandle handle = acquire(region, false);
+        if (handle == null) {
+            positions.forEach(pos -> result.put(pos, Optional.empty()));
+            return result;
+        }
+        try {
+            for (CubePos pos : positions) {
+                result.put(pos, handle.file.read(pos.localIndex()));
+            }
+            return result;
         } finally {
             release(handle);
         }

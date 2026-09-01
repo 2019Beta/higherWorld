@@ -31,14 +31,17 @@ public final class CubeWatchManager {
     private static final int POLL_ATTEMPTS_PER_PLAYER_TICK = 2;
     private static final int READ_AHEAD_PER_TICK = 8;
     private static final Map<UUID, WatchState> WATCHERS = new HashMap<>();
+    private static final Map<ServerWorld, AdaptiveBudget> BUDGETS = new HashMap<>();
 
     private CubeWatchManager() {
     }
 
     public static void tick(ServerWorld world) {
+        long workStarted = System.nanoTime();
+        AdaptiveBudget adaptive = BUDGETS.computeIfAbsent(world, ignored -> new AdaptiveBudget());
         Set<UUID> present = new HashSet<>();
         boolean watcherTicketsChanged = false;
-        CubeWorkBudget workBudget = new CubeWorkBudget(CUBE_WORK_PER_WORLD_TICK);
+        CubeWorkBudget workBudget = new CubeWorkBudget(adaptive.cubeAllowance());
         List<ServerPlayerEntity> players = world.getPlayers();
         int playerCount = players.size();
         int firstPlayer = playerCount == 0 ? 0 : Math.floorMod(world.getTime(), playerCount);
@@ -52,6 +55,7 @@ public final class CubeWatchManager {
         while (watchers.hasNext()) {
             Map.Entry<UUID, WatchState> entry = watchers.next();
             if (!present.contains(entry.getKey()) && entry.getValue().world == world) {
+                CubicWorldManager.removeTicket(world, entry.getKey());
                 watchers.remove();
                 watcherTicketsChanged = true;
             }
@@ -74,6 +78,7 @@ public final class CubeWatchManager {
             for (WatchState state : WATCHERS.values()) {
                 if (state.world == world) {
                     retained.addAll(state.sent);
+                    retained.addAll(state.pending);
                 }
             }
             CubicWorldManager.evictExcept(world, retained);
@@ -83,10 +88,22 @@ public final class CubeWatchManager {
         if (world.getTime() % 200L == 0L) {
             CubicWorldManager.flushDirty(world);
         }
+        adaptive.record(System.nanoTime() - workStarted);
+    }
+
+    /** A second bounded completion drain reduces future latency within a tick. */
+    public static void midTick(ServerWorld world) {
+        AdaptiveBudget budget = BUDGETS.computeIfAbsent(world, ignored -> new AdaptiveBudget());
+        CubicWorldManager.advanceReadyTasks(world, budget.commitNanos());
     }
 
     public static void removeWorld(ServerWorld world) {
-        WATCHERS.entrySet().removeIf(entry -> entry.getValue().world == world);
+        WATCHERS.entrySet().removeIf(entry -> {
+            if (entry.getValue().world != world) return false;
+            CubicWorldManager.removeTicket(world, entry.getKey());
+            return true;
+        });
+        BUDGETS.remove(world);
     }
 
     public static void broadcastBlockUpdate(ServerWorld world, BlockPos pos, BlockState state) {
@@ -107,7 +124,8 @@ public final class CubeWatchManager {
         }
         for (ServerPlayerEntity player : PlayerLookup.around(world, blockPos.toCenterPos(), 256.0)) {
             if (watches(player, pos) && ServerPlayNetworking.canSend(player, CubeDataPayload.ID)) {
-                ServerPlayNetworking.send(player, new CubeDataPayload(pos, data));
+                ServerPlayNetworking.send(player, new CubeDataPayload(
+                        pos, CubicWorldManager.cubeRevision(world, pos), data));
             }
         }
     }
@@ -163,7 +181,8 @@ public final class CubeWatchManager {
             }
             workBudget.consume();
             if (payload.length != 0 && CubeDataPayload.canEncode(payload)) {
-                ServerPlayNetworking.send(player, new CubeDataPayload(pos, payload));
+                ServerPlayNetworking.send(player, new CubeDataPayload(
+                        pos, CubicWorldManager.cubeRevision(world, pos), payload));
             }
             // Track empty positions too. They are implicit air and need no packet,
             // but remembering them prevents rechecking the overlapping 3D view
@@ -178,12 +197,20 @@ public final class CubeWatchManager {
             int horizontalRadius) {
         if (state.world != null && state.world != world) {
             ServerWorld previousWorld = state.world;
+            CubicWorldManager.removeTicket(previousWorld, player.getUuid());
             unloadAll(player, state);
             retainWorldPrefetches(previousWorld, state);
         }
         state.world = world;
         state.center = center;
         state.horizontalRadius = horizontalRadius;
+        if (center.y() - VERTICAL_RADIUS < world.getBottomSectionCoord()
+                || center.y() + VERTICAL_RADIUS >= world.getTopSectionCoord()) {
+            CubicWorldManager.replaceTicket(world,
+                    CubeTicket.player(player.getUuid(), center, horizontalRadius, VERTICAL_RADIUS));
+        } else {
+            CubicWorldManager.removeTicket(world, player.getUuid());
+        }
 
         Iterator<CubePos> iterator = state.sent.iterator();
         while (iterator.hasNext()) {
@@ -284,6 +311,26 @@ public final class CubeWatchManager {
 
         private void consume() {
             remaining--;
+        }
+    }
+
+    /** Keeps cube work near a small tick slice using an EWMA of actual cost. */
+    private static final class AdaptiveBudget {
+        private static final long TARGET_NANOS = 2_000_000L;
+        private double averageNanos = TARGET_NANOS;
+
+        private int cubeAllowance() {
+            double ratio = TARGET_NANOS / Math.max(250_000.0, averageNanos);
+            return Math.max(1, Math.min(4, (int) Math.round(CUBE_WORK_PER_WORLD_TICK * ratio)));
+        }
+
+        private long commitNanos() {
+            return Math.max(250_000L, Math.min(TARGET_NANOS, (long) (TARGET_NANOS *
+                    TARGET_NANOS / Math.max(TARGET_NANOS, averageNanos))));
+        }
+
+        private void record(long elapsedNanos) {
+            averageNanos = averageNanos * 0.8 + elapsedNanos * 0.2;
         }
     }
 }
