@@ -2,18 +2,28 @@ package org.devt.higherworld.world;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.nio.file.Path;
+import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.devt.higherworld.storage.CubePos;
+import org.devt.higherworld.storage.CubeIoScheduler;
+import org.devt.higherworld.storage.CubeStorage;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 class CubeSchedulingTest {
+    @TempDir
+    Path directory;
+
     @Test
     void dependencyRadiusIsAnisotropic() {
         CubeDependencyRadius radius = new CubeDependencyRadius(2, 0, 1);
@@ -73,5 +83,83 @@ class CubeSchedulingTest {
             second.get(5, TimeUnit.SECONDS);
         }
         assertFalse(secondEnteredEarly.get());
+    }
+
+    @Test
+    void lifecycleFuturesAdvanceIndependentlyAndRestartAfterCancellation() {
+        CubeHolder holder = new CubeHolder(new CubePos(1, 2, 3));
+        holder.request(CubeStatus.FULL);
+        CompletableFuture<?> firstFull = holder.fullFuture();
+
+        holder.advance(CubeStatus.TERRAIN);
+        assertTrue(holder.terrainFuture().isDone());
+        assertFalse(holder.featureFuture().isDone());
+        assertFalse(holder.lightFuture().isDone());
+        assertFalse(firstFull.isDone());
+        CompletableFuture<Void> save = new CompletableFuture<>();
+        holder.trackSave(save);
+        assertEquals(save, holder.saveFuture());
+
+        long firstEpoch = holder.epoch();
+        holder.cancel();
+        assertTrue(firstFull.isCompletedExceptionally());
+        assertFalse(save.isCancelled());
+        holder.request(CubeStatus.FEATURES);
+
+        assertEquals(firstEpoch + 1L, holder.epoch());
+        assertEquals(CubeStatus.EMPTY, holder.status());
+        assertNotSame(firstFull, holder.fullFuture());
+        assertFalse(holder.terrainFuture().isDone());
+    }
+
+    @Test
+    void staleIoCompletionCannotAdvanceRestartedLifecycle() {
+        CubeHolder holder = new CubeHolder(new CubePos(4, 5, 6));
+        holder.request(CubeStatus.IO_READY);
+        CompletableFuture<Optional<byte[]>> oldIo = new CompletableFuture<>();
+        holder.startIo(() -> oldIo);
+        holder.cancel();
+        holder.request(CubeStatus.IO_READY);
+
+        assertEquals(CubeStatus.EMPTY, holder.status());
+        holder.startIo(() -> CompletableFuture.completedFuture(Optional.empty()));
+        assertEquals(CubeStatus.IO_READY, holder.status());
+    }
+
+    @Test
+    void featureAndLightStagesWaitForLocalAndNeighbourPrerequisites() throws Exception {
+        CubePos center = new CubePos(0, -10, 0);
+        try (CubeStorage storage = new CubeStorage(directory);
+                CubeIoScheduler io = new CubeIoScheduler(storage);
+                CubeTaskScheduler scheduler = new CubeTaskScheduler(io)) {
+            CubeHolder holder = scheduler.request(center, CubeStatus.FULL, 0);
+            holder.ioFuture().join();
+            scheduler.neighbourDependenciesFuture(holder, CubeStatus.FEATURES, 0).join();
+
+            CompletableFuture<Void> features = scheduler.dependenciesFuture(
+                    holder, CubeStatus.FEATURES, 0);
+            assertFalse(features.isDone());
+            holder.advance(CubeStatus.TERRAIN);
+            features.join();
+            assertTrue(features.isDone());
+
+            CompletableFuture<Void> light = scheduler.dependenciesFuture(holder, CubeStatus.LIGHT, 0);
+            assertFalse(light.isDone());
+            holder.advance(CubeStatus.FEATURES);
+            light.join();
+            assertTrue(light.isDone());
+            assertEquals(CubeStatus.IO_READY,
+                    scheduler.holder(new CubePos(1, -10, 0)).target());
+        }
+    }
+
+    @Test
+    void statusMetadataUsesAcyclicLocalAndIoNeighbourDependencies() {
+        assertEquals(CubeStatus.IO_READY, CubeStatus.TERRAIN.localPrerequisite());
+        assertEquals(CubeStatus.TERRAIN, CubeStatus.FEATURES.localPrerequisite());
+        assertEquals(CubeStatus.FEATURES, CubeStatus.LIGHT.localPrerequisite());
+        assertEquals(CubeStatus.IO_READY, CubeStatus.FEATURES.neighbourPrerequisite());
+        assertEquals(CubeStatus.IO_READY, CubeStatus.LIGHT.neighbourPrerequisite());
+        assertEquals(CubeDependencyRadius.NONE, CubeStatus.TERRAIN.dependencyRadius());
     }
 }

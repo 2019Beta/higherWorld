@@ -59,6 +59,20 @@ public final class CubeIoScheduler implements AutoCloseable {
         request(pos, priority);
     }
 
+    /** Returns the deduplicated asynchronous read used by a cube lifecycle. */
+    public CompletableFuture<Optional<byte[]>> readAsync(CubePos pos, int priority) {
+        Optional<byte[]> cachedWrite = latestPendingWrite(pos);
+        if (cachedWrite.isPresent()) {
+            return CompletableFuture.completedFuture(cachedWrite);
+        }
+        if (isKnownMissing(pos)) {
+            return CompletableFuture.completedFuture(Optional.empty());
+        }
+        ReadTask task = request(pos, priority);
+        task.future.whenComplete((ignored, throwable) -> reads.remove(pos, task));
+        return task.future;
+    }
+
     public void retainPrefetches(Set<CubePos> retained) {
         reads.forEach((pos, task) -> {
             if (!retained.contains(pos) && reads.remove(pos, task)) {
