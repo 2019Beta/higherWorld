@@ -20,6 +20,7 @@ import org.devt.higherworld.storage.CubePos;
 final class LoadedCube {
     private final CubePos pos;
     private final ChunkSection section;
+    private final CubeLightData light = new CubeLightData();
     private final AtomicBoolean dirty = new AtomicBoolean();
     private final AtomicLong revision = new AtomicLong();
     private int generationVersion;
@@ -36,6 +37,10 @@ final class LoadedCube {
 
     ChunkSection section() {
         return section;
+    }
+
+    CubeLightData light() {
+        return light;
     }
 
     int generationVersion() {
@@ -87,6 +92,13 @@ final class LoadedCube {
 
     void restoreDirty() {
         dirty.set(true);
+    }
+
+    void publishLight() {
+        if (light.publish()) {
+            dirty.set(true);
+            revision.incrementAndGet();
+        }
     }
 
     BlockEntity getBlockEntity(BlockPos pos) {

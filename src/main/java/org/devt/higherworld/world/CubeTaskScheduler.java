@@ -133,7 +133,7 @@ final class CubeTaskScheduler implements AutoCloseable {
     private static Set<CubePos> withDependencies(Set<CubePos> active) {
         Set<CubePos> retained = ConcurrentHashMap.newKeySet();
         retained.addAll(active);
-        CubeDependencyRadius radius = CubeStatus.FEATURES.dependencyRadius();
+        CubeDependencyRadius radius = CubeStatus.LIGHT.dependencyRadius();
         active.forEach(pos -> radius.forEach(pos, retained::add));
         return retained;
     }

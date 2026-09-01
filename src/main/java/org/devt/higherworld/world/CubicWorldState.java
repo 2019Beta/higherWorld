@@ -16,6 +16,7 @@ import net.minecraft.fluid.FluidState;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.world.chunk.ChunkSection;
+import net.minecraft.world.Heightmap;
 import net.minecraft.world.rule.GameRules;
 import org.devt.higherworld.Higherworld;
 import org.devt.higherworld.storage.CubeIoScheduler;
@@ -39,6 +40,7 @@ final class CubicWorldState implements AutoCloseable {
     private final ConcurrentMap<ColumnPos, CubeColumn<LoadedCube>> columns = new ConcurrentHashMap<>();
     private final ConcurrentMap<CubePos, LoadedCube> cubes = new ConcurrentHashMap<>();
     private final ConcurrentMap<BlockColumnPos, Integer> highestBlocks = new ConcurrentHashMap<>();
+    private final SparseCubeLightEngine lightEngine = new SparseCubeLightEngine(new LightAccess());
 
     CubicWorldState(
             ServerWorld world, CubeStorage storage, boolean generateStructures,
@@ -63,13 +65,17 @@ final class CubicWorldState implements AutoCloseable {
         return cube(pos).getFluidState(pos);
     }
 
-    BlockState setBlockState(BlockPos pos, BlockState state) throws IOException {
+    BlockChange setBlockState(BlockPos pos, BlockState state) throws IOException {
         LoadedCube cube = cube(pos);
         BlockState previous = cube.setBlockState(pos, state);
+        Set<CubePos> changedLight = Set.of();
         if (previous != state) {
             updateHeight(pos, state);
+            lightEngine.queueBlock(pos.getX(), pos.getY(), pos.getZ());
+            queueLoadedSkyColumn(pos.getX(), pos.getZ());
+            changedLight = lightEngine.propagate(250_000).changedCubes();
         }
-        return previous;
+        return new BlockChange(previous, changedLight);
     }
 
     BlockEntity getBlockEntity(BlockPos pos) throws IOException {
@@ -116,6 +122,14 @@ final class CubicWorldState implements AutoCloseable {
 
     Integer highestBlockY(int blockX, int blockZ) {
         return highestBlocks.get(new BlockColumnPos(blockX, blockZ));
+    }
+
+    int lightLevel(net.minecraft.world.LightType type, BlockPos pos) {
+        LoadedCube cube = loadedCube(CubePos.fromBlock(pos.getX(), pos.getY(), pos.getZ()));
+        if (cube == null) return 0;
+        return type == net.minecraft.world.LightType.BLOCK
+                ? cube.light().block(local(pos.getX()), local(pos.getY()), local(pos.getZ()))
+                : cube.light().sky(local(pos.getX()), local(pos.getY()), local(pos.getZ()));
     }
 
     byte[] cubePayload(CubePos pos) throws IOException {
@@ -216,8 +230,10 @@ final class CubicWorldState implements AutoCloseable {
 
     void evictExcept(Set<CubePos> retained) throws IOException {
         IOException failure = null;
+        boolean removedAny = false;
         for (Map.Entry<ColumnPos, CubeColumn<LoadedCube>> entry : columns.entrySet()) {
             CubeColumn<LoadedCube> column = entry.getValue();
+            boolean removedFromColumn = false;
             for (LoadedCube cube : List.copyOf(column.loaded())) {
                 if (!isOutsideVanillaHeight(cube.pos()) || retained.contains(cube.pos())) {
                     continue;
@@ -227,6 +243,8 @@ final class CubicWorldState implements AutoCloseable {
                     column.remove(cube.pos().y());
                     cubes.remove(cube.pos(), cube);
                     removeIndexedHeights(cube);
+                    removedAny = true;
+                    removedFromColumn = true;
                 } catch (IOException exception) {
                     if (failure == null) {
                         failure = exception;
@@ -235,16 +253,24 @@ final class CubicWorldState implements AutoCloseable {
                     }
                 }
             }
+            if (removedFromColumn && !column.isEmpty()) {
+                column.forEach(remaining -> lightEngine.queueCube(remaining.pos(), true));
+            }
             if (column.isEmpty()) {
                 columns.remove(entry.getKey(), column);
             }
         }
+        if (removedAny) lightEngine.propagate(1_000_000);
         if (failure != null) {
             throw failure;
         }
     }
 
     void tick() {
+        SparseCubeLightEngine.Result lightWork = lightEngine.propagate(50_000);
+        if (!lightWork.changedCubes().isEmpty()) {
+            CubeWatchManager.broadcastCubeUpdates(world, lightWork.changedCubes());
+        }
         int randomTickSpeed = world.getGameRules().getValue(GameRules.RANDOM_TICK_SPEED);
         for (CubeColumn<LoadedCube> column : columns.values()) {
             column.forEach(cube -> {
@@ -319,10 +345,16 @@ final class CubicWorldState implements AutoCloseable {
         CubePos pos = cube.pos();
         CubeHolder holder = taskScheduler.holder(pos);
         holder.advance(CubeStatus.IO_READY);
+        boolean hasSavedLight = false;
         if (payload != null) {
             cube.setGenerationVersion(CubeRecordCodec.generationVersion(payload));
-            for (BlockEntity blockEntity : CubeRecordCodec.decode(payload, cube.section(), world)) {
+            CubeRecordCodec.DecodedCube decoded = CubeRecordCodec.decode(payload, cube.section(), world);
+            for (BlockEntity blockEntity : decoded.blockEntities()) {
                 cube.putLoadedBlockEntity(blockEntity);
+            }
+            if (decoded.hasLight()) {
+                cube.light().load(decoded.light());
+                hasSavedLight = true;
             }
             // A stored custom cube is authoritative: it may contain player edits and
             // its terrain must never be passed through the legacy upgrade pipeline.
@@ -358,6 +390,9 @@ final class CubicWorldState implements AutoCloseable {
             }
         }
         indexHeights(cube);
+        lightEngine.queueCube(pos, !hasSavedLight);
+        lightEngine.propagate(1_000_000);
+        holder.advance(CubeStatus.LIGHT);
         holder.complete(cube);
     }
 
@@ -511,5 +546,97 @@ final class CubicWorldState implements AutoCloseable {
     }
 
     private record BlockColumnPos(int x, int z) {
+    }
+
+    /** Re-evaluates only loaded cells in one sparse vertical block column. */
+    private void queueLoadedSkyColumn(int blockX, int blockZ) {
+        CubeColumn<LoadedCube> column = columns.get(new ColumnPos(
+                Math.floorDiv(blockX, CubePos.SIZE), Math.floorDiv(blockZ, CubePos.SIZE)));
+        if (column == null) return;
+        for (LoadedCube cube : column.loaded()) {
+            int minY = cube.pos().minBlockY();
+            for (int localY = 0; localY < CubePos.SIZE; localY++) {
+                lightEngine.queueBlock(blockX, minY + localY, blockZ);
+            }
+        }
+    }
+
+    record BlockChange(BlockState previous, Set<CubePos> changedLight) {
+    }
+
+    private final class LightAccess implements SparseCubeLightEngine.Access {
+        @Override
+        public boolean managed(int x, int y, int z) {
+            return loadedCube(CubePos.fromBlock(x, y, z)) != null;
+        }
+
+        @Override
+        public int emitted(int x, int y, int z) {
+            return state(x, y, z).getLuminance();
+        }
+
+        @Override
+        public int opacity(int x, int y, int z) {
+            return Math.max(1, state(x, y, z).getOpacity());
+        }
+
+        @Override
+        public boolean skySource(int x, int y, int z) {
+            if (!world.getDimension().hasSkyLight() || opacity(x, y, z) >= 15) return false;
+            Integer cubicHighest = highestBlocks.get(new BlockColumnPos(x, z));
+            int vanillaHighest = world.getTopY(Heightmap.Type.MOTION_BLOCKING, x, z) - 1;
+            int highest = cubicHighest == null ? vanillaHighest : Math.max(vanillaHighest, cubicHighest);
+            return y > highest;
+        }
+
+        @Override
+        public int block(int x, int y, int z) {
+            LoadedCube cube = loadedCube(CubePos.fromBlock(x, y, z));
+            if (cube != null) return cube.light().workingBlock(local(x), local(y), local(z));
+            if (y >= world.getBottomY() && y <= world.getTopYInclusive()) {
+                return world.getLightingProvider().get(net.minecraft.world.LightType.BLOCK)
+                        .getLightLevel(new BlockPos(x, y, z));
+            }
+            return 0;
+        }
+
+        @Override
+        public int sky(int x, int y, int z) {
+            LoadedCube cube = loadedCube(CubePos.fromBlock(x, y, z));
+            if (cube != null) return cube.light().workingSky(local(x), local(y), local(z));
+            if (y >= world.getBottomY() && y <= world.getTopYInclusive()) {
+                return world.getLightingProvider().get(net.minecraft.world.LightType.SKY)
+                        .getLightLevel(new BlockPos(x, y, z));
+            }
+            return 0;
+        }
+
+        @Override
+        public boolean setBlock(int x, int y, int z, int value) {
+            LoadedCube cube = loadedCube(CubePos.fromBlock(x, y, z));
+            return cube != null && cube.light().setWorkingBlock(local(x), local(y), local(z), value);
+        }
+
+        @Override
+        public boolean setSky(int x, int y, int z, int value) {
+            LoadedCube cube = loadedCube(CubePos.fromBlock(x, y, z));
+            return cube != null && cube.light().setWorkingSky(local(x), local(y), local(z), value);
+        }
+
+        @Override
+        public void publish(CubePos pos) {
+            LoadedCube cube = loadedCube(pos);
+            if (cube != null) cube.publishLight();
+        }
+
+        private BlockState state(int x, int y, int z) {
+            LoadedCube cube = loadedCube(CubePos.fromBlock(x, y, z));
+            return cube == null ? net.minecraft.block.Blocks.VOID_AIR.getDefaultState()
+                    : cube.section().getBlockState(local(x), local(y), local(z));
+        }
+    }
+
+    private static int local(int coordinate) {
+        return Math.floorMod(coordinate, CubePos.SIZE);
     }
 }

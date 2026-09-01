@@ -130,6 +130,21 @@ public final class CubeWatchManager {
         }
     }
 
+    /** Sends authoritative light snapshots for every cube touched by propagation. */
+    public static void broadcastCubeUpdates(ServerWorld world, Set<CubePos> positions) {
+        for (CubePos pos : positions) {
+            byte[] data = CubicWorldManager.cubePayload(world, pos);
+            if (data.length == 0 || !CubeDataPayload.canEncode(data)) continue;
+            CubeDataPayload payload = new CubeDataPayload(
+                    pos, CubicWorldManager.cubeRevision(world, pos), data);
+            for (ServerPlayerEntity player : world.getPlayers()) {
+                if (watches(player, pos) && ServerPlayNetworking.canSend(player, CubeDataPayload.ID)) {
+                    ServerPlayNetworking.send(player, payload);
+                }
+            }
+        }
+    }
+
     private static boolean update(
             ServerPlayerEntity player, WatchState state, CubeWorkBudget workBudget) {
         ServerWorld world = player.getEntityWorld();

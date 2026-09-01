@@ -1,11 +1,12 @@
 package org.devt.higherworld.world;
 
-/** Monotonic stages of a cube task graph. Lighting remains a separate future stage. */
+/** Monotonic stages of a cube task graph. */
 public enum CubeStatus {
     EMPTY(CubeDependencyRadius.NONE),
     IO_READY(CubeDependencyRadius.NONE),
     TERRAIN(new CubeDependencyRadius(1, 0, 1)),
     FEATURES(new CubeDependencyRadius(1, 1, 1)),
+    LIGHT(new CubeDependencyRadius(1, 1, 1)),
     FULL(CubeDependencyRadius.NONE);
 
     private final CubeDependencyRadius dependencyRadius;

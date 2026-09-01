@@ -55,18 +55,7 @@ abstract class ChunkRendererRegionMixin {
         if (!outsideVanillaHeight(pos)) {
             return world.getLightLevel(type, pos);
         }
-        if (type == LightType.SKY) {
-            if (!world.getDimension().hasSkyLight()) {
-                return 0;
-            }
-            Integer highest = ClientCubeCache.highestBlockY((net.minecraft.client.world.ClientWorld) world,
-                    pos.getX(), pos.getZ());
-            int vanillaHighest = world.getTopY(net.minecraft.world.Heightmap.Type.MOTION_BLOCKING,
-                    pos.getX(), pos.getZ()) - 1;
-            int effectiveHighest = highest == null ? vanillaHighest : Math.max(vanillaHighest, highest);
-            return pos.getY() > effectiveHighest ? 15 : 0;
-        }
-        return world.getBlockState(pos).getLuminance();
+        return ClientCubeCache.getLightLevel((ClientWorld) world, type, pos);
     }
 
     public int getBaseLightLevel(BlockPos pos, int ambientDarkness) {

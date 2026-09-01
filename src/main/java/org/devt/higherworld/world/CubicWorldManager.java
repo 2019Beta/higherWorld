@@ -20,6 +20,7 @@ import net.minecraft.registry.RegistryKey;
 import net.minecraft.registry.RegistryKeys;
 import net.minecraft.util.Identifier;
 import net.minecraft.world.dimension.DimensionType;
+import net.minecraft.world.LightType;
 import net.minecraft.world.gen.chunk.NoiseChunkGenerator;
 import org.devt.higherworld.Higherworld;
 import org.devt.higherworld.storage.CubePos;
@@ -135,7 +136,8 @@ public final class CubicWorldManager {
             return false;
         }
         try {
-            BlockState previous = state.setBlockState(pos, blockState);
+            CubicWorldState.BlockChange result = state.setBlockState(pos, blockState);
+            BlockState previous = result.previous();
             boolean changed = previous != blockState;
             if (changed) {
                 if (previous.hasBlockEntity() && !previous.keepBlockEntityWhenReplacedWith(blockState)) {
@@ -160,6 +162,9 @@ public final class CubicWorldManager {
                 }
                 if ((flags & net.minecraft.block.Block.NOTIFY_NEIGHBORS) != 0 && maxUpdateDepth > 0) {
                     world.updateNeighborsAlways(pos, blockState.getBlock(), null);
+                }
+                if (!result.changedLight().isEmpty()) {
+                    CubeWatchManager.broadcastCubeUpdates(world, result.changedLight());
                 }
             }
             return changed;
@@ -256,6 +261,11 @@ public final class CubicWorldManager {
     public static Integer highestBlockY(ServerWorld world, int blockX, int blockZ) {
         CubicWorldState state = WORLDS.get(world);
         return state == null ? null : state.highestBlockY(blockX, blockZ);
+    }
+
+    public static int lightLevel(ServerWorld world, LightType type, BlockPos pos) {
+        CubicWorldState state = WORLDS.get(world);
+        return state == null ? 0 : state.lightLevel(type, pos);
     }
 
     public static BlockEntity getBlockEntity(ServerWorld world, BlockPos pos) {

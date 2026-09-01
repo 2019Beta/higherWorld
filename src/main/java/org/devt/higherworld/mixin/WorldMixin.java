@@ -129,17 +129,10 @@ abstract class WorldMixin {
         if (!isOutsideVanillaHeight(world, pos)) {
             return world.getLightingProvider().get(type).getLightLevel(pos);
         }
-        if (type == LightType.BLOCK) {
-            return world.getBlockState(pos).getLuminance();
+        if (world instanceof ServerWorld serverWorld) {
+            return CubicWorldManager.lightLevel(serverWorld, type, pos);
         }
-        if (!world.getDimension().hasSkyLight()) {
-            return 0;
-        }
-        Integer highest = world instanceof ServerWorld serverWorld
-                ? CubicWorldManager.highestBlockY(serverWorld, pos.getX(), pos.getZ()) : null;
-        int vanillaHighest = world.getTopY(Heightmap.Type.MOTION_BLOCKING, pos.getX(), pos.getZ()) - 1;
-        int effectiveHighest = highest == null ? vanillaHighest : Math.max(vanillaHighest, highest);
-        return pos.getY() > effectiveHighest ? 15 : 0;
+        return 0;
     }
 
     /** Overrides the inherited BlockRenderView default for cubic positions. */

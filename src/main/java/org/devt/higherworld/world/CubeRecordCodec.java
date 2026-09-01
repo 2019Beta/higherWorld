@@ -20,6 +20,7 @@ import net.minecraft.world.chunk.ChunkSection;
 public final class CubeRecordCodec {
     private static final int MAGIC_V2 = 0x48574332; // HWC2
     private static final int MAGIC_V3 = 0x48574333; // HWC3, includes generator version
+    private static final int MAGIC_V4 = 0x48574334; // HWC4, includes sparse cube light
     private static final int MAX_SECTION_BYTES = 2 * 1024 * 1024;
     private static final int MAX_BLOCK_ENTITIES = 4096;
 
@@ -30,7 +31,7 @@ public final class CubeRecordCodec {
         byte[] sectionPayload = ChunkSectionCodec.encode(cube.section());
         ByteArrayOutputStream bytes = new ByteArrayOutputStream(sectionPayload.length + 128);
         try (DataOutputStream output = new DataOutputStream(bytes)) {
-            output.writeInt(MAGIC_V3);
+            output.writeInt(MAGIC_V4);
             output.writeInt(cube.generationVersion());
             output.writeInt(sectionPayload.length);
             output.write(sectionPayload);
@@ -38,20 +39,21 @@ public final class CubeRecordCodec {
             for (BlockEntity blockEntity : cube.blockEntities()) {
                 NbtIo.writeCompound(blockEntity.createNbtWithIdentifyingData(world.getRegistryManager()), output);
             }
+            CubeLightData.write(output, cube.light().snapshot());
         }
         return bytes.toByteArray();
     }
 
-    public static List<BlockEntity> decode(byte[] payload, ChunkSection section, World world) throws IOException {
+    public static DecodedCube decode(byte[] payload, ChunkSection section, World world) throws IOException {
         int magic = payload.length < Integer.BYTES ? 0 : readMagic(payload);
-        if (magic != MAGIC_V2 && magic != MAGIC_V3) {
+        if (magic != MAGIC_V2 && magic != MAGIC_V3 && magic != MAGIC_V4) {
             ChunkSectionCodec.decodeInto(payload, section);
-            return List.of();
+            return new DecodedCube(List.of(), CubeLightData.Snapshot.dark(), false);
         }
 
         try (DataInputStream input = new DataInputStream(new ByteArrayInputStream(payload))) {
             input.readInt();
-            if (magic == MAGIC_V3) {
+            if (magic == MAGIC_V3 || magic == MAGIC_V4) {
                 input.readInt();
             }
             int sectionLength = input.readInt();
@@ -76,15 +78,21 @@ public final class CubeRecordCodec {
                     blockEntities.add(blockEntity);
                 }
             }
+            CubeLightData.Snapshot light = CubeLightData.Snapshot.dark();
+            boolean hasLight = magic == MAGIC_V4;
+            if (hasLight) {
+                light = CubeLightData.read(input);
+            }
             if (input.available() != 0) {
                 throw new IOException("Trailing bytes in cube record: " + input.available());
             }
-            return blockEntities;
+            return new DecodedCube(List.copyOf(blockEntities), light, hasLight);
         }
     }
 
     static int generationVersion(byte[] payload) {
-        if (payload.length < Integer.BYTES * 2 || readMagic(payload) != MAGIC_V3) {
+        int magic = payload.length < Integer.BYTES ? 0 : readMagic(payload);
+        if (payload.length < Integer.BYTES * 2 || (magic != MAGIC_V3 && magic != MAGIC_V4)) {
             return 0;
         }
         return (payload[4] & 0xFF) << 24 | (payload[5] & 0xFF) << 16
@@ -95,4 +103,7 @@ public final class CubeRecordCodec {
         return (payload[0] & 0xFF) << 24 | (payload[1] & 0xFF) << 16
                 | (payload[2] & 0xFF) << 8 | payload[3] & 0xFF;
     }
+
+    public record DecodedCube(
+            List<BlockEntity> blockEntities, CubeLightData.Snapshot light, boolean hasLight) {}
 }
