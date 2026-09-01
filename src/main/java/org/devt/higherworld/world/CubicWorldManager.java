@@ -197,6 +197,17 @@ public final class CubicWorldManager {
         return state == null ? 0L : state.cubeRevision(pos);
     }
 
+    /**
+     * Returns whether this thread is committing generated cube state for the
+     * given world.  ServerWorld.updateListeners is invoked by some structure
+     * block entities during placement; allowing that callback to request a FULL
+     * payload would recursively restart the same feature commit.
+     */
+    public static boolean suppressingGenerationUpdates(ServerWorld world) {
+        CubicWorldState state = WORLDS.get(world);
+        return state != null && state.suppressingGenerationUpdates();
+    }
+
     /** Queues disk IO for a watched cube without touching live world state. */
     public static void prefetchCubePayload(ServerWorld world, CubePos pos, int priority) {
         CubicWorldState state = WORLDS.get(world);

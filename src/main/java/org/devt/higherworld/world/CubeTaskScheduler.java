@@ -23,6 +23,12 @@ final class CubeTaskScheduler implements AutoCloseable {
     private final CubeIoScheduler io;
     private final CubeTicketManager tickets = new CubeTicketManager();
     private final ConcurrentMap<CubePos, CubeHolder> holders = new ConcurrentHashMap<>();
+    /**
+     * The complete closure currently demanded by live tickets.  Keeping this
+     * separately from {@link #holders} is important: a dependency cube can be
+     * required by a ticket without being part of a player's sent/pending view.
+     */
+    private volatile Set<CubePos> requiredPositions = Set.of();
     private final ThreadPoolExecutor generationExecutor;
     private final AtomicLong sequence = new AtomicLong();
 
@@ -75,6 +81,22 @@ final class CubeTaskScheduler implements AutoCloseable {
 
     boolean isTicketed(CubePos pos) {
         return tickets.isActive(pos);
+    }
+
+    /** Returns whether a cube is part of an active ticket's dependency closure. */
+    boolean isRequired(CubePos pos) {
+        return requiredPositions.contains(pos);
+    }
+
+    /**
+     * Releases a cache entry that is no longer ticket-required.  Cancelling the
+     * holder here prevents a stale IO or generation completion from
+     * resurrecting a cube after its live state has been evicted.
+     */
+    void release(CubePos pos) {
+        if (isRequired(pos)) return;
+        CubeHolder holder = holders.remove(pos);
+        if (holder != null) holder.cancel();
     }
 
     int priority(CubePos pos) {
@@ -210,6 +232,11 @@ final class CubeTaskScheduler implements AutoCloseable {
             collectRequired(pos, tickets.targetStatus(pos), required, visited);
         }
 
+        // Publish the closure before lowering/cancelling holders.  The world
+        // tick and eviction paths read this immutable snapshot concurrently
+        // with asynchronous IO completion.
+        requiredPositions = Set.copyOf(required.keySet());
+
         // Tickets describe demand only. Actual IO starts from the watcher's
         // bounded read-ahead request, which then expands just that cube's DAG.
         required.forEach((pos, target) ->
@@ -250,6 +277,7 @@ final class CubeTaskScheduler implements AutoCloseable {
         generationExecutor.shutdownNow();
         holders.values().forEach(CubeHolder::cancel);
         holders.clear();
+        requiredPositions = Set.of();
     }
 
     private record StageRequest(CubePos pos, CubeStatus status) {}

@@ -4,6 +4,7 @@ import net.minecraft.block.BlockState;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.util.math.BlockPos;
 import org.devt.higherworld.world.CubeWatchManager;
+import org.devt.higherworld.world.CubicWorldManager;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
@@ -17,6 +18,14 @@ abstract class ServerWorldMixin {
             BlockPos pos, BlockState oldState, BlockState newState, int flags, CallbackInfo callbackInfo) {
         ServerWorld world = (ServerWorld) (Object) this;
         if (pos.getY() < world.getBottomY() || pos.getY() > world.getTopYInclusive()) {
+            if (CubicWorldManager.suppressingGenerationUpdates(world)) {
+                // Structure block entities (notably mob spawners) may notify
+                // their world while a sparse cube is being generated. The
+                // completed cube payload represents this notification, so
+                // forwarding it would synchronously re-enter FULL generation.
+                callbackInfo.cancel();
+                return;
+            }
             if (oldState == newState) {
                 // Same-state notifications can carry block-entity NBT changes.
                 CubeWatchManager.broadcastCubeUpdate(world, pos);

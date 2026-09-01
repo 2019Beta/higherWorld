@@ -5,6 +5,7 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
@@ -19,6 +20,7 @@ import net.minecraft.block.entity.BlockEntity;
 import org.devt.higherworld.storage.CubePos;
 import org.devt.higherworld.world.CubeLightData;
 import org.devt.higherworld.world.CubeRecordCodec;
+import org.devt.higherworld.world.CubeRevisionGate;
 import org.devt.higherworld.world.SparseCubeLightEngine;
 
 /** Sparse client-side mirror of the cubes sent by the server. */
@@ -37,8 +39,9 @@ public final class ClientCubeCache {
 
     public static void put(ClientWorld world, CubePos pos, long revision, byte[] payload) {
         ensureOwner(world);
+        if (!pos.isBlockRangeRepresentable()) return;
         CubeEntry current = CUBES.get(pos);
-        if (current != null && current.revision() > revision) {
+        if (current != null && !CubeRevisionGate.snapshot(current.revision(), revision).accepted()) {
             return;
         }
         ChunkSection section = new ChunkSection(world.getPalettesFactory());
@@ -48,8 +51,11 @@ public final class ClientCubeCache {
         } catch (java.io.IOException exception) {
             throw new IllegalArgumentException("Invalid cube payload for " + pos, exception);
         }
-        CUBES.compute(pos, (ignored, existing) -> existing != null && existing.revision() > revision
-                ? existing : new CubeEntry(section, new CubeLightData(decoded.light()), revision));
+        CubeEntry replacement = new CubeEntry(section, new CubeLightData(decoded.light()), revision);
+        CubeEntry accepted = CUBES.compute(pos, (ignored, existing) ->
+                existing != null && !CubeRevisionGate.snapshot(existing.revision(), revision).accepted()
+                        ? existing : replacement);
+        if (accepted != replacement) return;
         removeBlockEntities(pos);
         for (BlockEntity blockEntity : decoded.blockEntities()) {
             BLOCK_ENTITIES.put(blockEntity.getPos().toImmutable(), blockEntity);
@@ -60,8 +66,22 @@ public final class ClientCubeCache {
     }
 
     public static void unload(ClientWorld world, CubePos pos) {
+        unload(world, pos, 0L);
+    }
+
+    /** Removes a cube unless a newer authoritative snapshot is already present. */
+    public static void unload(ClientWorld world, CubePos pos, long revision) {
         ensureOwner(world);
-        CUBES.remove(pos);
+        if (!pos.isBlockRangeRepresentable()) return;
+        AtomicBoolean removed = new AtomicBoolean();
+        CUBES.compute(pos, (ignored, current) -> {
+            if (current == null || !CubeRevisionGate.removal(current.revision(), revision).accepted()) {
+                return current;
+            }
+            removed.set(true);
+            return null;
+        });
+        if (!removed.get()) return;
         removeBlockEntities(pos);
         queueLoadedNeighbours(pos);
         LIGHT_ENGINE.propagate(250_000);
@@ -83,13 +103,17 @@ public final class ClientCubeCache {
     public static boolean setBlockState(ClientWorld world, BlockPos pos, BlockState state) {
         ensureOwner(world);
         CubePos cubePos = CubePos.fromBlock(pos.getX(), pos.getY(), pos.getZ());
-        CubeEntry entry = CUBES.computeIfAbsent(cubePos,
-                ignored -> new CubeEntry(new ChunkSection(world.getPalettesFactory()), new CubeLightData(), 0L));
+        // Prediction and block updates are valid only for an already streamed
+        // cube.  Creating a client-only placeholder here resurrects a cube after
+        // an unload packet (or lets a delayed packet leak blocks outside the view).
+        CubeEntry entry = CUBES.get(cubePos);
+        if (entry == null) return false;
         ChunkSection section = entry.section();
         BlockState previous = section.setBlockState(local(pos.getX()), local(pos.getY()), local(pos.getZ()), state);
         if (previous != state) {
-            CUBES.computeIfPresent(cubePos,
-                    (ignored, current) -> new CubeEntry(current.section(), current.light(), current.revision() + 1L));
+            // Keep the server revision authoritative.  Local prediction changes
+            // the section immediately, but must not make a later authoritative
+            // packet look stale (or make a matching block update get rejected).
             LIGHT_ENGINE.queueBlock(pos.getX(), pos.getY(), pos.getZ());
             queueLoadedSkyColumn(pos.getX(), pos.getZ());
             LIGHT_ENGINE.propagate(250_000);
@@ -97,6 +121,25 @@ public final class ClientCubeCache {
             return true;
         }
         return false;
+    }
+
+    /**
+     * Checks a server block update before it enters ClientWorld's normal update
+     * path.  Revision zero is retained as a compatibility value for packets
+     * produced by older servers; revisioned packets cannot overwrite a newer
+     * full-cube snapshot after a rapid unload/reload.
+     */
+    public static boolean acceptsBlockUpdate(ClientWorld world, BlockPos pos, long revision) {
+        ensureOwner(world);
+        CubePos cubePos = CubePos.fromBlock(pos.getX(), pos.getY(), pos.getZ());
+        AtomicBoolean accepted = new AtomicBoolean();
+        CUBES.computeIfPresent(cubePos, (ignored, entry) -> {
+            CubeRevisionGate.Decision decision = CubeRevisionGate.delta(entry.revision(), revision);
+            accepted.set(decision.accepted());
+            if (!decision.accepted() || decision.revision() == entry.revision()) return entry;
+            return new CubeEntry(entry.section(), entry.light(), decision.revision());
+        });
+        return accepted.get();
     }
 
     public static void clear() {
@@ -108,6 +151,16 @@ public final class ClientCubeCache {
 
     public static int loadedCubeCount() {
         return CUBES.size();
+    }
+
+    /**
+     * Drains a bounded slice of cross-cube propagation every client tick.  A
+     * large view can enqueue more nodes than the packet handler should process
+     * synchronously; without this drain, the remaining queue would only be
+     * revisited when another cube packet happened to arrive.
+     */
+    public static void tickLighting() {
+        if (owner != null) LIGHT_ENGINE.propagate(50_000);
     }
 
     public static ChunkSection getSection(ClientWorld world, int sectionX, int sectionY, int sectionZ) {
@@ -134,9 +187,9 @@ public final class ClientCubeCache {
         int minY = pos.minBlockY();
         int minZ = pos.minBlockZ();
         return BLOCK_ENTITIES.entrySet().stream()
-                .filter(entry -> entry.getKey().getX() >= minX && entry.getKey().getX() < minX + 16
-                        && entry.getKey().getY() >= minY && entry.getKey().getY() < minY + 16
-                        && entry.getKey().getZ() >= minZ && entry.getKey().getZ() < minZ + 16)
+                .filter(entry -> (long) entry.getKey().getX() >= minX && entry.getKey().getX() < (long) minX + 16
+                        && (long) entry.getKey().getY() >= minY && entry.getKey().getY() < (long) minY + 16
+                        && (long) entry.getKey().getZ() >= minZ && entry.getKey().getZ() < (long) minZ + 16)
                 .map(Map.Entry::getValue)
                 .toList();
     }
@@ -191,12 +244,24 @@ public final class ClientCubeCache {
         MinecraftClient client = MinecraftClient.getInstance();
         if (client.worldRenderer != null) {
             client.worldRenderer.scheduleChunkRender(pos.x(), pos.y(), pos.z());
-            client.worldRenderer.scheduleChunkRender(pos.x() - 1, pos.y(), pos.z());
-            client.worldRenderer.scheduleChunkRender(pos.x() + 1, pos.y(), pos.z());
-            client.worldRenderer.scheduleChunkRender(pos.x(), pos.y() - 1, pos.z());
-            client.worldRenderer.scheduleChunkRender(pos.x(), pos.y() + 1, pos.z());
-            client.worldRenderer.scheduleChunkRender(pos.x(), pos.y(), pos.z() - 1);
-            client.worldRenderer.scheduleChunkRender(pos.x(), pos.y(), pos.z() + 1);
+            if (pos.x() != Integer.MIN_VALUE) {
+                client.worldRenderer.scheduleChunkRender(pos.x() - 1, pos.y(), pos.z());
+            }
+            if (pos.x() != Integer.MAX_VALUE) {
+                client.worldRenderer.scheduleChunkRender(pos.x() + 1, pos.y(), pos.z());
+            }
+            if (pos.y() != Integer.MIN_VALUE) {
+                client.worldRenderer.scheduleChunkRender(pos.x(), pos.y() - 1, pos.z());
+            }
+            if (pos.y() != Integer.MAX_VALUE) {
+                client.worldRenderer.scheduleChunkRender(pos.x(), pos.y() + 1, pos.z());
+            }
+            if (pos.z() != Integer.MIN_VALUE) {
+                client.worldRenderer.scheduleChunkRender(pos.x(), pos.y(), pos.z() - 1);
+            }
+            if (pos.z() != Integer.MAX_VALUE) {
+                client.worldRenderer.scheduleChunkRender(pos.x(), pos.y(), pos.z() + 1);
+            }
             client.worldRenderer.scheduleTerrainUpdate();
         }
     }
@@ -205,16 +270,22 @@ public final class ClientCubeCache {
         int minX = pos.minBlockX();
         int minY = pos.minBlockY();
         int minZ = pos.minBlockZ();
-        BLOCK_ENTITIES.keySet().removeIf(blockPos -> blockPos.getX() >= minX && blockPos.getX() < minX + 16
-                && blockPos.getY() >= minY && blockPos.getY() < minY + 16
-                && blockPos.getZ() >= minZ && blockPos.getZ() < minZ + 16);
+        BLOCK_ENTITIES.keySet().removeIf(blockPos -> (long) blockPos.getX() >= minX
+                && blockPos.getX() < (long) minX + 16
+                && (long) blockPos.getY() >= minY && blockPos.getY() < (long) minY + 16
+                && (long) blockPos.getZ() >= minZ && blockPos.getZ() < (long) minZ + 16);
     }
 
     private static void queueLoadedNeighbours(CubePos pos) {
         int[][] directions = {{-1, 0, 0}, {1, 0, 0}, {0, -1, 0}, {0, 1, 0}, {0, 0, -1}, {0, 0, 1}};
         for (int[] direction : directions) {
-            CubePos neighbour = new CubePos(
-                    pos.x() + direction[0], pos.y() + direction[1], pos.z() + direction[2]);
+            long x = (long) pos.x() + direction[0];
+            long y = (long) pos.y() + direction[1];
+            long z = (long) pos.z() + direction[2];
+            if (x < Integer.MIN_VALUE || x > Integer.MAX_VALUE
+                    || y < Integer.MIN_VALUE || y > Integer.MAX_VALUE
+                    || z < Integer.MIN_VALUE || z > Integer.MAX_VALUE) continue;
+            CubePos neighbour = new CubePos((int) x, (int) y, (int) z);
             if (CUBES.containsKey(neighbour)) LIGHT_ENGINE.queueCube(neighbour, false);
         }
     }

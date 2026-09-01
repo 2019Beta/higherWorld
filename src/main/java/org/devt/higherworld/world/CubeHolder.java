@@ -47,7 +47,10 @@ final class CubeHolder {
     void advance(CubeStatus reached) {
         Lifecycle current = lifecycle;
         synchronized (current) {
-            if (current.cancelled || reached.ordinal() <= current.status.ordinal()) return;
+            // A failed epoch is terminal.  In particular, do not let a late
+            // dependency completion turn an exceptional lifecycle back into a
+            // successful one; callers must cancel and request a fresh epoch.
+            if (current.cancelled || current.failed || reached.ordinal() <= current.status.ordinal()) return;
             for (CubeStatus stage : CubeStatus.values()) {
                 if (stage == CubeStatus.EMPTY) continue;
                 if (stage == CubeStatus.FULL || stage.ordinal() > reached.ordinal()) break;
@@ -83,16 +86,17 @@ final class CubeHolder {
 
     synchronized void complete(LoadedCube cube) {
         Lifecycle current = lifecycle;
+        if (current.cancelled || current.failed) return;
         advance(CubeStatus.FULL);
         current.fullFuture.complete(Optional.ofNullable(cube));
     }
 
     synchronized void materialize(LoadedCube cube) {
         Lifecycle current = lifecycle;
+        if (current.cancelled || current.failed) return;
         Optional<LoadedCube> completed = current.fullFuture.isCompletedExceptionally()
                 || current.fullFuture.isCancelled() ? null : current.fullFuture.getNow(null);
-        if (current.fullFuture.isCompletedExceptionally() || current.fullFuture.isCancelled()
-                || (completed != null && completed.isEmpty())) {
+        if (completed != null && completed.isEmpty()) {
             current = lifecycle = new Lifecycle(current.epoch + 1L);
             current.target = CubeStatus.FULL;
         }

@@ -169,10 +169,25 @@ final class CubeRegionFile implements Closeable {
     }
 
     private static byte[] inflate(byte[] compressed, int expectedLength) throws IOException {
+        if (expectedLength < 0 || expectedLength > MAX_UNCOMPRESSED_BYTES) {
+            throw new IOException("Invalid expected cube length " + expectedLength);
+        }
         ByteArrayOutputStream bytes = new ByteArrayOutputStream(expectedLength);
         try (InflaterInputStream inflater = new InflaterInputStream(new ByteArrayInputStream(compressed));
              DataInputStream input = new DataInputStream(inflater)) {
-            input.transferTo(bytes);
+            // Do not use transferTo here.  The length in the record header is
+            // untrusted, and a corrupt compressed stream can expand far past it
+            // before the old post-read length check gets a chance to run.
+            byte[] buffer = new byte[Math.min(8192, Math.max(1, expectedLength))];
+            int total = 0;
+            int read;
+            while ((read = input.read(buffer)) != -1) {
+                if (read > expectedLength - total) {
+                    throw new IOException("Cube payload exceeds declared length " + expectedLength);
+                }
+                bytes.write(buffer, 0, read);
+                total += read;
+            }
         }
         byte[] payload = bytes.toByteArray();
         if (payload.length != expectedLength) {

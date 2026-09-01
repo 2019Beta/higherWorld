@@ -107,9 +107,14 @@ public final class CubeWatchManager {
     }
 
     public static void broadcastBlockUpdate(ServerWorld world, BlockPos pos, BlockState state) {
-        CubeBlockUpdatePayload payload = new CubeBlockUpdatePayload(pos, state);
+        if (CubicWorldManager.suppressingGenerationUpdates(world)) {
+            return;
+        }
+        CubePos cubePos = CubePos.fromBlock(pos.getX(), pos.getY(), pos.getZ());
+        CubeBlockUpdatePayload payload = new CubeBlockUpdatePayload(
+                pos, state, CubicWorldManager.cubeRevision(world, cubePos));
         for (ServerPlayerEntity player : PlayerLookup.around(world, pos.toCenterPos(), 256.0)) {
-            if (watches(player, CubePos.fromBlock(pos.getX(), pos.getY(), pos.getZ()))
+            if (watches(player, cubePos)
                     && ServerPlayNetworking.canSend(player, CubeBlockUpdatePayload.ID)) {
                 ServerPlayNetworking.send(player, payload);
             }
@@ -118,29 +123,44 @@ public final class CubeWatchManager {
 
     public static void broadcastCubeUpdate(ServerWorld world, BlockPos blockPos) {
         CubePos pos = CubePos.fromBlock(blockPos.getX(), blockPos.getY(), blockPos.getZ());
-        byte[] data = CubicWorldManager.cubePayload(world, pos);
-        if (data.length == 0 || !CubeDataPayload.canEncode(data)) {
+        if (CubicWorldManager.suppressingGenerationUpdates(world)) {
             return;
         }
+        List<ServerPlayerEntity> recipients = new ArrayList<>();
         for (ServerPlayerEntity player : PlayerLookup.around(world, blockPos.toCenterPos(), 256.0)) {
             if (watches(player, pos) && ServerPlayNetworking.canSend(player, CubeDataPayload.ID)) {
-                ServerPlayNetworking.send(player, new CubeDataPayload(
-                        pos, CubicWorldManager.cubeRevision(world, pos), data));
+                recipients.add(player);
             }
+        }
+        // Do not synchronously load/generate/encode a cube unless at least one
+        // connected watcher can actually receive its payload.
+        if (recipients.isEmpty()) return;
+        byte[] data = CubicWorldManager.cubePayload(world, pos);
+        if (data.length == 0 || !CubeDataPayload.canEncode(data)) return;
+        CubeDataPayload payload = new CubeDataPayload(
+                pos, CubicWorldManager.cubeRevision(world, pos), data);
+        for (ServerPlayerEntity player : recipients) {
+            ServerPlayNetworking.send(player, payload);
         }
     }
 
     /** Sends authoritative light snapshots for every cube touched by propagation. */
     public static void broadcastCubeUpdates(ServerWorld world, Set<CubePos> positions) {
+        if (CubicWorldManager.suppressingGenerationUpdates(world)) return;
         for (CubePos pos : positions) {
+            List<ServerPlayerEntity> recipients = new ArrayList<>();
+            for (ServerPlayerEntity player : world.getPlayers()) {
+                if (watches(player, pos) && ServerPlayNetworking.canSend(player, CubeDataPayload.ID)) {
+                    recipients.add(player);
+                }
+            }
+            if (recipients.isEmpty()) continue;
             byte[] data = CubicWorldManager.cubePayload(world, pos);
             if (data.length == 0 || !CubeDataPayload.canEncode(data)) continue;
             CubeDataPayload payload = new CubeDataPayload(
                     pos, CubicWorldManager.cubeRevision(world, pos), data);
-            for (ServerPlayerEntity player : world.getPlayers()) {
-                if (watches(player, pos) && ServerPlayNetworking.canSend(player, CubeDataPayload.ID)) {
-                    ServerPlayNetworking.send(player, payload);
-                }
+            for (ServerPlayerEntity player : recipients) {
+                ServerPlayNetworking.send(player, payload);
             }
         }
     }
@@ -232,7 +252,8 @@ public final class CubeWatchManager {
             CubePos pos = iterator.next();
             if (!withinView(pos, center, horizontalRadius)) {
                 if (ServerPlayNetworking.canSend(player, CubeUnloadPayload.ID)) {
-                    ServerPlayNetworking.send(player, new CubeUnloadPayload(pos));
+                    ServerPlayNetworking.send(player, new CubeUnloadPayload(
+                            pos, CubicWorldManager.cubeRevision(world, pos)));
                 }
                 iterator.remove();
             }
@@ -258,7 +279,8 @@ public final class CubeWatchManager {
     private static void unloadAll(ServerPlayerEntity player, WatchState state) {
         if (ServerPlayNetworking.canSend(player, CubeUnloadPayload.ID)) {
             for (CubePos pos : state.sent) {
-                ServerPlayNetworking.send(player, new CubeUnloadPayload(pos));
+                ServerPlayNetworking.send(player, new CubeUnloadPayload(
+                        pos, CubicWorldManager.cubeRevision(state.world, pos)));
             }
         }
         state.sent.clear();

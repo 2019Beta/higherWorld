@@ -14,6 +14,22 @@ public record CubeDataPayload(CubePos pos, long revision, byte[] data) implement
     public static final PacketCodec<RegistryByteBuf, CubeDataPayload> CODEC = CustomPayload.codecOf(
             CubeDataPayload::write, CubeDataPayload::read);
 
+    public CubeDataPayload {
+        if (pos == null) {
+            throw new NullPointerException("pos");
+        }
+        if (!pos.isBlockRangeRepresentable()) {
+            throw new IllegalArgumentException("Cube position is outside the signed block range: " + pos);
+        }
+        if (data == null) {
+            throw new NullPointerException("data");
+        }
+        if (!canEncode(data)) {
+            throw new IllegalArgumentException("Cube payload is too large: " + data.length);
+        }
+        data = data.clone();
+    }
+
     private void write(RegistryByteBuf buffer) {
         buffer.writeInt(pos.x());
         buffer.writeInt(pos.y());
@@ -31,8 +47,14 @@ public record CubeDataPayload(CubePos pos, long revision, byte[] data) implement
         this(pos, 0L, data);
     }
 
+    /** Returns a snapshot so callers cannot mutate an already queued packet. */
+    @Override
+    public byte[] data() {
+        return data.clone();
+    }
+
     public static boolean canEncode(byte[] data) {
-        return data.length <= MAX_PAYLOAD_BYTES;
+        return data != null && data.length <= MAX_PAYLOAD_BYTES;
     }
 
     @Override

@@ -44,6 +44,14 @@ final class CubicWorldState implements AutoCloseable {
     private final ConcurrentMap<BlockColumnPos, Integer> highestBlocks = new ConcurrentHashMap<>();
     private final SparseCubeLightEngine lightEngine = new SparseCubeLightEngine(new LightAccess());
     private final ThreadLocal<Boolean> committingFeatures = ThreadLocal.withInitial(() -> false);
+    /**
+     * World listener callbacks are not safe while terrain/features are being
+     * committed.  Structure block entities can call ServerWorld.updateListeners
+     * while they are installed, which would otherwise synchronously request the
+     * same cube's FULL payload and re-enter generation.
+     */
+    private final ThreadLocal<Boolean> suppressingGenerationUpdates =
+            ThreadLocal.withInitial(() -> false);
 
     CubicWorldState(
             ServerWorld world, CubeStorage storage, boolean generateStructures,
@@ -148,6 +156,10 @@ final class CubicWorldState implements AutoCloseable {
     long cubeRevision(CubePos pos) {
         LoadedCube loaded = loadedCube(pos);
         return loaded == null ? 0L : loaded.revision();
+    }
+
+    boolean suppressingGenerationUpdates() {
+        return suppressingGenerationUpdates.get();
     }
 
     Integer highestBlockY(int blockX, int blockZ) {
@@ -326,7 +338,12 @@ final class CubicWorldState implements AutoCloseable {
             CubeColumn<LoadedCube> column = entry.getValue();
             boolean removedFromColumn = false;
             for (LoadedCube cube : List.copyOf(column.loaded())) {
-                if (!isOutsideVanillaHeight(cube.pos()) || retained.contains(cube.pos())) {
+                // A ticket's dependency halo is not necessarily present in a
+                // player's sent/pending set.  Evicting it while FEATURES or
+                // LIGHT is waiting makes the DAG restart mid-commit and can
+                // expose an incomplete neighbour to gameplay code.
+                if (!isOutsideVanillaHeight(cube.pos()) || retained.contains(cube.pos())
+                        || taskScheduler.isRequired(cube.pos())) {
                     continue;
                 }
                 try {
@@ -335,6 +352,7 @@ final class CubicWorldState implements AutoCloseable {
                     cubes.remove(cube.pos(), cube);
                     loadContexts.remove(cube.pos());
                     removeIndexedHeights(cube);
+                    taskScheduler.release(cube.pos());
                     removedAny = true;
                     removedFromColumn = true;
                 } catch (IOException exception) {
@@ -366,7 +384,17 @@ final class CubicWorldState implements AutoCloseable {
         int randomTickSpeed = world.getGameRules().getValue(GameRules.RANDOM_TICK_SPEED);
         for (CubeColumn<LoadedCube> column : columns.values()) {
             column.forEach(cube -> {
-                if (!taskScheduler.holder(cube.pos()).status().isAtLeast(CubeStatus.FULL)) return;
+                // Loaded is not the same as ticketed.  Direct block queries can
+                // leave a sparse cube cached for a short time; ticking it would
+                // continue simulation after its owner has gone away.
+                if (!taskScheduler.isRequired(cube.pos())) return;
+                CubeHolder holder = taskScheduler.holder(cube.pos());
+                // A lower-priority ticket may deliberately downgrade an
+                // already-loaded cube to TERRAIN/FEATURES.  Status is
+                // monotonic within an epoch, so target must be checked too;
+                // otherwise the old FULL state would keep ticking forever.
+                if (!holder.target().isAtLeast(CubeStatus.FULL)
+                        || !holder.status().isAtLeast(CubeStatus.FULL)) return;
                 cube.tickBlockEntities(world);
                 cube.tickRandomly(world, randomTickSpeed);
             });
@@ -520,58 +548,70 @@ final class CubicWorldState implements AutoCloseable {
     private boolean commitTerrain(
             CubeHolder holder, LoadContext context, int priority, boolean wait) throws IOException {
         CubePos pos = holder.pos();
-        if (context.payload != null) {
-            context.committing = true;
-            try {
-                context.cube.setGenerationVersion(CubeRecordCodec.generationVersion(context.payload));
-                CubeRecordCodec.DecodedCube decoded = CubeRecordCodec.decode(
-                        context.payload, context.cube.section(), world);
-                for (BlockEntity blockEntity : decoded.blockEntities()) {
-                    context.cube.putLoadedBlockEntity(blockEntity);
-                }
-                if (decoded.hasLight()) {
-                    context.cube.light().load(decoded.light());
-                    context.hasSavedLight = true;
-                }
-                if (!customWorld && shouldGenerate(pos)
-                        && InfiniteDownwardGenerator.upgradeLegacyTerrain(
-                                world, context.cube, effectiveStructureSettings())) {
-                    Higherworld.LOGGER.debug("Upgraded untouched generated terrain cube {}", pos);
-                }
-            } finally {
-                context.committing = false;
-            }
-        } else if (shouldGenerate(pos) && customWorld) {
-            CompletableFuture<CustomCubeGenerator.TerrainSnapshot> preparation =
-                    taskScheduler.prepareTerrain(holder, world.getSeed(), customWorldSettings, priority);
-            if (!wait && !preparation.isDone()) return false;
-            try {
+        boolean wasSuppressing = suppressingGenerationUpdates.get();
+        suppressingGenerationUpdates.set(true);
+        try {
+            if (context.payload != null) {
                 context.committing = true;
                 try {
-                    CustomCubeGenerator.applyTerrain(context.cube, preparation.join());
+                    context.cube.setGenerationVersion(CubeRecordCodec.generationVersion(context.payload));
+                    CubeRecordCodec.DecodedCube decoded = CubeRecordCodec.decode(
+                            context.payload, context.cube.section(), world);
+                    for (BlockEntity blockEntity : decoded.blockEntities()) {
+                        context.cube.putLoadedBlockEntity(blockEntity);
+                    }
+                    if (decoded.hasLight()) {
+                        context.cube.light().load(decoded.light());
+                        context.hasSavedLight = true;
+                    }
+                    if (!customWorld && shouldGenerate(pos)
+                            && InfiniteDownwardGenerator.upgradeLegacyTerrain(
+                                    world, context.cube, effectiveStructureSettings())) {
+                        Higherworld.LOGGER.debug("Upgraded untouched generated terrain cube {}", pos);
+                    }
                 } finally {
                     context.committing = false;
                 }
-            } catch (CompletionException exception) {
-                Throwable cause = exception.getCause();
-                if (cause instanceof RuntimeException runtime) throw runtime;
-                throw new IOException("Cannot prepare terrain for cube " + pos, cause);
+            } else if (shouldGenerate(pos) && customWorld) {
+                CompletableFuture<CustomCubeGenerator.TerrainSnapshot> preparation =
+                        taskScheduler.prepareTerrain(holder, world.getSeed(), customWorldSettings, priority);
+                if (!wait && !preparation.isDone()) return false;
+                try {
+                    context.committing = true;
+                    try {
+                        CustomCubeGenerator.applyTerrain(context.cube, preparation.join());
+                    } finally {
+                        context.committing = false;
+                    }
+                } catch (CompletionException exception) {
+                    Throwable cause = exception.getCause();
+                    if (cause instanceof RuntimeException runtime) throw runtime;
+                    throw new IOException("Cannot prepare terrain for cube " + pos, cause);
+                }
+            } else if (shouldGenerate(pos)) {
+                context.committing = true;
+                try {
+                    InfiniteDownwardGenerator.generateTerrain(world, context.cube);
+                } finally {
+                    context.committing = false;
+                }
             }
-        } else if (shouldGenerate(pos)) {
-            context.committing = true;
-            try {
-                InfiniteDownwardGenerator.generateTerrain(world, context.cube);
-            } finally {
-                context.committing = false;
+            holder.advance(CubeStatus.TERRAIN);
+            return true;
+        } finally {
+            if (wasSuppressing) {
+                suppressingGenerationUpdates.set(true);
+            } else {
+                suppressingGenerationUpdates.remove();
             }
         }
-        holder.advance(CubeStatus.TERRAIN);
-        return true;
     }
 
     private void commitFeatures(CubeHolder holder, LoadContext context) {
         boolean alreadyCommittingFeatures = committingFeatures.get();
+        boolean wasSuppressing = suppressingGenerationUpdates.get();
         committingFeatures.set(true);
+        suppressingGenerationUpdates.set(true);
         context.committing = true;
         try {
             if (context.payload == null && shouldGenerate(holder.pos())) {
@@ -591,6 +631,8 @@ final class CubicWorldState implements AutoCloseable {
             context.committing = false;
             if (alreadyCommittingFeatures) committingFeatures.set(true);
             else committingFeatures.remove();
+            if (wasSuppressing) suppressingGenerationUpdates.set(true);
+            else suppressingGenerationUpdates.remove();
         }
     }
 

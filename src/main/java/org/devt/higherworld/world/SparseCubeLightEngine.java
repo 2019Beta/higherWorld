@@ -10,6 +10,7 @@ import org.devt.higherworld.storage.CubePos;
  * Missing cubes are null light sections and are never allocated by propagation.
  */
 public final class SparseCubeLightEngine {
+    private static final int MAX_LIGHT_LEVEL = 15;
     private static final int[][] DIRECTIONS = {
             {-1, 0, 0}, {1, 0, 0}, {0, -1, 0}, {0, 1, 0}, {0, 0, -1}, {0, 0, 1}
     };
@@ -28,6 +29,11 @@ public final class SparseCubeLightEngine {
 
     /** Queues an entire new cube, or only its faces when saved light is present. */
     public void queueCube(CubePos pos, boolean initialize) {
+        // CubePos deliberately permits every int coordinate for storage keys, but
+        // a cube whose block range is outside int space cannot participate in the
+        // block light graph.  Silently ignoring it also keeps a malformed packet
+        // from turning a boundary coordinate into an opposite-side neighbour.
+        if (!pos.isBlockRangeRepresentable()) return;
         int minX = pos.minBlockX();
         int minY = pos.minBlockY();
         int minZ = pos.minBlockZ();
@@ -53,7 +59,7 @@ public final class SparseCubeLightEngine {
     public void queueBlock(int x, int y, int z) {
         queue(x, y, z);
         for (int[] direction : DIRECTIONS) {
-            queue(x + direction[0], y + direction[1], z + direction[2]);
+            queueOffset(x, y, z, direction[0], direction[1], direction[2]);
         }
     }
 
@@ -67,16 +73,24 @@ public final class SparseCubeLightEngine {
             steps++;
             if (!access.managed(node.x, node.y, node.z)) continue;
 
-            int opacity = Math.max(1, Math.min(15, access.opacity(node.x, node.y, node.z)));
-            int block = access.emitted(node.x, node.y, node.z);
-            int sky = access.skySource(node.x, node.y, node.z) ? 15 : 0;
-            if (opacity < 15) {
+            int opacity = Math.max(1, Math.min(MAX_LIGHT_LEVEL,
+                    access.opacity(node.x, node.y, node.z)));
+            int block = clampLight(access.emitted(node.x, node.y, node.z));
+            int sky = access.skySource(node.x, node.y, node.z) ? MAX_LIGHT_LEVEL : 0;
+            if (opacity < MAX_LIGHT_LEVEL) {
                 for (int[] direction : DIRECTIONS) {
-                    int x = node.x + direction[0];
-                    int y = node.y + direction[1];
-                    int z = node.z + direction[2];
-                    block = Math.max(block, access.block(x, y, z) - opacity);
-                    sky = Math.max(sky, access.sky(x, y, z) - opacity);
+                    long neighbourX = (long) node.x + direction[0];
+                    long neighbourY = (long) node.y + direction[1];
+                    long neighbourZ = (long) node.z + direction[2];
+                    if (!inIntegerRange(neighbourX) || !inIntegerRange(neighbourY)
+                            || !inIntegerRange(neighbourZ)) continue;
+                    int x = (int) neighbourX;
+                    int y = (int) neighbourY;
+                    int z = (int) neighbourZ;
+                    block = Math.max(block,
+                            clampLight(access.block(x, y, z)) - opacity);
+                    sky = Math.max(sky,
+                            clampLight(access.sky(x, y, z)) - opacity);
                 }
             }
 
@@ -85,7 +99,8 @@ public final class SparseCubeLightEngine {
             if (blockChanged || skyChanged) {
                 changed.add(CubePos.fromBlock(node.x, node.y, node.z));
                 for (int[] direction : DIRECTIONS) {
-                    queue(node.x + direction[0], node.y + direction[1], node.z + direction[2]);
+                    queueOffset(node.x, node.y, node.z,
+                            direction[0], direction[1], direction[2]);
                 }
             }
         }
@@ -95,13 +110,30 @@ public final class SparseCubeLightEngine {
 
     private void queueWithNeighbour(int x, int y, int z, int dx, int dy, int dz) {
         queue(x, y, z);
-        queue(x + dx, y + dy, z + dz);
+        queueOffset(x, y, z, dx, dy, dz);
     }
 
     private void queue(int x, int y, int z) {
         if (!access.managed(x, y, z)) return;
         Node node = new Node(x, y, z);
         if (queued.add(node)) pending.addLast(node);
+    }
+
+    private void queueOffset(int x, int y, int z, int dx, int dy, int dz) {
+        long nextX = (long) x + dx;
+        long nextY = (long) y + dy;
+        long nextZ = (long) z + dz;
+        if (inIntegerRange(nextX) && inIntegerRange(nextY) && inIntegerRange(nextZ)) {
+            queue((int) nextX, (int) nextY, (int) nextZ);
+        }
+    }
+
+    private static boolean inIntegerRange(long value) {
+        return value >= Integer.MIN_VALUE && value <= Integer.MAX_VALUE;
+    }
+
+    private static int clampLight(int value) {
+        return Math.max(0, Math.min(MAX_LIGHT_LEVEL, value));
     }
 
     private record Node(int x, int y, int z) {}
