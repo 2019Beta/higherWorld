@@ -11,6 +11,7 @@ import net.minecraft.client.gui.widget.ClickableWidget;
 import net.minecraft.client.gui.widget.CheckboxWidget;
 import net.minecraft.client.gui.widget.CyclingButtonWidget;
 import net.minecraft.client.gui.widget.ElementListWidget;
+import net.minecraft.client.gui.widget.SliderWidget;
 import net.minecraft.client.gui.widget.TextFieldWidget;
 import net.minecraft.client.font.TextRenderer;
 import net.minecraft.text.Text;
@@ -25,7 +26,9 @@ final class CustomSettingsList extends ElementListWidget<CustomSettingsList.Row>
     private static final int ROW_PADDING = 4;
     private static final int LABEL_MIN_WIDTH = 120;
     private static final int EDITOR_MIN_WIDTH = 120;
-    private static final int EDITOR_MAX_WIDTH = 260;
+    private static final int EDITOR_MAX_WIDTH = 360;
+    private static final int EDITOR_GROUP_MAX_WIDTH = 560;
+    private static final int NUMBER_FIELD_WIDTH = 88;
     private static final int COLUMN_GAP = 4;
 
     CustomSettingsList(MinecraftClient client, int width, int height, int top, int bottom) {
@@ -33,6 +36,15 @@ final class CustomSettingsList extends ElementListWidget<CustomSettingsList.Row>
         // bottom coordinate (the list's height is the third argument).
         super(client, width, height, top, bottom);
         centerListVertically = false;
+    }
+
+    @Override
+    public int getRowWidth() {
+        // EntryListWidget defaults every row to a hard-coded 220 pixels.  The
+        // outer list could grow, but its controls therefore stayed squeezed in
+        // the middle.  Let rows consume the list width while reserving room for
+        // the scrollbar and a small visual gutter.
+        return Math.max(1, getWidth() - 24);
     }
 
     Row addRow(Text label, ClickableWidget... widgets) {
@@ -97,6 +109,18 @@ final class CustomSettingsList extends ElementListWidget<CustomSettingsList.Row>
                     && (widgets.get(0) instanceof TextFieldWidget
                     || widgets.get(0) instanceof CyclingButtonWidget<?>)) {
                 widgets.get(0).setWidth(editorWidth(contentWidth));
+            } else if (widgets.size() == 2
+                    && widgets.get(0) instanceof SliderWidget
+                    && widgets.get(1) instanceof TextFieldWidget) {
+                int available = contentWidth >= LABEL_MIN_WIDTH + COLUMN_GAP + 100
+                        ? contentWidth - LABEL_MIN_WIDTH - COLUMN_GAP
+                        : Math.max(1, Math.round(contentWidth * 0.62f));
+                int groupWidth = Math.min(EDITOR_GROUP_MAX_WIDTH, available);
+                int fieldWidth = Math.min(NUMBER_FIELD_WIDTH,
+                        Math.max(48, groupWidth / 3));
+                widgets.get(1).setWidth(fieldWidth);
+                widgets.get(0).setWidth(Math.max(1,
+                        groupWidth - fieldWidth - COLUMN_GAP));
             }
 
             if (widgets.isEmpty()) {
@@ -107,11 +131,22 @@ final class CustomSettingsList extends ElementListWidget<CustomSettingsList.Row>
                 widgetsWidth += widget.getWidth();
             }
             widgetsWidth += COLUMN_GAP * Math.max(0, widgets.size() - 1);
+            if (widgetsWidth > contentWidth) {
+                int widthEach = Math.max(1,
+                        (contentWidth - COLUMN_GAP * Math.max(0, widgets.size() - 1))
+                                / widgets.size());
+                for (ClickableWidget widget : widgets) {
+                    widget.setWidth(widthEach);
+                }
+                widgetsWidth = widthEach * widgets.size()
+                        + COLUMN_GAP * Math.max(0, widgets.size() - 1);
+            }
             int widgetStart = contentRight - widgetsWidth;
             int rowHeight = getHeight();
             int checkboxY = getY() + Math.max(0, (rowHeight - widgets.get(0).getHeight()) / 2);
             if (widgets.size() == 1 && widgets.get(0) instanceof CheckboxWidget) {
                 ClickableWidget checkbox = widgets.get(0);
+                checkbox.setWidth(Math.min(checkbox.getWidth(), contentWidth));
                 checkbox.setX(contentLeft);
                 checkbox.setY(checkboxY);
                 return;

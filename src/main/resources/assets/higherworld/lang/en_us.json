@@ -149,6 +149,7 @@
   "custom.preview.axis_y": "Y: %s",
   "custom.sync_xz": "Sync X/Z",
   "custom.sync_xz.tooltip": "Copy each depth, selector, low, and high X frequency into Z",
+  "custom.slider.suggested_range": "Suggested slider range: %s to %s; the field still accepts exact values outside it",
   "custom.reset": "Restore defaults",
   "custom.reset.tooltip": "Restore the complete custom-world default preset",
   "custom.preset": "Preset...",

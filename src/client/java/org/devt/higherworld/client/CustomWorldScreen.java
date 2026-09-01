@@ -21,6 +21,10 @@ import org.devt.higherworld.world.CustomWorldSettings;
 
 /** Complete five-page editor for the immutable custom-world generation preset. */
 public final class CustomWorldScreen extends Screen {
+    private static final int SCREEN_MARGIN = 10;
+    private static final int MAX_FORM_WIDTH = 920;
+    private static final int MAX_ADVANCED_WIDTH = 1280;
+
     private enum Page {
         BASIC("basic"), ORES("ores"), LAKES("lakes"), CAVES("caves"), ADVANCED("advanced");
 
@@ -61,7 +65,8 @@ public final class CustomWorldScreen extends Screen {
         previewWidget = null;
         if (page == Page.ADVANCED && width >= 760) {
             int gap = 12;
-            int available = Math.max(0, width - 20);
+            int available = Math.min(MAX_ADVANCED_WIDTH,
+                    Math.max(1, width - SCREEN_MARGIN * 2));
             int previewWidth = Math.min(300, Math.max(240, available / 3));
             listWidth = Math.max(360, available - previewWidth - gap);
             int totalWidth = listWidth + gap + previewWidth;
@@ -86,14 +91,16 @@ public final class CustomWorldScreen extends Screen {
                 remaining = 40;
             }
             listTop = contentTop + previewHeight + 10;
-            listWidth = Math.max(1, width - 20);
+            listWidth = Math.max(1, Math.min(MAX_FORM_WIDTH,
+                    width - SCREEN_MARGIN * 2));
             listHeight = Math.max(40, remaining);
             listX = (width - listWidth) / 2;
             previewWidget = new CustomTerrainPreviewWidget(
                     listX, contentTop, listWidth, previewHeight,
                     this::previewSettings);
         } else {
-            listWidth = Math.min(760, Math.max(300, width - 20));
+            listWidth = Math.max(1, Math.min(MAX_FORM_WIDTH,
+                    width - SCREEN_MARGIN * 2));
             listHeight = Math.max(40, footerTop - listTop);
             listX = (width - listWidth) / 2;
         }
@@ -111,14 +118,18 @@ public final class CustomWorldScreen extends Screen {
     }
 
     private void buildTabs() {
-        int gap = 4;
-        int left = Math.max(4, (width - (5 * 116 + 4 * gap)) / 2);
+        int count = Page.values().length;
+        int gap = width >= 320 ? 4 : 2;
+        int available = Math.max(count, width - 8 - gap * (count - 1));
+        int tabWidth = Math.max(1, Math.min(116, available / count));
+        int total = tabWidth * count + gap * (count - 1);
+        int left = Math.max(0, (width - total) / 2);
         for (int index = 0; index < Page.values().length; index++) {
             Page target = Page.values()[index];
             ButtonWidget button = ButtonWidget.builder(
                             Text.translatable("custom.page." + target.id),
                             ignored -> switchPage(target))
-                    .dimensions(left + index * (116 + gap), 52, 116, 20)
+                    .dimensions(left + index * (tabWidth + gap), 52, tabWidth, 20)
                     .tooltip(Tooltip.of(Text.translatable("custom.page." + target.id + ".tooltip")))
                     .build();
             button.active = target != page;
@@ -166,10 +177,11 @@ public final class CustomWorldScreen extends Screen {
                 draft = draft.toBuilder().ravines(value).build());
         addCheckbox("dungeons", draft.dungeons(), value ->
                 draft = draft.toBuilder().dungeons(value).build());
-        addTextField("dungeonCount", "custom.field.dungeon_count", Integer.toString(draft.dungeonCount()));
+        addIntegerSlider("dungeonCount", "custom.field.dungeon_count",
+                draft.dungeonCount(), 0, 64);
         addTextField("biome", "custom.field.biome", draft.biome() == null ? "" : draft.biome());
-        addTextField("biomeSize", "custom.field.biome_size", Integer.toString(draft.biomeSize()));
-        addTextField("riverSize", "custom.field.river_size", Integer.toString(draft.riverSize()));
+        addIntegerSlider("biomeSize", "custom.field.biome_size", draft.biomeSize(), 1, 8);
+        addIntegerSlider("riverSize", "custom.field.river_size", draft.riverSize(), 1, 8);
     }
 
     private void buildOresPage() {
@@ -289,8 +301,8 @@ public final class CustomWorldScreen extends Screen {
         settingsList.addHeader(Text.translatable("custom.group.depth"));
         addNumber("depthNoiseFrequencyX", "custom.field.depth_noise_frequency_x", draft.depthNoiseFrequencyX());
         addNumber("depthNoiseFrequencyZ", "custom.field.depth_noise_frequency_z", draft.depthNoiseFrequencyZ());
-        addTextField("depthNoiseOctaves", "custom.field.depth_noise_octaves",
-                Integer.toString(draft.depthNoiseOctaves()));
+        addIntegerSlider("depthNoiseOctaves", "custom.field.depth_noise_octaves",
+                draft.depthNoiseOctaves(), 1, 32);
         addNumber("depthNoiseFactor", "custom.field.depth_noise_factor", draft.depthNoiseFactor());
         addNumber("depthNoiseOffset", "custom.field.depth_noise_offset", draft.depthNoiseOffset());
 
@@ -298,8 +310,8 @@ public final class CustomWorldScreen extends Screen {
         addNumber("selectorNoiseFrequencyX", "custom.field.selector_noise_frequency_x", draft.selectorNoiseFrequencyX());
         addNumber("selectorNoiseFrequencyY", "custom.field.selector_noise_frequency_y", draft.selectorNoiseFrequencyY());
         addNumber("selectorNoiseFrequencyZ", "custom.field.selector_noise_frequency_z", draft.selectorNoiseFrequencyZ());
-        addTextField("selectorNoiseOctaves", "custom.field.selector_noise_octaves",
-                Integer.toString(draft.selectorNoiseOctaves()));
+        addIntegerSlider("selectorNoiseOctaves", "custom.field.selector_noise_octaves",
+                draft.selectorNoiseOctaves(), 1, 32);
         addNumber("selectorNoiseFactor", "custom.field.selector_noise_factor", draft.selectorNoiseFactor());
         addNumber("selectorNoiseOffset", "custom.field.selector_noise_offset", draft.selectorNoiseOffset());
 
@@ -307,8 +319,8 @@ public final class CustomWorldScreen extends Screen {
         addNumber("lowNoiseFrequencyX", "custom.field.low_noise_frequency_x", draft.lowNoiseFrequencyX());
         addNumber("lowNoiseFrequencyY", "custom.field.low_noise_frequency_y", draft.lowNoiseFrequencyY());
         addNumber("lowNoiseFrequencyZ", "custom.field.low_noise_frequency_z", draft.lowNoiseFrequencyZ());
-        addTextField("lowNoiseOctaves", "custom.field.low_noise_octaves",
-                Integer.toString(draft.lowNoiseOctaves()));
+        addIntegerSlider("lowNoiseOctaves", "custom.field.low_noise_octaves",
+                draft.lowNoiseOctaves(), 1, 32);
         addNumber("lowNoiseFactor", "custom.field.low_noise_factor", draft.lowNoiseFactor());
         addNumber("lowNoiseOffset", "custom.field.low_noise_offset", draft.lowNoiseOffset());
 
@@ -316,8 +328,8 @@ public final class CustomWorldScreen extends Screen {
         addNumber("highNoiseFrequencyX", "custom.field.high_noise_frequency_x", draft.highNoiseFrequencyX());
         addNumber("highNoiseFrequencyY", "custom.field.high_noise_frequency_y", draft.highNoiseFrequencyY());
         addNumber("highNoiseFrequencyZ", "custom.field.high_noise_frequency_z", draft.highNoiseFrequencyZ());
-        addTextField("highNoiseOctaves", "custom.field.high_noise_octaves",
-                Integer.toString(draft.highNoiseOctaves()));
+        addIntegerSlider("highNoiseOctaves", "custom.field.high_noise_octaves",
+                draft.highNoiseOctaves(), 1, 32);
         addNumber("highNoiseFactor", "custom.field.high_noise_factor", draft.highNoiseFactor());
         addNumber("highNoiseOffset", "custom.field.high_noise_offset", draft.highNoiseOffset());
 
@@ -333,10 +345,12 @@ public final class CustomWorldScreen extends Screen {
     }
 
     private void buildFooter() {
-        int widthEach = 96;
-        int gap = 4;
+        int count = 4;
+        int gap = width >= 240 ? 4 : 2;
+        int available = Math.max(count, width - 8 - gap * (count - 1));
+        int widthEach = Math.max(1, Math.min(96, available / count));
         int total = widthEach * 4 + gap * 3;
-        int left = (width - total) / 2;
+        int left = Math.max(0, (width - total) / 2);
         ButtonWidget preset = ButtonWidget.builder(Text.translatable("custom.preset"), ignored -> openPreset())
                 .dimensions(left, height - 28, widthEach, 20)
                 .tooltip(Tooltip.of(Text.translatable("custom.preset.tooltip")))
@@ -385,7 +399,93 @@ public final class CustomWorldScreen extends Screen {
     }
 
     private void addNumber(String id, String labelKey, double value) {
-        addTextField(id, labelKey, CustomSettingsParsers.formatNumber(value));
+        SliderRange range = sliderRange(id);
+        if (range == null) {
+            addTextField(id, labelKey, CustomSettingsParsers.formatNumber(value));
+            return;
+        }
+
+        TextFieldWidget field = new TextFieldWidget(textRenderer, 0, 0, 88, 20, Text.empty());
+        field.setMaxLength(4096);
+        field.setText(CustomSettingsParsers.formatNumber(value));
+        Tooltip tooltip = sliderTooltip(labelKey, range.min(), range.max());
+        field.setTooltip(tooltip);
+        CustomDoubleSliderWidget slider = new CustomDoubleSliderWidget(
+                180, value, range.min(), range.max(), range.step(),
+                selected -> field.setText(CustomSettingsParsers.formatNumber(selected)));
+        slider.setTooltip(tooltip);
+        field.setChangedListener(text -> {
+            try {
+                slider.syncFromText(CustomSettingsParsers.finite(text, id));
+            } catch (RuntimeException ignored) {
+                // Keep the thumb at the last valid value while typing.
+            }
+            markPreviewDirty();
+        });
+        fields.put(id, field);
+        settingsList.addRow(Text.translatable(labelKey), slider, field);
+    }
+
+    private void addIntegerSlider(
+            String id, String labelKey, int value, int min, int max) {
+        TextFieldWidget field = new TextFieldWidget(textRenderer, 0, 0, 88, 20, Text.empty());
+        field.setMaxLength(4096);
+        field.setText(Integer.toString(value));
+        Tooltip tooltip = sliderTooltip(labelKey, min, max);
+        field.setTooltip(tooltip);
+        CustomDoubleSliderWidget slider = new CustomDoubleSliderWidget(
+                180, value, min, max, 1.0,
+                selected -> field.setText(Integer.toString((int) Math.round(selected))));
+        slider.setTooltip(tooltip);
+        field.setChangedListener(text -> {
+            try {
+                slider.syncFromText(CustomSettingsParsers.integer(text, id));
+            } catch (RuntimeException ignored) {
+                // Keep the thumb at the last valid value while typing.
+            }
+            if (page == Page.ADVANCED) {
+                markPreviewDirty();
+            }
+        });
+        fields.put(id, field);
+        settingsList.addRow(Text.translatable(labelKey), slider, field);
+    }
+
+    private static SliderRange sliderRange(String id) {
+        if (id.endsWith("FrequencyX") || id.endsWith("FrequencyY")
+                || id.endsWith("FrequencyZ")) {
+            return new SliderRange(0.0, 0.05, 0.00001);
+        }
+        return switch (id) {
+            case "expectedBaseHeight" -> new SliderRange(-512.0, 512.0, 1.0);
+            case "expectedHeightVariation" -> new SliderRange(0.0, 512.0, 1.0);
+            case "actualHeight" -> new SliderRange(16.0, 2048.0, 1.0);
+            case "heightVariationFactor", "specialHeightVariationFactorBelowAverageY",
+                    "heightVariationOffset", "heightFactor" ->
+                    new SliderRange(-256.0, 256.0, 1.0);
+            case "heightOffset" -> new SliderRange(-512.0, 512.0, 1.0);
+            case "depthNoiseFactor", "selectorNoiseFactor" ->
+                    new SliderRange(0.0, 32.0, 0.1);
+            case "depthNoiseOffset" -> new SliderRange(-16.0, 16.0, 0.1);
+            case "selectorNoiseOffset" -> new SliderRange(-2.0, 2.0, 0.01);
+            case "lowNoiseFactor", "highNoiseFactor" ->
+                    new SliderRange(0.0, 8.0, 0.05);
+            case "lowNoiseOffset", "highNoiseOffset" ->
+                    new SliderRange(-8.0, 8.0, 0.05);
+            default -> null;
+        };
+    }
+
+    private record SliderRange(double min, double max, double step) {
+    }
+
+    private static Tooltip sliderTooltip(String labelKey, double min, double max) {
+        return Tooltip.of(Text.empty()
+                .append(Text.translatable(labelKey + ".tooltip"))
+                .append("\n")
+                .append(Text.translatable("custom.slider.suggested_range",
+                        CustomSettingsParsers.formatNumber(min),
+                        CustomSettingsParsers.formatNumber(max))));
     }
 
     private void addSampleSize(String id, int value) {
