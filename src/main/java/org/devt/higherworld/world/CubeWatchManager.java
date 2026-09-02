@@ -89,10 +89,15 @@ public final class CubeWatchManager {
         adaptive.record(System.nanoTime() - workStarted);
     }
 
-    /** A second bounded completion drain reduces future latency within a tick. */
+    /** Drains completed lifecycle work once per world tick on the server thread. */
     public static void midTick(ServerWorld world) {
         AdaptiveBudget budget = BUDGETS.computeIfAbsent(world, ignored -> new AdaptiveBudget());
-        CubicWorldManager.advanceReadyTasks(world, budget.commitNanos());
+        long allowance = budget.claimCommitNanos();
+        if (allowance <= 0L) return;
+
+        long started = System.nanoTime();
+        CubicWorldManager.advanceReadyTasks(world, allowance);
+        budget.recordCommit(System.nanoTime() - started);
     }
 
     public static void removeWorld(ServerWorld world) {
@@ -370,22 +375,41 @@ public final class CubeWatchManager {
     }
 
     /** Keeps cube work near a small tick slice using an EWMA of actual cost. */
-    private static final class AdaptiveBudget {
+    static final class AdaptiveBudget {
         private static final long TARGET_NANOS = 2_000_000L;
+        private static final long MAX_DEBT_NANOS = 200_000_000L;
         private double averageNanos = TARGET_NANOS;
+        private long debtNanos;
 
-        private int cubeAllowance() {
+        int cubeAllowance() {
+            if (debtNanos > 0L) return 0;
             double ratio = TARGET_NANOS / Math.max(250_000.0, averageNanos);
             return Math.max(1, Math.min(4, (int) Math.round(CUBE_WORK_PER_WORLD_TICK * ratio)));
         }
 
-        private long commitNanos() {
+        long claimCommitNanos() {
+            if (debtNanos > 0L) {
+                debtNanos = Math.max(0L, debtNanos - TARGET_NANOS);
+                return 0L;
+            }
             return Math.max(250_000L, Math.min(TARGET_NANOS, (long) (TARGET_NANOS *
                     TARGET_NANOS / Math.max(TARGET_NANOS, averageNanos))));
         }
 
-        private void record(long elapsedNanos) {
+        void recordCommit(long elapsedNanos) {
+            record(elapsedNanos);
+            if (elapsedNanos > TARGET_NANOS) {
+                debtNanos = Math.min(MAX_DEBT_NANOS,
+                        debtNanos + elapsedNanos - TARGET_NANOS);
+            }
+        }
+
+        void record(long elapsedNanos) {
             averageNanos = averageNanos * 0.8 + elapsedNanos * 0.2;
+        }
+
+        long debtNanos() {
+            return debtNanos;
         }
     }
 }

@@ -243,7 +243,6 @@ final class CubicWorldState implements AutoCloseable {
             }
             CubeHolder holder = taskScheduler.holder(pos);
             if (!holder.status().isAtLeast(CubeStatus.FULL)) {
-                advanceReadyTasks(2_000_000L);
                 if (!holder.fullFuture().isDone()) return null;
             } else {
                 taskScheduler.adoptLoaded(loaded);
@@ -293,7 +292,6 @@ final class CubicWorldState implements AutoCloseable {
             }
             LoadedCube generated;
             if (allowPending) {
-                advanceReadyTasks(2_000_000L);
                 Optional<LoadedCube> completed = holder.fullFuture().getNow(null);
                 if (completed == null) return null;
                 generated = completed.orElse(null);
@@ -309,7 +307,6 @@ final class CubicWorldState implements AutoCloseable {
         CubeHolder holder = taskScheduler.request(pos, CubeStatus.FULL, priority);
         LoadedCube created;
         if (allowPending) {
-            advanceReadyTasks(2_000_000L);
             Optional<LoadedCube> completed = holder.fullFuture().getNow(null);
             if (completed == null) return null;
             created = completed.orElse(null);
