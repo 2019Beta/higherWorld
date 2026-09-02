@@ -65,9 +65,21 @@ public final class SparseCubeLightEngine {
 
     /** Runs until stable or the supplied safety limit is reached. */
     public Result propagate(int maximumSteps) {
+        return propagate(maximumSteps, Long.MAX_VALUE);
+    }
+
+    /**
+     * Runs a bounded slice of light work.  The time check is deliberately
+     * sampled instead of performed for every node: {@link System#nanoTime()}
+     * is measurable in this very hot loop, while a small overshoot is harmless.
+     */
+    public Result propagate(int maximumSteps, long maximumNanos) {
         Set<CubePos> changed = new HashSet<>();
         int steps = 0;
-        while (!pending.isEmpty() && steps < maximumSteps) {
+        long budget = Math.max(0L, maximumNanos);
+        long started = System.nanoTime();
+        while (!pending.isEmpty() && steps < maximumSteps
+                && ((steps & 63) != 0 || System.nanoTime() - started < budget)) {
             Node node = pending.removeFirst();
             queued.remove(node);
             steps++;

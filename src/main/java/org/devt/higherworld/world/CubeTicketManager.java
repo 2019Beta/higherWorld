@@ -33,8 +33,12 @@ final class CubeTicketManager {
 
     synchronized int priority(CubePos pos) {
         Map<Object, CubeTicket> owners = byCube.get(pos);
-        return owners == null ? Integer.MAX_VALUE : owners.values().stream()
-                .mapToInt(ticket -> positionalPriority(ticket, pos)).min().orElse(Integer.MAX_VALUE);
+        if (owners == null || owners.isEmpty()) return Integer.MAX_VALUE;
+        int best = Integer.MAX_VALUE;
+        for (CubeTicket ticket : owners.values()) {
+            best = Math.min(best, positionalPriority(ticket, pos));
+        }
+        return best;
     }
 
     synchronized CubeStatus targetStatus(CubePos pos) {

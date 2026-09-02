@@ -44,6 +44,21 @@ class SparseCubeLightEngineTest {
         assertEquals(0, access.block(9, 8, 8));
     }
 
+    @Test
+    void zeroTimeBudgetDefersQueuedWorkWithoutLosingIt() {
+        TestAccess access = new TestAccess();
+        CubePos cube = new CubePos(0, 0, 0);
+        access.add(cube);
+        SparseCubeLightEngine engine = new SparseCubeLightEngine(access);
+        engine.queueCube(cube, true);
+
+        SparseCubeLightEngine.Result deferred = engine.propagate(200_000, 0L);
+        assertEquals(0, deferred.steps());
+        assertTrue(!deferred.complete());
+
+        assertTrue(engine.propagate(200_000).complete());
+    }
+
     private static final class TestAccess implements SparseCubeLightEngine.Access {
         private final Map<CubePos, CubeLightData> cubes = new HashMap<>();
         private final Map<Point, Integer> emission = new HashMap<>();

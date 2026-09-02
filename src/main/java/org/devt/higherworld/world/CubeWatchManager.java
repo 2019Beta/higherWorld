@@ -73,7 +73,7 @@ public final class CubeWatchManager {
 
         // Cache eviction is maintenance, not simulation. Running the full cache
         // walk every server tick creates avoidable allocation and CPU pressure.
-        if (world.getTime() % 20L == 0L) {
+        if (world.getTime() % 5L == 0L) {
             Set<CubePos> retained = new HashSet<>();
             for (WatchState state : WATCHERS.values()) {
                 if (state.world == world) {
@@ -84,10 +84,7 @@ public final class CubeWatchManager {
             CubicWorldManager.evictExcept(world, retained);
         }
         CubicWorldManager.tick(world);
-
-        if (world.getTime() % 200L == 0L) {
-            CubicWorldManager.flushDirty(world);
-        }
+        CubicWorldManager.flushDirty(world);
         adaptive.record(System.nanoTime() - workStarted);
     }
 
