@@ -3,7 +3,9 @@ package org.devt.higherworld.client;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
@@ -41,6 +43,12 @@ public final class ClientCubeCache {
     private static volatile ClientWorld owner;
     private static final ConcurrentMap<BlockPos, BlockEntity> BLOCK_ENTITIES = new ConcurrentHashMap<>();
     private static final SparseCubeLightEngine LIGHT_ENGINE = new SparseCubeLightEngine(new ClientLightAccess());
+    /**
+     * Render invalidations are produced only on the client thread. Keep them in
+     * one tick-local set so a burst of cube packets, block updates and light
+     * publications rebuilds each affected section at most once.
+     */
+    private static final Set<CubePos> PENDING_RENDER_CUBES = new HashSet<>();
 
     private ClientCubeCache() {
     }
@@ -81,7 +89,7 @@ public final class ClientCubeCache {
             BLOCK_ENTITIES.put(blockEntity.getPos().toImmutable(), blockEntity);
         }
         LIGHT_ENGINE.queueCube(pos, !decoded.hasLight());
-        scheduleRenderNeighborhood(pos);
+        queueRenderNeighborhood(pos);
     }
 
     public static void unload(ClientWorld world, CubePos pos) {
@@ -104,7 +112,7 @@ public final class ClientCubeCache {
         if (!removed) return;
         removeBlockEntities(pos);
         queueLoadedNeighbours(pos);
-        scheduleRenderNeighborhood(pos);
+        queueRenderNeighborhood(pos);
     }
 
     public static BlockState getBlockState(ClientWorld world, BlockPos pos) {
@@ -146,7 +154,7 @@ public final class ClientCubeCache {
         }
         LIGHT_ENGINE.queueBlock(pos.getX(), pos.getY(), pos.getZ());
         queueLoadedSkyColumn(pos.getX(), pos.getZ());
-        scheduleRenderNeighborhood(cubePos);
+        queueRenderNeighborhood(cubePos);
         return true;
     }
 
@@ -178,6 +186,7 @@ public final class ClientCubeCache {
             HIGHEST_BLOCKS.clear();
             BLOCK_ENTITIES.clear();
             LIGHT_ENGINE.clear();
+            PENDING_RENDER_CUBES.clear();
             owner = null;
         }
     }
@@ -195,6 +204,7 @@ public final class ClientCubeCache {
     public static void tickLighting() {
         if (owner == null) return;
         LIGHT_ENGINE.propagate(LIGHT_STEPS_PER_TICK, LIGHT_BUDGET_NANOS);
+        flushRenderUpdates();
     }
 
     public static ChunkSection getSection(ClientWorld world, int sectionX, int sectionY, int sectionZ) {
@@ -248,6 +258,7 @@ public final class ClientCubeCache {
                     HIGHEST_BLOCKS.clear();
                     BLOCK_ENTITIES.clear();
                     LIGHT_ENGINE.clear();
+                    PENDING_RENDER_CUBES.clear();
                     owner = world;
                 }
             }
@@ -259,30 +270,33 @@ public final class ClientCubeCache {
      * appears or disappears, rebuilding only the changed cube leaves the old
      * neighbor's full boundary face in the scene as a visible 16-block sheet.
      */
-    private static void scheduleRenderNeighborhood(CubePos pos) {
+    private static void queueRenderNeighborhood(CubePos pos) {
+        PENDING_RENDER_CUBES.add(pos);
+        addRepresentableRenderCube((long) pos.x() - 1L, pos.y(), pos.z());
+        addRepresentableRenderCube((long) pos.x() + 1L, pos.y(), pos.z());
+        addRepresentableRenderCube(pos.x(), (long) pos.y() - 1L, pos.z());
+        addRepresentableRenderCube(pos.x(), (long) pos.y() + 1L, pos.z());
+        addRepresentableRenderCube(pos.x(), pos.y(), (long) pos.z() - 1L);
+        addRepresentableRenderCube(pos.x(), pos.y(), (long) pos.z() + 1L);
+    }
+
+    private static void addRepresentableRenderCube(long x, long y, long z) {
+        if (x < Integer.MIN_VALUE || x > Integer.MAX_VALUE
+                || y < Integer.MIN_VALUE || y > Integer.MAX_VALUE
+                || z < Integer.MIN_VALUE || z > Integer.MAX_VALUE) return;
+        PENDING_RENDER_CUBES.add(new CubePos((int) x, (int) y, (int) z));
+    }
+
+    /** Flushes the de-duplicated invalidations once at the end of the client tick. */
+    private static void flushRenderUpdates() {
+        if (PENDING_RENDER_CUBES.isEmpty()) return;
         MinecraftClient client = MinecraftClient.getInstance();
-        if (client.worldRenderer != null) {
+        if (client.worldRenderer == null) return;
+        for (CubePos pos : PENDING_RENDER_CUBES) {
             client.worldRenderer.scheduleChunkRender(pos.x(), pos.y(), pos.z());
-            if (pos.x() != Integer.MIN_VALUE) {
-                client.worldRenderer.scheduleChunkRender(pos.x() - 1, pos.y(), pos.z());
-            }
-            if (pos.x() != Integer.MAX_VALUE) {
-                client.worldRenderer.scheduleChunkRender(pos.x() + 1, pos.y(), pos.z());
-            }
-            if (pos.y() != Integer.MIN_VALUE) {
-                client.worldRenderer.scheduleChunkRender(pos.x(), pos.y() - 1, pos.z());
-            }
-            if (pos.y() != Integer.MAX_VALUE) {
-                client.worldRenderer.scheduleChunkRender(pos.x(), pos.y() + 1, pos.z());
-            }
-            if (pos.z() != Integer.MIN_VALUE) {
-                client.worldRenderer.scheduleChunkRender(pos.x(), pos.y(), pos.z() - 1);
-            }
-            if (pos.z() != Integer.MAX_VALUE) {
-                client.worldRenderer.scheduleChunkRender(pos.x(), pos.y(), pos.z() + 1);
-            }
-            client.worldRenderer.scheduleTerrainUpdate();
         }
+        PENDING_RENDER_CUBES.clear();
+        client.worldRenderer.scheduleTerrainUpdate();
     }
 
     private static void removeBlockEntities(CubePos pos) {
@@ -312,9 +326,14 @@ public final class ClientCubeCache {
     private static void queueLoadedSkyColumn(int blockX, int blockZ) {
         int cubeX = Math.floorDiv(blockX, CubePos.SIZE);
         int cubeZ = Math.floorDiv(blockZ, CubePos.SIZE);
-        for (CubePos pos : CUBES.keySet()) {
-            if (pos.x() != cubeX || pos.z() != cubeZ) continue;
-            int minY = pos.minBlockY();
+        int[] loadedCubeYs;
+        synchronized (ClientCubeCache.class) {
+            Map<Integer, HeightIndex> heights = CUBE_HEIGHTS.get(new CubeColumnPos(cubeX, cubeZ));
+            if (heights == null || heights.isEmpty()) return;
+            loadedCubeYs = heights.keySet().stream().mapToInt(Integer::intValue).toArray();
+        }
+        for (int cubeY : loadedCubeYs) {
+            int minY = new CubePos(cubeX, cubeY, cubeZ).minBlockY();
             for (int localY = 0; localY < CubePos.SIZE; localY++) {
                 LIGHT_ENGINE.queueBlock(blockX, minY + localY, blockZ);
             }
@@ -508,7 +527,7 @@ public final class ClientCubeCache {
         @Override
         public void publish(CubePos pos) {
             CubeEntry entry = CUBES.get(pos);
-            if (entry != null && entry.light().publish()) scheduleRenderNeighborhood(pos);
+            if (entry != null && entry.light().publish()) queueRenderNeighborhood(pos);
         }
 
         private static BlockState state(int x, int y, int z) {

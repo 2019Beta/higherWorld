@@ -7,6 +7,8 @@ import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.util.math.BlockPos;
+import net.minecraft.util.math.Direction;
+import net.minecraft.state.property.Properties;
 import net.minecraft.world.gen.chunk.ChunkGeneratorSettings;
 import net.minecraft.world.gen.densityfunction.DensityFunction;
 import net.minecraft.world.gen.densityfunction.DensityFunctionTypes;
@@ -15,7 +17,7 @@ import org.devt.higherworld.storage.CubePos;
 
 /** Lazily extends Overworld terrain below the vanilla generation band. */
 final class InfiniteDownwardGenerator {
-    static final int GENERATION_VERSION = 14;
+    static final int GENERATION_VERSION = 15;
     private static final BlockState AIR = Blocks.AIR.getDefaultState();
     private static final BlockState DEEPSLATE = Blocks.DEEPSLATE.getDefaultState();
     private static final int NOISE_CELL_SIZE = 4;
@@ -96,6 +98,57 @@ final class InfiniteDownwardGenerator {
         }
     }
 
+    /** Removes only pointed-dripstone chains that have no block anchoring their base. */
+    private static boolean removeOrphanedPointedDripstone(ServerWorld world, LoadedCube cube) {
+        boolean[] orphaned = new boolean[CubePos.SIZE * CubePos.SIZE * CubePos.SIZE];
+        boolean changed = false;
+        for (int y = 0; y < CubePos.SIZE; y++) {
+            for (int z = 0; z < CubePos.SIZE; z++) {
+                for (int x = 0; x < CubePos.SIZE; x++) {
+                    BlockState state = cube.section().getBlockState(x, y, z);
+                    if (!state.isOf(Blocks.POINTED_DRIPSTONE)) continue;
+                    BlockPos pos = new BlockPos(
+                            cube.pos().minBlockX() + x,
+                            cube.pos().minBlockY() + y,
+                            cube.pos().minBlockZ() + z);
+                    Direction tipDirection = state.get(Properties.VERTICAL_DIRECTION);
+                    if (!hasDripstoneAnchor(world, cube, pos, tipDirection)) {
+                        orphaned[(y * CubePos.SIZE + z) * CubePos.SIZE + x] = true;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if (!changed) return false;
+        for (int y = 0; y < CubePos.SIZE; y++) {
+            for (int z = 0; z < CubePos.SIZE; z++) {
+                for (int x = 0; x < CubePos.SIZE; x++) {
+                    if (orphaned[(y * CubePos.SIZE + z) * CubePos.SIZE + x]) {
+                        cube.setGeneratedBlockState(x, y, z, AIR);
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    private static boolean hasDripstoneAnchor(
+            ServerWorld world, LoadedCube cube, BlockPos tip, Direction tipDirection) {
+        Direction towardBase = tipDirection.getOpposite();
+        BlockPos cursor = tip.offset(towardBase);
+        for (int distance = 0; distance < 64; distance++, cursor = cursor.offset(towardBase)) {
+            BlockState support = cube.pos().equals(CubePos.fromBlock(
+                    cursor.getX(), cursor.getY(), cursor.getZ()))
+                    ? cube.getBlockState(cursor) : world.getBlockState(cursor);
+            if (!support.isOf(Blocks.POINTED_DRIPSTONE)) {
+                return !support.isAir();
+            }
+            if (support.get(Properties.VERTICAL_DIRECTION) != tipDirection) return false;
+        }
+        // Preserve abnormally long chains rather than guessing about player work.
+        return true;
+    }
+
     private static void generateVanillaNoiseTerrain(ServerWorld world, LoadedCube cube) {
         CubePos pos = cube.pos();
         DensityFunction density = extendedOverworldDensity(world);
@@ -164,6 +217,12 @@ final class InfiniteDownwardGenerator {
             ServerWorld world, LoadedCube cube, StructureGenerationSettings structureSettings) {
         if (cube.generationVersion() >= GENERATION_VERSION) {
             return false;
+        }
+        if (cube.generationVersion() == 14) {
+            boolean repaired = removeOrphanedPointedDripstone(world, cube);
+            cube.setGenerationVersion(GENERATION_VERSION);
+            cube.markDirty();
+            return repaired;
         }
         if (cube.generationVersion() == 13) {
             removeGeneratedFluids(cube);

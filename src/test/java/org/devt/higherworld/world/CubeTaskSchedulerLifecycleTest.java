@@ -86,7 +86,7 @@ class CubeTaskSchedulerLifecycleTest {
     }
 
     @Test
-    void readyCommitPrefersLowerStageBeforeTicketPriority() {
+    void readyCommitSkipsHighPriorityStageWhoseDependenciesAreBlocked() {
         CubePos blockedHighPriorityPos = new CubePos(100, -20, 100);
         CubePos lowPriorityTerrainPos = new CubePos(-100, -20, -100);
         try (CubeStorage storage = new CubeStorage(directory);
@@ -108,6 +108,37 @@ class CubeTaskSchedulerLifecycleTest {
             lowPriorityTerrain.advance(CubeStatus.IO_READY);
 
             assertSame(lowPriorityTerrain, scheduler.readyForCommit(1).get(0));
+        }
+    }
+
+    @Test
+    void readyCommitDoesNotLetDistantIoReadyWorkStarveNearbyFeatures() {
+        CubePos center = new CubePos(0, -20, 0);
+        try (CubeStorage storage = new CubeStorage(directory);
+                CubeIoScheduler io = new CubeIoScheduler(storage);
+                CubeTaskScheduler scheduler = new CubeTaskScheduler(io)) {
+            scheduler.replaceTicket(new CubeTicket(
+                    "player", CubeTicketType.PLAYER, center,
+                    new CubeDependencyRadius(32, 4, 32), CubeStatus.FULL, 0));
+
+            CubeHolder nearbyFeatures = scheduler.holder(center);
+            nearbyFeatures.request(CubeStatus.FULL);
+            CubeStatus.LIGHT.dependencyRadius().forEach(center, pos -> {
+                CubeHolder dependency = scheduler.holder(pos);
+                dependency.request(CubeStatus.FULL);
+                dependency.advance(CubeStatus.FEATURES);
+            });
+
+            // Model a continuing stream of newly IO-ready cubes farther from
+            // the player. The old status-first ordering selected every one of
+            // these ahead of the nearby cube, regardless of ticket distance.
+            for (int distance = 8; distance <= 24; distance++) {
+                CubeHolder distant = scheduler.holder(new CubePos(distance, -20, 0));
+                distant.request(CubeStatus.FULL);
+                distant.advance(CubeStatus.IO_READY);
+            }
+
+            assertSame(nearbyFeatures, scheduler.readyForCommit(1).get(0));
         }
     }
 

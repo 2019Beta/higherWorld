@@ -248,6 +248,13 @@ final class CubeTaskScheduler implements AutoCloseable {
         // can contain the whole dependency closure.
         PriorityQueue<ReadyCandidate> best = new PriorityQueue<>(limit, (first, second) ->
                 compareReady(second, first));
+        // Keep a second, dependency-first frontier. A high-priority LIGHT
+        // candidate can be blocked on FEATURES cubes outside the ticket's
+        // direct volume (and therefore with no ticket priority of their own).
+        // Reserving fallback candidates lets those prerequisites advance
+        // without making lifecycle stage the primary ordering again.
+        PriorityQueue<ReadyCandidate> prerequisites = new PriorityQueue<>(
+                limit, (first, second) -> comparePrerequisite(second, first));
         for (CubeHolder holder : holders.values()) {
             if (holder.failed()
                     || !holder.target().isAtLeast(CubeStatus.TERRAIN)
@@ -258,18 +265,23 @@ final class CubeTaskScheduler implements AutoCloseable {
 
             ReadyCandidate candidate = new ReadyCandidate(
                     holder, tickets.priority(holder.pos()), holder.status().ordinal());
-            if (best.size() < limit) {
-                best.offer(candidate);
-            } else if (compareReady(candidate, best.peek()) < 0) {
-                best.poll();
-                best.offer(candidate);
-            }
+            offerBounded(best, candidate, limit, CubeTaskScheduler::compareReady);
+            offerBounded(
+                    prerequisites, candidate, limit, CubeTaskScheduler::comparePrerequisite);
         }
 
-        ArrayList<ReadyCandidate> ordered = new ArrayList<>(best);
+        Set<ReadyCandidate> candidates = new HashSet<>(best);
+        candidates.addAll(prerequisites);
+        ArrayList<ReadyCandidate> ordered = new ArrayList<>(candidates.size());
+        for (ReadyCandidate candidate : candidates) {
+            if (nextCommitDependenciesReady(candidate.holder())) ordered.add(candidate);
+        }
         ordered.sort(CubeTaskScheduler::compareReady);
-        ArrayList<CubeHolder> result = new ArrayList<>(ordered.size());
-        for (ReadyCandidate candidate : ordered) result.add(candidate.holder());
+        ArrayList<CubeHolder> result = new ArrayList<>(Math.min(limit, ordered.size()));
+        for (ReadyCandidate candidate : ordered) {
+            if (result.size() >= limit) break;
+            result.add(candidate.holder());
+        }
         return result;
     }
 
@@ -374,9 +386,59 @@ final class CubeTaskScheduler implements AutoCloseable {
     private record ReadyCandidate(CubeHolder holder, int priority, int statusOrdinal) {}
 
     private static int compareReady(ReadyCandidate first, ReadyCandidate second) {
+        // Ticket priority includes distance from the ticket centre.  It must be
+        // the primary key so newly arriving, distant IO_READY cubes cannot
+        // indefinitely displace a nearby cube that is one commit from FULL.
+        int byPriority = Integer.compare(first.priority(), second.priority());
+        if (byPriority != 0) return byPriority;
+
+        // Within the same distance band, finish work already in flight before
+        // starting another stage.  Blocked high-stage nodes are filtered by
+        // nextCommitDependenciesReady(), so this cannot starve their lower-stage
+        // dependency cubes.
+        return Integer.compare(second.statusOrdinal(), first.statusOrdinal());
+    }
+
+    private static int comparePrerequisite(ReadyCandidate first, ReadyCandidate second) {
         int byStatus = Integer.compare(first.statusOrdinal(), second.statusOrdinal());
         return byStatus != 0
                 ? byStatus : Integer.compare(first.priority(), second.priority());
+    }
+
+    private static void offerBounded(
+            PriorityQueue<ReadyCandidate> queue, ReadyCandidate candidate, int limit,
+            Comparator<ReadyCandidate> comparator) {
+        if (queue.size() < limit) {
+            queue.offer(candidate);
+        } else if (comparator.compare(candidate, queue.peek()) < 0) {
+            queue.poll();
+            queue.offer(candidate);
+        }
+    }
+
+    private boolean nextCommitDependenciesReady(CubeHolder holder) {
+        CubeStatus next = CubeStatus.values()[holder.status().ordinal() + 1];
+        CubeStatus neighbour = next.neighbourPrerequisite();
+        if (neighbour == null) return true;
+
+        CubeDependencyRadius radius = next.dependencyRadius();
+        for (int offsetY = -radius.y(); offsetY <= radius.y(); offsetY++) {
+            for (int offsetZ = -radius.z(); offsetZ <= radius.z(); offsetZ++) {
+                for (int offsetX = -radius.x(); offsetX <= radius.x(); offsetX++) {
+                    CubePos dependency = new CubePos(
+                            Math.addExact(holder.pos().x(), offsetX),
+                            Math.addExact(holder.pos().y(), offsetY),
+                            Math.addExact(holder.pos().z(), offsetZ));
+                    CubeHolder dependencyHolder = holders.get(dependency);
+                    if (dependencyHolder == null
+                            || dependencyHolder.failed()
+                            || !dependencyHolder.status().isAtLeast(neighbour)) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
     }
 
     private record GenerationTask(int priority, long sequence, Runnable action)

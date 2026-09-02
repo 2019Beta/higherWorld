@@ -70,17 +70,17 @@ final class VanillaPlacedFeatureGenerator {
     }
 
     static void generate(ServerWorld world, LoadedCube cube) {
-        generate(world, cube, SAFE_UNDERGROUND_STEPS, false);
+        generate(world, cube, SAFE_UNDERGROUND_STEPS, BoundaryMode.TRANSLATED);
     }
 
     /** Reproduces the version-12 pass exactly enough to identify untouched cubes. */
     static void generateVersion12(ServerWorld world, LoadedCube cube) {
-        generate(world, cube, LEGACY_UNDERGROUND_STEPS, true);
+        generate(world, cube, LEGACY_UNDERGROUND_STEPS, BoundaryMode.VERSION_12);
     }
 
     private static void generate(
             ServerWorld world, LoadedCube cube, List<GenerationStep.Feature> steps,
-            boolean legacyBoundaryReads) {
+            BoundaryMode boundaryMode) {
         int depthIndex = world.getBottomSectionCoord() - 1 - cube.pos().y();
         int sectionsPerBand = REPEATED_BAND_HEIGHT / CubePos.SIZE;
         int virtualSectionIndex = sectionsPerBand - 1
@@ -93,6 +93,9 @@ final class VanillaPlacedFeatureGenerator {
         Registry<PlacedFeature> registry = world.getRegistryManager()
                 .getOrThrow(RegistryKeys.PLACED_FEATURE);
         long bandSeed = world.getSeed() ^ repeatedBand * 0xD1B54A32D192ED03L;
+        StructureWorldAccess sharedAccess = boundaryMode == BoundaryMode.TRANSLATED
+                ? translatedAccess(world, cube, virtualMinY, offsetY, boundaryMode)
+                : null;
 
         // Vanilla decorates a chunk region and permits features to spill into
         // neighbouring chunks. Sparse cubes have no writable ChunkRegion, so
@@ -106,8 +109,9 @@ final class VanillaPlacedFeatureGenerator {
                 int originZ = chunkZ * CubePos.SIZE;
                 List<FeatureCall> features = collectFeatures(
                         world, originX, originZ, virtualMinY, generator, steps);
-                StructureWorldAccess access = translatedAccess(
-                        world, cube, virtualMinY, offsetY, legacyBoundaryReads);
+                StructureWorldAccess access = sharedAccess != null
+                        ? sharedAccess
+                        : translatedAccess(world, cube, virtualMinY, offsetY, boundaryMode);
                 ChunkRandom random = new ChunkRandom(new Xoroshiro128PlusPlusRandom(
                         world.getSeed() ^ repeatedBand * 0x9E3779B97F4A7C15L));
                 long populationSeed = random.setPopulationSeed(
@@ -161,62 +165,72 @@ final class VanillaPlacedFeatureGenerator {
 
     private static StructureWorldAccess translatedAccess(
             ServerWorld world, LoadedCube cube, int virtualMinY, int offsetY,
-            boolean legacyBoundaryReads) {
+            BoundaryMode boundaryMode) {
         BlockBox virtualCube = new BlockBox(
                 cube.pos().minBlockX(), virtualMinY, cube.pos().minBlockZ(),
                 cube.pos().minBlockX() + CubePos.SIZE - 1,
                 virtualMinY + CubePos.SIZE - 1,
                 cube.pos().minBlockZ() + CubePos.SIZE - 1);
         Map<Long, Chunk> featureChunks = new HashMap<>();
+        Map<BlockPos, BlockState> clippedBlockStates = new HashMap<>();
         Map<BlockPos, BlockEntity> clippedBlockEntities = new HashMap<>();
         return (StructureWorldAccess) Proxy.newProxyInstance(
                 VanillaPlacedFeatureGenerator.class.getClassLoader(),
                 new Class<?>[] {StructureWorldAccess.class},
                 (proxy, method, arguments) -> invoke(
                         proxy, world, cube, virtualCube, virtualMinY, offsetY,
-                        legacyBoundaryReads, featureChunks, clippedBlockEntities,
+                        boundaryMode, featureChunks, clippedBlockStates,
+                        clippedBlockEntities,
                         method, arguments));
     }
 
     @SuppressWarnings("unchecked")
     private static Object invoke(
             Object proxy, ServerWorld world, LoadedCube cube, BlockBox virtualCube,
-            int virtualMinY, int offsetY, boolean legacyBoundaryReads,
-            Map<Long, Chunk> featureChunks, Map<BlockPos, BlockEntity> clippedBlockEntities,
+            int virtualMinY, int offsetY, BoundaryMode boundaryMode,
+            Map<Long, Chunk> featureChunks, Map<BlockPos, BlockState> clippedBlockStates,
+            Map<BlockPos, BlockEntity> clippedBlockEntities,
             Method method, Object[] arguments) throws Throwable {
         String name = method.getName();
-        if (!legacyBoundaryReads && "getChunk".equals(name)
+        if (boundaryMode != BoundaryMode.VERSION_12 && "getChunk".equals(name)
                 && arguments != null && arguments.length >= 1
                 && arguments[0] instanceof BlockPos pos) {
             int chunkX = Math.floorDiv(pos.getX(), CubePos.SIZE);
             int chunkZ = Math.floorDiv(pos.getZ(), CubePos.SIZE);
             long key = ((long) chunkX << 32) ^ (chunkZ & 0xFFFFFFFFL);
             return featureChunks.computeIfAbsent(key, ignored ->
-                    createFeatureChunk(world, cube, virtualMinY, chunkX, chunkZ));
+                    createFeatureChunk(world, cube, virtualCube, virtualMinY, offsetY,
+                            boundaryMode, clippedBlockStates, chunkX, chunkZ));
         }
-        if (!legacyBoundaryReads && ("getChunk".equals(name) || "getChunkAsView".equals(name))
+        if (boundaryMode != BoundaryMode.VERSION_12
+                && ("getChunk".equals(name) || "getChunkAsView".equals(name))
                 && arguments != null && arguments.length >= 2
                 && arguments[0] instanceof Integer chunkX
                 && arguments[1] instanceof Integer chunkZ) {
             long key = ((long) chunkX << 32) ^ (chunkZ & 0xFFFFFFFFL);
             return featureChunks.computeIfAbsent(key, ignored ->
-                    createFeatureChunk(world, cube, virtualMinY, chunkX, chunkZ));
+                    createFeatureChunk(world, cube, virtualCube, virtualMinY, offsetY,
+                            boundaryMode, clippedBlockStates, chunkX, chunkZ));
         }
-        if (!legacyBoundaryReads && "getTopY".equals(name)
+        if (boundaryMode != BoundaryMode.VERSION_12 && "getTopY".equals(name)
                 && arguments != null && arguments.length == 3
                 && arguments[1] instanceof Integer x && arguments[2] instanceof Integer z) {
-            return getVirtualTopY(world, cube, virtualCube, x, z);
+            return getVirtualTopY(world, cube, virtualCube, offsetY,
+                    boundaryMode, clippedBlockStates, x, z);
         }
-        if (!legacyBoundaryReads && "getTopY".equals(name)
+        if (boundaryMode != BoundaryMode.VERSION_12 && "getTopY".equals(name)
                 && arguments != null && arguments.length == 2
                 && arguments[1] instanceof BlockPos pos) {
-            return getVirtualTopY(world, cube, virtualCube, pos.getX(), pos.getZ());
+            return getVirtualTopY(world, cube, virtualCube, offsetY,
+                    boundaryMode, clippedBlockStates, pos.getX(), pos.getZ());
         }
-        if (!legacyBoundaryReads && "getTopPosition".equals(name)
+        if (boundaryMode != BoundaryMode.VERSION_12 && "getTopPosition".equals(name)
                 && arguments != null && arguments.length == 2
                 && arguments[1] instanceof BlockPos pos) {
             return new BlockPos(pos.getX(),
-                    getVirtualTopY(world, cube, virtualCube, pos.getX(), pos.getZ()), pos.getZ());
+                    getVirtualTopY(world, cube, virtualCube, offsetY,
+                            boundaryMode, clippedBlockStates, pos.getX(), pos.getZ()),
+                    pos.getZ());
         }
         BlockPos virtualPos = firstPos(arguments);
         if ("setBlockState".equals(name) && virtualPos != null
@@ -231,6 +245,21 @@ final class VanillaPlacedFeatureGenerator {
                 // DungeonFeature immediately fetch and configure the block
                 // entity they just placed, and returning false/null otherwise
                 // emits an error for every replay.
+                if (boundaryMode == BoundaryMode.TRANSLATED) {
+                    BlockPos stablePos = virtualPos.toImmutable();
+                    BlockState previous = featureBlockState(
+                            world, cube, virtualCube, offsetY, BoundaryMode.TRANSLATED,
+                            clippedBlockStates, stablePos);
+                    clippedBlockStates.put(stablePos, state);
+                    updateFeatureChunk(featureChunks, stablePos, state);
+                    if (state.hasBlockEntity() && state.getBlock() instanceof BlockEntityProvider provider) {
+                        BlockEntity blockEntity = provider.createBlockEntity(stablePos, state);
+                        if (blockEntity != null) clippedBlockEntities.put(stablePos, blockEntity);
+                    } else {
+                        clippedBlockEntities.remove(stablePos);
+                    }
+                    return !previous.equals(state);
+                }
                 if (state.hasBlockEntity() && state.getBlock() instanceof BlockEntityProvider provider) {
                     BlockPos stablePos = virtualPos.toImmutable();
                     BlockEntity blockEntity = provider.createBlockEntity(stablePos, state);
@@ -260,22 +289,12 @@ final class VanillaPlacedFeatureGenerator {
             return !previous.equals(state);
         }
         if ("getBlockState".equals(name) && virtualPos != null) {
-            if (virtualCube.contains(virtualPos)) {
-                return cube.getBlockState(translate(virtualPos, offsetY));
-            }
-            if (isInVanillaHeight(virtualPos)) {
-                return world.getBlockState(virtualPos);
-            }
-            return Blocks.AIR.getDefaultState();
+            return featureBlockState(world, cube, virtualCube, offsetY,
+                    boundaryMode, clippedBlockStates, virtualPos);
         }
         if ("getFluidState".equals(name) && virtualPos != null) {
-            if (virtualCube.contains(virtualPos)) {
-                return cube.getFluidState(translate(virtualPos, offsetY));
-            }
-            if (isInVanillaHeight(virtualPos)) {
-                return world.getFluidState(virtualPos);
-            }
-            return Fluids.EMPTY.getDefaultState();
+            return featureFluidState(world, cube, virtualCube, offsetY,
+                    boundaryMode, clippedBlockStates, virtualPos);
         }
         if ("getBlockEntity".equals(name) && virtualPos != null && virtualCube.contains(virtualPos)) {
             BlockEntity blockEntity = cube.getBlockEntity(translate(virtualPos, offsetY));
@@ -296,38 +315,42 @@ final class VanillaPlacedFeatureGenerator {
                 return clipped;
             }
             if (isInVanillaHeight(virtualPos)) {
+                BlockPos lookupPos = boundaryMode == BoundaryMode.TRANSLATED
+                        ? translate(virtualPos, offsetY) : virtualPos;
                 if (arguments.length == 2) {
-                    BlockEntity blockEntity = world.getBlockEntity(virtualPos);
+                    BlockEntity blockEntity = world.getBlockEntity(lookupPos);
                     return blockEntity != null
                             && arguments[1] instanceof net.minecraft.block.entity.BlockEntityType<?> type
                             && blockEntity.getType() == type
                             ? Optional.of(blockEntity) : Optional.empty();
                 }
-                return world.getBlockEntity(virtualPos);
+                return world.getBlockEntity(lookupPos);
             }
             return arguments.length == 2 ? Optional.empty() : null;
         }
         if ("testBlockState".equals(name) && virtualPos != null
                 && arguments[1] instanceof Predicate<?> predicate) {
-            BlockState state = virtualCube.contains(virtualPos)
-                    ? cube.getBlockState(translate(virtualPos, offsetY))
-                    : isInVanillaHeight(virtualPos)
-                            ? world.getBlockState(virtualPos)
-                            : Blocks.AIR.getDefaultState();
+            BlockState state = featureBlockState(world, cube, virtualCube, offsetY,
+                    boundaryMode, clippedBlockStates, virtualPos);
             return ((Predicate<BlockState>) predicate).test(state);
         }
         if ("testFluidState".equals(name) && virtualPos != null
                 && arguments[1] instanceof Predicate<?> predicate) {
-            FluidState state = virtualCube.contains(virtualPos)
-                    ? cube.getFluidState(translate(virtualPos, offsetY))
-                    : isInVanillaHeight(virtualPos)
-                            ? world.getFluidState(virtualPos)
-                            : Fluids.EMPTY.getDefaultState();
+            FluidState state = featureFluidState(world, cube, virtualCube, offsetY,
+                    boundaryMode, clippedBlockStates, virtualPos);
             return ((Predicate<FluidState>) predicate).test(state);
         }
         if (("removeBlock".equals(name) || "breakBlock".equals(name)) && virtualPos != null) {
             if (!virtualCube.contains(virtualPos)) {
-                return false;
+                if (boundaryMode != BoundaryMode.TRANSLATED) return false;
+                BlockPos stablePos = virtualPos.toImmutable();
+                BlockState previous = featureBlockState(
+                        world, cube, virtualCube, offsetY, BoundaryMode.TRANSLATED,
+                        clippedBlockStates, stablePos);
+                clippedBlockStates.put(stablePos, Blocks.AIR.getDefaultState());
+                clippedBlockEntities.remove(stablePos);
+                updateFeatureChunk(featureChunks, stablePos, Blocks.AIR.getDefaultState());
+                return !previous.isAir();
             }
             BlockPos actualPos = translate(virtualPos, offsetY);
             cube.removeBlockEntity(actualPos);
@@ -416,7 +439,9 @@ final class VanillaPlacedFeatureGenerator {
     }
 
     private static Chunk createFeatureChunk(
-            ServerWorld world, LoadedCube cube, int virtualMinY,
+            ServerWorld world, LoadedCube cube, BlockBox virtualCube,
+            int virtualMinY, int offsetY, BoundaryMode boundaryMode,
+            Map<BlockPos, BlockState> clippedBlockStates,
             int chunkX, int chunkZ) {
         HeightLimitView height = HeightLimitView.create(VANILLA_BOTTOM_Y, VANILLA_HEIGHT);
         ProtoChunk chunk = new ProtoChunk(
@@ -425,8 +450,70 @@ final class VanillaPlacedFeatureGenerator {
         if (chunkX == cube.pos().x() && chunkZ == cube.pos().z()) {
             int sectionIndex = Math.floorDiv(virtualMinY - VANILLA_BOTTOM_Y, CubePos.SIZE);
             chunk.getSectionArray()[sectionIndex] = cube.section();
+        } else if (boundaryMode == BoundaryMode.TRANSLATED) {
+            int sectionIndex = Math.floorDiv(virtualMinY - VANILLA_BOTTOM_Y, CubePos.SIZE);
+            net.minecraft.world.chunk.ChunkSection section = chunk.getSectionArray()[sectionIndex];
+            BlockPos.Mutable mutable = new BlockPos.Mutable();
+            for (int localY = 0; localY < CubePos.SIZE; localY++) {
+                for (int localZ = 0; localZ < CubePos.SIZE; localZ++) {
+                    for (int localX = 0; localX < CubePos.SIZE; localX++) {
+                        mutable.set(chunkX * CubePos.SIZE + localX, virtualMinY + localY,
+                                chunkZ * CubePos.SIZE + localZ);
+                        section.setBlockState(localX, localY, localZ,
+                                featureBlockState(world, cube, virtualCube, offsetY,
+                                        BoundaryMode.TRANSLATED, clippedBlockStates, mutable));
+                    }
+                }
+            }
         }
         return chunk;
+    }
+
+    private static void updateFeatureChunk(
+            Map<Long, Chunk> featureChunks, BlockPos pos, BlockState state) {
+        int chunkX = Math.floorDiv(pos.getX(), CubePos.SIZE);
+        int chunkZ = Math.floorDiv(pos.getZ(), CubePos.SIZE);
+        long key = ((long) chunkX << 32) ^ (chunkZ & 0xFFFFFFFFL);
+        Chunk chunk = featureChunks.get(key);
+        if (chunk == null || !isInVanillaHeight(pos)) return;
+        int sectionIndex = Math.floorDiv(pos.getY() - VANILLA_BOTTOM_Y, CubePos.SIZE);
+        if (sectionIndex < 0 || sectionIndex >= chunk.getSectionArray().length) return;
+        chunk.getSectionArray()[sectionIndex].setBlockState(
+                Math.floorMod(pos.getX(), CubePos.SIZE),
+                Math.floorMod(pos.getY() - VANILLA_BOTTOM_Y, CubePos.SIZE),
+                Math.floorMod(pos.getZ(), CubePos.SIZE), state);
+    }
+
+    private static BlockState featureBlockState(
+            ServerWorld world, LoadedCube cube, BlockBox virtualCube, int offsetY,
+            BoundaryMode boundaryMode, Map<BlockPos, BlockState> clippedBlockStates,
+            BlockPos virtualPos) {
+        if (virtualCube.contains(virtualPos)) {
+            return cube.getBlockState(translate(virtualPos, offsetY));
+        }
+        if (boundaryMode == BoundaryMode.TRANSLATED) {
+            BlockState clipped = clippedBlockStates.get(virtualPos);
+            return clipped != null
+                    ? clipped : world.getBlockState(translate(virtualPos, offsetY));
+        }
+        return isInVanillaHeight(virtualPos)
+                ? world.getBlockState(virtualPos) : Blocks.AIR.getDefaultState();
+    }
+
+    private static FluidState featureFluidState(
+            ServerWorld world, LoadedCube cube, BlockBox virtualCube, int offsetY,
+            BoundaryMode boundaryMode, Map<BlockPos, BlockState> clippedBlockStates,
+            BlockPos virtualPos) {
+        if (virtualCube.contains(virtualPos)) {
+            return cube.getFluidState(translate(virtualPos, offsetY));
+        }
+        if (boundaryMode == BoundaryMode.TRANSLATED) {
+            BlockState clipped = clippedBlockStates.get(virtualPos);
+            return clipped != null
+                    ? clipped.getFluidState() : world.getFluidState(translate(virtualPos, offsetY));
+        }
+        return isInVanillaHeight(virtualPos)
+                ? world.getFluidState(virtualPos) : Fluids.EMPTY.getDefaultState();
     }
 
     private static BlockPos translate(BlockPos pos, int offsetY) {
@@ -435,13 +522,16 @@ final class VanillaPlacedFeatureGenerator {
 
     private static int getVirtualTopY(
             ServerWorld world, LoadedCube cube, BlockBox virtualCube,
+            int offsetY, BoundaryMode boundaryMode,
+            Map<BlockPos, BlockState> clippedBlockStates,
             int blockX, int blockZ) {
         if (blockX < virtualCube.getMinX() || blockX > virtualCube.getMaxX()
                 || blockZ < virtualCube.getMinZ() || blockZ > virtualCube.getMaxZ()) {
             BlockPos.Mutable mutable = new BlockPos.Mutable();
             for (int y = virtualCube.getMaxY(); y >= virtualCube.getMinY(); y--) {
                 mutable.set(blockX, y, blockZ);
-                if (!world.getBlockState(mutable).isAir()) {
+                if (!featureBlockState(world, cube, virtualCube, offsetY,
+                        boundaryMode, clippedBlockStates, mutable).isAir()) {
                     return y + 1;
                 }
             }
@@ -463,5 +553,10 @@ final class VanillaPlacedFeatureGenerator {
     }
 
     private record FeatureCall(GenerationStep.Feature step, int index, PlacedFeature feature) {
+    }
+
+    private enum BoundaryMode {
+        VERSION_12,
+        TRANSLATED
     }
 }

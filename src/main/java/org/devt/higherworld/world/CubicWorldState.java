@@ -119,7 +119,7 @@ final class CubicWorldState implements AutoCloseable {
     }
 
     BlockEntity getBlockEntity(BlockPos pos) throws IOException {
-        return cube(pos).getBlockEntity(pos);
+        return cubeForRead(pos).getBlockEntity(pos);
     }
 
     void putBlockEntity(BlockEntity blockEntity) throws IOException {
@@ -132,7 +132,11 @@ final class CubicWorldState implements AutoCloseable {
     }
 
     void markDirty(BlockPos pos) throws IOException {
-        cube(pos).markDirty();
+        // Block entities created by placed features (notably dungeon spawners)
+        // call World#markDirty while FEATURES is still being committed.  Do not
+        // advance a neighbouring cube to FULL from that callback, or feature
+        // generation recursively starts again through the LIGHT dependencies.
+        cubeForRead(pos).markDirty();
     }
 
     LoadedCube cube(BlockPos blockPos) throws IOException {
@@ -602,10 +606,23 @@ final class CubicWorldState implements AutoCloseable {
                         context.cube.light().load(decoded.light());
                         context.hasSavedLight = true;
                     }
-                    if (!customWorld && shouldGenerate(pos)
-                            && InfiniteDownwardGenerator.upgradeLegacyTerrain(
+                    if (!customWorld && shouldGenerate(pos)) {
+                        // A legacy upgrade may deterministically replay placed
+                        // features. Route any neighbour reads through TERRAIN
+                        // while this holder is still committing its own terrain;
+                        // asking for FULL here recursively re-enters generation.
+                        boolean alreadyCommittingFeatures = committingFeatures.get();
+                        committingFeatures.set(true);
+                        try {
+                            if (InfiniteDownwardGenerator.upgradeLegacyTerrain(
                                     world, context.cube, effectiveStructureSettings())) {
-                        Higherworld.LOGGER.debug("Upgraded untouched generated terrain cube {}", pos);
+                                Higherworld.LOGGER.debug(
+                                        "Upgraded generated terrain cube {}", pos);
+                            }
+                        } finally {
+                            if (alreadyCommittingFeatures) committingFeatures.set(true);
+                            else committingFeatures.remove();
+                        }
                     }
                 } finally {
                     context.committing = false;

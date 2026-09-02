@@ -29,7 +29,7 @@ public final class CubeWatchManager {
     // cannot multiply the amount of synchronous cube work in a single tick.
     private static final int CUBE_WORK_PER_WORLD_TICK = 1;
     private static final int POLL_ATTEMPTS_PER_PLAYER_TICK = 2;
-    private static final int READ_AHEAD_PER_TICK = 8;
+    private static final int READ_AHEAD_PER_WORLD_TICK = 2;
     private static final Map<UUID, WatchState> WATCHERS = new HashMap<>();
     private static final Map<ServerWorld, AdaptiveBudget> BUDGETS = new HashMap<>();
 
@@ -42,6 +42,7 @@ public final class CubeWatchManager {
         Set<UUID> present = new HashSet<>();
         boolean watcherTicketsChanged = false;
         CubeWorkBudget workBudget = new CubeWorkBudget(adaptive.cubeAllowance());
+        CubeWorkBudget readAheadBudget = new CubeWorkBudget(READ_AHEAD_PER_WORLD_TICK);
         List<ServerPlayerEntity> players = world.getPlayers();
         int playerCount = players.size();
         int firstPlayer = playerCount == 0 ? 0 : Math.floorMod(world.getTime(), playerCount);
@@ -49,7 +50,7 @@ public final class CubeWatchManager {
             ServerPlayerEntity player = players.get((firstPlayer + index) % playerCount);
             present.add(player.getUuid());
             WatchState state = WATCHERS.computeIfAbsent(player.getUuid(), ignored -> new WatchState());
-            watcherTicketsChanged |= update(player, state, workBudget);
+            watcherTicketsChanged |= update(player, state, workBudget, readAheadBudget);
         }
         Iterator<Map.Entry<UUID, WatchState>> watchers = WATCHERS.entrySet().iterator();
         while (watchers.hasNext()) {
@@ -185,7 +186,8 @@ public final class CubeWatchManager {
     }
 
     private static boolean update(
-            ServerPlayerEntity player, WatchState state, CubeWorkBudget workBudget) {
+            ServerPlayerEntity player, WatchState state, CubeWorkBudget workBudget,
+            CubeWorkBudget readAheadBudget) {
         ServerWorld world = player.getEntityWorld();
         CubePos center = CubePos.fromBlock(
                 player.getBlockX(), player.getBlockY(), player.getBlockZ());
@@ -197,15 +199,12 @@ public final class CubeWatchManager {
             rebuilt = true;
         }
 
-        int prefetched = 0;
         for (CubePos pos : state.pending) {
-            if (prefetched >= READ_AHEAD_PER_TICK) {
-                break;
-            }
+            if (!readAheadBudget.hasRemaining()) break;
             if (withinView(pos, state.center, state.horizontalRadius)
                     && isOutsideVanillaHeight(world, pos) && !state.sent.contains(pos)) {
                 CubicWorldManager.prefetchCubePayload(world, pos, cubePriority(pos, state.center));
-                prefetched++;
+                readAheadBudget.consume();
             }
         }
 
