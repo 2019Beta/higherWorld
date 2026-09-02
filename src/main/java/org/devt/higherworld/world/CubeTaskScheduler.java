@@ -112,6 +112,11 @@ final class CubeTaskScheduler implements AutoCloseable {
         return holders.computeIfAbsent(pos, CubeHolder::new);
     }
 
+    /** Package-private inspection hook used by lifecycle tests. */
+    int holderCount() {
+        return holders.size();
+    }
+
     CubeHolder adoptLoaded(LoadedCube cube) {
         CubeHolder holder = holders.computeIfAbsent(cube.pos(), CubeHolder::new);
         holder.request(CubeStatus.FULL);
@@ -291,9 +296,8 @@ final class CubeTaskScheduler implements AutoCloseable {
 
     private void refreshTargets() {
         Map<CubePos, CubeStatus> required = new HashMap<>();
-        Set<StageRequest> visited = new HashSet<>();
-        for (CubePos pos : tickets.activePositions()) {
-            collectRequired(pos, tickets.targetStatus(pos), required, visited);
+        for (CubeTicket ticket : tickets.activeTickets()) {
+            collectRequired(ticket.center(), ticket.radius(), ticket.targetStatus(), required);
         }
 
         // Publish the closure before lowering/cancelling holders.  The world
@@ -301,40 +305,63 @@ final class CubeTaskScheduler implements AutoCloseable {
         // with asynchronous IO completion.
         requiredPositions = Set.copyOf(required.keySet());
 
-        // Tickets describe demand only. Actual IO starts from the watcher's
-        // bounded read-ahead request, which then expands just that cube's DAG.
-        required.forEach((pos, target) ->
-                holders.computeIfAbsent(pos, CubeHolder::new).request(target));
+        // Tickets describe demand, but do not themselves start work for every
+        // cube in the (potentially very large) closure.  Only holders already
+        // participating in an IO/generation request are retained.  The
+        // watcher's bounded prefetch or an explicit request() materializes a
+        // new DAG node and chooses its target status.
         io.retainPrefetches(required.keySet());
         holders.forEach((pos, holder) -> {
             CubeStatus target = required.get(pos);
             if (target == null) {
                 holder.cancel();
                 holders.remove(pos, holder);
-            } else {
+            } else if (target.ordinal() < holder.target().ordinal()) {
                 holder.lowerTarget(target);
             }
         });
     }
 
+    /**
+     * Adds one ticket and all of its transitive neighbour requirements by
+     * expanding the ticket cuboid.  Dependency status always decreases, so
+     * this visits at most the small status DAG once per edge rather than
+     * recursively starting from every active cube position.
+     */
     private static void collectRequired(
-            CubePos pos, CubeStatus target, Map<CubePos, CubeStatus> required,
-            Set<StageRequest> visited) {
-        required.merge(pos, target, CubeTaskScheduler::maximum);
-        StageRequest request = new StageRequest(pos, target);
-        if (!visited.add(request)) return;
+            CubePos center, CubeDependencyRadius radius, CubeStatus target,
+            Map<CubePos, CubeStatus> required) {
+        mergeAll(required, center, radius, target);
         for (CubeStatus stage : CubeStatus.values()) {
             if (stage.ordinal() > target.ordinal()) break;
             CubeStatus neighbour = stage.neighbourPrerequisite();
             if (neighbour == null) continue;
-            stage.dependencyRadius().forEach(pos, dependency ->
-                    collectRequired(dependency, neighbour, required, visited));
+
+            CubeDependencyRadius expanded = expanded(radius, stage.dependencyRadius());
+            collectRequired(center, expanded, neighbour, required);
         }
+    }
+
+    private static CubeDependencyRadius expanded(
+            CubeDependencyRadius first, CubeDependencyRadius second) {
+        return new CubeDependencyRadius(
+                Math.addExact(first.x(), second.x()),
+                Math.addExact(first.y(), second.y()),
+                Math.addExact(first.z(), second.z()));
+    }
+
+    private static void mergeAll(
+            Map<CubePos, CubeStatus> required, CubePos center,
+            CubeDependencyRadius radius, CubeStatus target) {
+        radius.forEach(center,
+                pos -> required.merge(pos, target, CubeTaskScheduler::maximum));
     }
 
     private static CubeStatus maximum(CubeStatus first, CubeStatus second) {
         return first.ordinal() >= second.ordinal() ? first : second;
     }
+
+    private record StageRequest(CubePos pos, CubeStatus status) {}
 
     @Override
     public void close() {
@@ -344,14 +371,12 @@ final class CubeTaskScheduler implements AutoCloseable {
         requiredPositions = Set.of();
     }
 
-    private record StageRequest(CubePos pos, CubeStatus status) {}
-
     private record ReadyCandidate(CubeHolder holder, int priority, int statusOrdinal) {}
 
     private static int compareReady(ReadyCandidate first, ReadyCandidate second) {
-        int byPriority = Integer.compare(first.priority(), second.priority());
-        return byPriority != 0
-                ? byPriority : Integer.compare(first.statusOrdinal(), second.statusOrdinal());
+        int byStatus = Integer.compare(first.statusOrdinal(), second.statusOrdinal());
+        return byStatus != 0
+                ? byStatus : Integer.compare(first.priority(), second.priority());
     }
 
     private record GenerationTask(int priority, long sequence, Runnable action)

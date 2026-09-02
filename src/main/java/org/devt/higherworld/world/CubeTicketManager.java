@@ -2,75 +2,81 @@ package org.devt.higherworld.world;
 
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.Comparator;
 import org.devt.higherworld.storage.CubePos;
 
-/** Maintains reference-counted 3D tickets without rebuilding unrelated owners. */
+/** Maintains replaceable 3D tickets without pre-expanding their covered volumes. */
 final class CubeTicketManager {
-    private final Map<Object, TicketPlacement> tickets = new HashMap<>();
-    private final Map<CubePos, Map<Object, CubeTicket>> byCube = new HashMap<>();
+    /**
+     * Tickets are keyed by owner only.  Expanding every ticket into a reverse
+     * index made moving a large view distance allocate and mutate thousands of
+     * map entries on every replacement.  Position queries are infrequent and
+     * can scan this small set while holding the monitor.
+     */
+    private final Map<Object, CubeTicket> tickets = new HashMap<>();
 
-    synchronized Set<CubePos> replace(CubeTicket ticket) {
-        Set<CubePos> changed = removeInternal(ticket.key());
-        Set<CubePos> positions = positions(ticket);
-        tickets.put(ticket.key(), new TicketPlacement(ticket, positions));
-        for (CubePos pos : positions) {
-            byCube.computeIfAbsent(pos, ignored -> new HashMap<>()).put(ticket.key(), ticket);
-        }
-        changed.addAll(positions);
-        return Set.copyOf(changed);
+    synchronized void replace(CubeTicket ticket) {
+        tickets.put(ticket.key(), ticket);
     }
 
-    synchronized Set<CubePos> remove(Object key) {
-        return Set.copyOf(removeInternal(key));
+    synchronized void remove(Object key) {
+        tickets.remove(key);
     }
 
     synchronized Set<CubePos> activePositions() {
-        return Set.copyOf(byCube.keySet());
+        Set<CubePos> positions = new HashSet<>();
+        for (CubeTicket ticket : tickets.values()) {
+            ticket.radius().forEach(ticket.center(), positions::add);
+        }
+        return Set.copyOf(positions);
+    }
+
+    /**
+     * Returns a stable snapshot of the ticket roots.  The scheduler uses the
+     * roots to derive the required dependency closure without iterating every
+     * position in every ticket and recursively walking the same graph again.
+     */
+    synchronized List<CubeTicket> activeTickets() {
+        return List.copyOf(tickets.values());
     }
 
     synchronized int priority(CubePos pos) {
-        Map<Object, CubeTicket> owners = byCube.get(pos);
-        if (owners == null || owners.isEmpty()) return Integer.MAX_VALUE;
         int best = Integer.MAX_VALUE;
-        for (CubeTicket ticket : owners.values()) {
-            best = Math.min(best, positionalPriority(ticket, pos));
+        for (CubeTicket ticket : tickets.values()) {
+            if (contains(ticket, pos)) {
+                best = Math.min(best, positionalPriority(ticket, pos));
+            }
         }
         return best;
     }
 
     synchronized CubeStatus targetStatus(CubePos pos) {
-        Map<Object, CubeTicket> owners = byCube.get(pos);
-        return owners == null ? CubeStatus.EMPTY : owners.values().stream()
-                .map(CubeTicket::targetStatus)
-                .max(Comparator.naturalOrder())
-                .orElse(CubeStatus.EMPTY);
+        CubeStatus best = CubeStatus.EMPTY;
+        for (CubeTicket ticket : tickets.values()) {
+            if (contains(ticket, pos) && ticket.targetStatus().ordinal() > best.ordinal()) {
+                best = ticket.targetStatus();
+            }
+        }
+        return best;
     }
 
     synchronized boolean isActive(CubePos pos) {
-        return byCube.containsKey(pos);
-    }
-
-    private Set<CubePos> removeInternal(Object key) {
-        TicketPlacement previous = tickets.remove(key);
-        if (previous == null) return new HashSet<>();
-        Set<CubePos> changed = new HashSet<>(previous.positions());
-        for (CubePos pos : previous.positions()) {
-            Map<Object, CubeTicket> owners = byCube.get(pos);
-            if (owners != null) {
-                owners.remove(key);
-                if (owners.isEmpty()) byCube.remove(pos);
+        for (CubeTicket ticket : tickets.values()) {
+            if (contains(ticket, pos)) {
+                return true;
             }
         }
-        return changed;
+        return false;
     }
 
-    private static Set<CubePos> positions(CubeTicket ticket) {
-        Set<CubePos> positions = new HashSet<>(ticket.radius().volume());
-        ticket.radius().forEach(ticket.center(), positions::add);
-        return positions;
+    private static boolean contains(CubeTicket ticket, CubePos pos) {
+        CubePos center = ticket.center();
+        CubeDependencyRadius radius = ticket.radius();
+        return Math.abs((long) pos.x() - center.x()) <= radius.x()
+                && Math.abs((long) pos.y() - center.y()) <= radius.y()
+                && Math.abs((long) pos.z() - center.z()) <= radius.z();
     }
 
     private static int positionalPriority(CubeTicket ticket, CubePos pos) {
@@ -83,5 +89,4 @@ final class CubeTicketManager {
                 Math.max(0L, (long) ticket.effectivePriority() + distance));
     }
 
-    private record TicketPlacement(CubeTicket ticket, Set<CubePos> positions) {}
 }

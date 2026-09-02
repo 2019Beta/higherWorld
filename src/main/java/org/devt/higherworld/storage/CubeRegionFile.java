@@ -31,12 +31,14 @@ final class CubeRegionFile implements Closeable {
     private final int[] compressedLengths = new int[SLOT_COUNT];
     private final int[] uncompressedLengths = new int[SLOT_COUNT];
     private final int[] checksums = new int[SLOT_COUNT];
+    private boolean dirty;
 
     CubeRegionFile(Path path, RegionPos pos) throws IOException {
         Files.createDirectories(path.getParent());
         this.file = new RandomAccessFile(path.toFile(), "rw");
         if (file.length() == 0) {
             writeHeader(pos);
+            dirty = true;
         } else {
             readHeader(pos);
         }
@@ -63,14 +65,19 @@ final class CubeRegionFile implements Closeable {
 
     synchronized void write(int slot, byte[] payload) throws IOException {
         append(slot, payload);
-        file.getFD().sync();
     }
 
     synchronized void writeBatch(Map<Integer, byte[]> payloads) throws IOException {
         for (Map.Entry<Integer, byte[]> entry : payloads.entrySet()) {
             append(entry.getKey(), entry.getValue());
         }
-        if (!payloads.isEmpty()) file.getFD().sync();
+    }
+
+    /** Flushes appended records to durable storage when the caller reaches a save barrier. */
+    synchronized void sync() throws IOException {
+        if (!dirty) return;
+        file.getFD().sync();
+        dirty = false;
     }
 
     private void append(int slot, byte[] payload) throws IOException {
@@ -99,6 +106,7 @@ final class CubeRegionFile implements Closeable {
         compressedLengths[slot] = compressed.length;
         uncompressedLengths[slot] = payload.length;
         checksums[slot] = (int) crc.getValue();
+        dirty = true;
     }
 
     private void writeHeader(RegionPos pos) throws IOException {
@@ -145,6 +153,7 @@ final class CubeRegionFile implements Closeable {
                 if (next > file.length()) {
                     // Remove an interrupted append so later records stay discoverable on reopen.
                     file.setLength(cursor);
+                    dirty = true;
                     return;
                 }
                 offsets[slot] = payloadOffset;
@@ -154,6 +163,7 @@ final class CubeRegionFile implements Closeable {
                 cursor = next;
             } catch (EOFException ignored) {
                 file.setLength(cursor);
+                dirty = true;
                 return;
             }
         }
@@ -211,6 +221,23 @@ final class CubeRegionFile implements Closeable {
 
     @Override
     public synchronized void close() throws IOException {
-        file.close();
+        IOException failure = null;
+        try {
+            sync();
+        } catch (IOException exception) {
+            failure = exception;
+        }
+        try {
+            file.close();
+        } catch (IOException exception) {
+            if (failure == null) {
+                failure = exception;
+            } else {
+                failure.addSuppressed(exception);
+            }
+        }
+        if (failure != null) {
+            throw failure;
+        }
     }
 }

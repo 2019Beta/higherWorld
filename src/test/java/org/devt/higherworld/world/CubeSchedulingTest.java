@@ -56,6 +56,28 @@ class CubeSchedulingTest {
     }
 
     @Test
+    void ticketQueriesHonorAnisotropicRadiusAfterReplacement() {
+        CubeTicketManager manager = new CubeTicketManager();
+        CubePos center = new CubePos(100, -30, -100);
+        Object key = "moving-owner";
+        manager.replace(new CubeTicket(key, CubeTicketType.PLAYER, center,
+                new CubeDependencyRadius(2, 1, 3), CubeStatus.FULL, 0));
+
+        assertTrue(manager.isActive(new CubePos(102, -29, -97)));
+        assertEquals(CubeStatus.FULL, manager.targetStatus(new CubePos(102, -29, -97)));
+        assertFalse(manager.isActive(new CubePos(103, -29, -97)));
+        assertFalse(manager.isActive(new CubePos(102, -32, -97)));
+        assertFalse(manager.isActive(new CubePos(102, -29, -104)));
+
+        CubePos replacement = new CubePos(-12, 40, 7);
+        manager.replace(new CubeTicket(key, CubeTicketType.PORTAL, replacement,
+                CubeDependencyRadius.NONE, CubeStatus.TERRAIN, 0));
+        assertFalse(manager.isActive(center));
+        assertTrue(manager.isActive(replacement));
+        assertEquals(CubeStatus.TERRAIN, manager.targetStatus(replacement));
+    }
+
+    @Test
     void spatialLocksSerializeOverlappingCommitRegions() throws Exception {
         CubeSpatialLock locks = new CubeSpatialLock(64);
         CubePos center = new CubePos(4, -20, 9);

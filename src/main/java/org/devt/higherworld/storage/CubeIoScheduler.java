@@ -36,6 +36,8 @@ public final class CubeIoScheduler implements AutoCloseable {
     private final AtomicLong sequence = new AtomicLong();
     private final AtomicBoolean closed = new AtomicBoolean();
     private final AtomicReference<Throwable> writeFailure = new AtomicReference<>();
+    /** Serializes write submission with an explicit durability barrier. */
+    private final Object writeGate = new Object();
 
     public CubeIoScheduler(CubeStorage storage) {
         this(storage, DEFAULT_WORKERS);
@@ -124,47 +126,60 @@ public final class CubeIoScheduler implements AutoCloseable {
 
     /** Replaces an older queued payload for the same cube instead of writing it twice. */
     public CompletableFuture<Void> write(CubePos pos, byte[] payload) {
-        if (closed.get()) {
-            return CompletableFuture.failedFuture(new IOException("Cube IO scheduler is closed"));
-        }
-        negativeCache.remove(pos);
         byte[] immutablePayload = payload.clone();
-        while (true) {
-            PendingWrite current = writes.get(pos);
-            if (current != null) {
-                if (current.replace(immutablePayload)) {
-                    return current.completion;
-                }
-                Thread.onSpinWait();
-                continue;
+        synchronized (writeGate) {
+            if (closed.get()) {
+                return CompletableFuture.failedFuture(new IOException("Cube IO scheduler is closed"));
             }
-            PendingWrite candidate = new PendingWrite(pos, immutablePayload);
-            if (writes.putIfAbsent(pos, candidate) == null) {
-                submit(new WriteTask(candidate, sequence.getAndIncrement()));
-                return candidate.completion;
+            negativeCache.remove(pos);
+            while (true) {
+                PendingWrite current = writes.get(pos);
+                if (current != null) {
+                    if (current.replace(immutablePayload)) {
+                        return current.completion;
+                    }
+                    Thread.onSpinWait();
+                    continue;
+                }
+                PendingWrite candidate = new PendingWrite(pos, immutablePayload);
+                if (writes.putIfAbsent(pos, candidate) == null) {
+                    submit(new WriteTask(candidate, sequence.getAndIncrement()));
+                    return candidate.completion;
+                }
             }
         }
     }
 
     /** Waits until every write accepted before or during this call is durable. */
     public void flushWrites() throws IOException {
-        while (true) {
-            CompletableFuture<?>[] pending = writes.values().stream()
-                    .map(write -> write.completion)
-                    .toArray(CompletableFuture[]::new);
-            if (pending.length == 0) {
-                break;
+        synchronized (writeGate) {
+            while (true) {
+                CompletableFuture<?>[] pending = writes.values().stream()
+                        .map(write -> write.completion)
+                        .toArray(CompletableFuture[]::new);
+                if (pending.length == 0) {
+                    break;
+                }
+                try {
+                    CompletableFuture.allOf(pending).join();
+                } catch (CompletionException ignored) {
+                    // The original failure is retained below so concurrent failures
+                    // are not lost when a completed entry leaves the map.
+                }
             }
+            Throwable failure = writeFailure.getAndSet(null);
             try {
-                CompletableFuture.allOf(pending).join();
-            } catch (CompletionException ignored) {
-                // The original failure is retained below so concurrent failures
-                // are not lost when a completed entry leaves the map.
+                storage.sync();
+            } catch (IOException exception) {
+                if (failure == null) {
+                    failure = exception;
+                } else {
+                    failure.addSuppressed(exception);
+                }
             }
-        }
-        Throwable failure = writeFailure.getAndSet(null);
-        if (failure != null) {
-            throw asIOException("Cannot flush cube writes", failure);
+            if (failure != null) {
+                throw asIOException("Cannot flush cube writes", failure);
+            }
         }
     }
 

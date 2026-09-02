@@ -1,6 +1,8 @@
 package org.devt.higherworld.world;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Path;
@@ -34,6 +36,78 @@ class CubeTaskSchedulerLifecycleTest {
 
             assertFalse(scheduler.isRequired(center));
             assertFalse(scheduler.isRequired(new CubePos(center.x() + 1, center.y(), center.z())));
+        }
+    }
+
+    @Test
+    void largeTicketClosureDoesNotMaterializeHolders() {
+        CubePos center = new CubePos(12, -20, -7);
+        try (CubeStorage storage = new CubeStorage(directory);
+                CubeIoScheduler io = new CubeIoScheduler(storage);
+                CubeTaskScheduler scheduler = new CubeTaskScheduler(io)) {
+            scheduler.replaceTicket(new CubeTicket(
+                    "large", CubeTicketType.PLAYER, center,
+                    new CubeDependencyRadius(32, 4, 32), CubeStatus.FULL, 0));
+
+            assertEquals(0, scheduler.holderCount());
+        }
+    }
+
+    @Test
+    void fullTicketClosureExpandsToTwoDependencyCubes() {
+        CubePos center = new CubePos(12, -20, -7);
+        try (CubeStorage storage = new CubeStorage(directory);
+                CubeIoScheduler io = new CubeIoScheduler(storage);
+                CubeTaskScheduler scheduler = new CubeTaskScheduler(io)) {
+            scheduler.replaceTicket(new CubeTicket(
+                    "full", CubeTicketType.PLAYER, center,
+                    CubeDependencyRadius.NONE, CubeStatus.FULL, 0));
+
+            assertTrue(scheduler.isRequired(new CubePos(center.x() + 2, center.y(), center.z())));
+            assertFalse(scheduler.isRequired(new CubePos(center.x() + 3, center.y(), center.z())));
+        }
+    }
+
+    @Test
+    void explicitRequestMaterializesHolderAfterTicketRefresh() {
+        CubePos center = new CubePos(12, -20, -7);
+        try (CubeStorage storage = new CubeStorage(directory);
+                CubeIoScheduler io = new CubeIoScheduler(storage);
+                CubeTaskScheduler scheduler = new CubeTaskScheduler(io)) {
+            scheduler.replaceTicket(new CubeTicket(
+                    "explicit", CubeTicketType.PLAYER, center,
+                    new CubeDependencyRadius(32, 4, 32), CubeStatus.FULL, 0));
+            assertEquals(0, scheduler.holderCount());
+
+            scheduler.request(center, CubeStatus.FULL, 0);
+
+            assertTrue(scheduler.holderCount() > 0);
+        }
+    }
+
+    @Test
+    void readyCommitPrefersLowerStageBeforeTicketPriority() {
+        CubePos blockedHighPriorityPos = new CubePos(100, -20, 100);
+        CubePos lowPriorityTerrainPos = new CubePos(-100, -20, -100);
+        try (CubeStorage storage = new CubeStorage(directory);
+                CubeIoScheduler io = new CubeIoScheduler(storage);
+                CubeTaskScheduler scheduler = new CubeTaskScheduler(io)) {
+            scheduler.replaceTicket(new CubeTicket(
+                    "blocked-high", CubeTicketType.COLLISION, blockedHighPriorityPos,
+                    CubeDependencyRadius.NONE, CubeStatus.FULL, 0));
+            scheduler.replaceTicket(new CubeTicket(
+                    "terrain-low", CubeTicketType.FORCED, lowPriorityTerrainPos,
+                    CubeDependencyRadius.NONE, CubeStatus.TERRAIN, 100));
+
+            CubeHolder blockedHighPriority = scheduler.holder(blockedHighPriorityPos);
+            blockedHighPriority.request(CubeStatus.FULL);
+            blockedHighPriority.advance(CubeStatus.FEATURES);
+
+            CubeHolder lowPriorityTerrain = scheduler.holder(lowPriorityTerrainPos);
+            lowPriorityTerrain.request(CubeStatus.TERRAIN);
+            lowPriorityTerrain.advance(CubeStatus.IO_READY);
+
+            assertSame(lowPriorityTerrain, scheduler.readyForCommit(1).get(0));
         }
     }
 

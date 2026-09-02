@@ -34,7 +34,7 @@ public final class CubeStorage implements Closeable {
         }
     }
 
-    /** Appends a same-region write group and performs one durability sync. */
+    /** Appends a same-region write group; sync/close provides the durability barrier. */
     public void writeBatch(Map<CubePos, byte[]> payloads) throws IOException {
         if (payloads.isEmpty()) return;
         Iterator<CubePos> iterator = payloads.keySet().iterator();
@@ -103,6 +103,43 @@ public final class CubeStorage implements Closeable {
         }
     }
 
+    /** Flushes all currently open regions at an explicit durability barrier. */
+    void sync() throws IOException {
+        List<RegionHandle> toSync;
+        synchronized (regionCacheLock) {
+            ensureOpen();
+            toSync = List.copyOf(regions.values());
+            for (RegionHandle region : toSync) {
+                // Pin the handles while the cache lock is released.  This keeps
+                // eviction from closing a file before its sync, without holding
+                // regionCacheLock across a potentially blocking filesystem call.
+                region.users++;
+            }
+        }
+
+        IOException failure = null;
+        try {
+            for (RegionHandle region : toSync) {
+                try {
+                    region.file.sync();
+                } catch (IOException exception) {
+                    if (failure == null) {
+                        failure = exception;
+                    } else {
+                        failure.addSuppressed(exception);
+                    }
+                }
+            }
+        } finally {
+            for (RegionHandle region : toSync) {
+                release(region);
+            }
+        }
+        if (failure != null) {
+            throw failure;
+        }
+    }
+
     private RegionHandle acquire(RegionPos pos, boolean create) throws IOException {
         synchronized (regionCacheLock) {
             ensureOpen();
@@ -142,6 +179,7 @@ public final class CubeStorage implements Closeable {
             while (iterator.hasNext()) {
                 Map.Entry<RegionPos, RegionHandle> candidate = iterator.next();
                 if (candidate.getValue().users == 0) {
+                    candidate.getValue().file.sync();
                     iterator.remove();
                     candidate.getValue().file.close();
                     evicted = true;
