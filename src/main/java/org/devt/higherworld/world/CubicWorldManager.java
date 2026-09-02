@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CompletableFuture;
 import java.util.Set;
 
 import net.minecraft.block.BlockState;
@@ -208,12 +209,21 @@ public final class CubicWorldManager {
         return state != null && state.suppressingGenerationUpdates();
     }
 
-    /** Queues disk IO for a watched cube without touching live world state. */
-    public static void prefetchCubePayload(ServerWorld world, CubePos pos, int priority) {
+    /**
+     * Requests a watched cube's FULL lifecycle and returns when that lifecycle
+     * is ready.  The returned future is deliberately payload-free: callers
+     * only need a completion signal and should use {@link #tryCubePayload} when
+     * they actually need encoded data.
+     *
+     * <p>If this world has not been opened yet, there is no lifecycle to wait
+     * for, so the method returns an already completed future.</p>
+     */
+    public static CompletableFuture<Void> prefetchCubePayload(
+            ServerWorld world, CubePos pos, int priority) {
         CubicWorldState state = WORLDS.get(world);
-        if (state != null) {
-            state.prefetchCubePayload(pos, priority);
-        }
+        return state == null
+                ? CompletableFuture.completedFuture(null)
+                : state.prefetchCubePayload(pos, priority);
     }
 
     /** Drops queued read-ahead work after its last 3D watcher ticket disappears. */

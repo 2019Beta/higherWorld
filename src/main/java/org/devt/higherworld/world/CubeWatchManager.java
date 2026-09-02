@@ -1,6 +1,5 @@
 package org.devt.higherworld.world;
 
-import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -8,8 +7,11 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.RejectedExecutionException;
 
 import net.fabricmc.fabric.api.networking.v1.PlayerLookup;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
@@ -30,6 +32,8 @@ public final class CubeWatchManager {
     private static final int CUBE_WORK_PER_WORLD_TICK = 1;
     private static final int POLL_ATTEMPTS_PER_PLAYER_TICK = 2;
     private static final int READ_AHEAD_PER_WORLD_TICK = 2;
+    private static final long PREFETCH_RETRY_DELAY_TICKS = 2L;
+    private static final long SEND_RETRY_DELAY_TICKS = 1L;
     private static final Map<UUID, WatchState> WATCHERS = new HashMap<>();
     private static final Map<ServerWorld, AdaptiveBudget> BUDGETS = new HashMap<>();
 
@@ -57,6 +61,7 @@ public final class CubeWatchManager {
             Map.Entry<UUID, WatchState> entry = watchers.next();
             if (!present.contains(entry.getKey()) && entry.getValue().world == world) {
                 CubicWorldManager.removeTicket(world, entry.getKey());
+                entry.getValue().invalidate();
                 watchers.remove();
                 watcherTicketsChanged = true;
             }
@@ -66,7 +71,7 @@ public final class CubeWatchManager {
             Set<CubePos> requestedReads = new HashSet<>();
             for (WatchState state : WATCHERS.values()) {
                 if (state.world == world) {
-                    requestedReads.addAll(state.pending);
+                    requestedReads.addAll(state.activeUnsentPositions());
                 }
             }
             CubicWorldManager.retainPrefetches(world, requestedReads);
@@ -79,7 +84,7 @@ public final class CubeWatchManager {
             for (WatchState state : WATCHERS.values()) {
                 if (state.world == world) {
                     retained.addAll(state.sent);
-                    retained.addAll(state.pending);
+                    retained.addAll(state.activeUnsentPositions());
                 }
             }
             CubicWorldManager.evictExcept(world, retained);
@@ -104,6 +109,7 @@ public final class CubeWatchManager {
         WATCHERS.entrySet().removeIf(entry -> {
             if (entry.getValue().world != world) return false;
             CubicWorldManager.removeTicket(world, entry.getKey());
+            entry.getValue().invalidate();
             return true;
         });
         BUDGETS.remove(world);
@@ -204,37 +210,61 @@ public final class CubeWatchManager {
             rebuilt = true;
         }
 
-        for (CubePos pos : state.pending) {
-            if (!readAheadBudget.hasRemaining()) break;
-            if (withinView(pos, state.center, state.horizontalRadius)
-                    && isOutsideVanillaHeight(world, pos) && !state.sent.contains(pos)) {
-                CubicWorldManager.prefetchCubePayload(world, pos, cubePriority(pos, state.center));
-                readAheadBudget.consume();
+        state.promoteDueRetries(world.getTime());
+
+        // Starting a read is intentionally separate from sending its result.
+        // The read-ahead budget is shared by every watcher in this world.
+        while (readAheadBudget.hasRemaining()) {
+            Watch watch = state.pollPendingStart();
+            if (watch == null) break;
+
+            long version = watch.version + 1L;
+            long generation = state.generation;
+            watch.phase = WatchPhase.IN_FLIGHT;
+            watch.version = version;
+            readAheadBudget.consume();
+            try {
+                CompletableFuture<Void> ready = CubicWorldManager.prefetchCubePayload(
+                        world, watch.pos, watch.rank);
+                ready.whenComplete((ignored, failure) -> dispatchPrefetchCompletion(
+                        world, player.getUuid(), state, watch, generation, version, failure));
+            } catch (RuntimeException exception) {
+                // A synchronous request failure is already on the server thread,
+                // so it can enter the same due-retry path directly.
+                state.scheduleRetry(watch, world.getTime(), RetryTarget.START,
+                        PREFETCH_RETRY_DELAY_TICKS);
             }
         }
 
         int pollAttempts = 0;
-        while (workBudget.hasRemaining() && pollAttempts < POLL_ATTEMPTS_PER_PLAYER_TICK
-                && !state.pending.isEmpty()) {
-            CubePos pos = state.pending.removeFirst();
+        while (workBudget.hasRemaining() && pollAttempts < POLL_ATTEMPTS_PER_PLAYER_TICK) {
+            Watch watch = state.pollReadySend();
+            if (watch == null) break;
             pollAttempts++;
+
+            CubePos pos = watch.pos;
             if (!withinView(pos, state.center, state.horizontalRadius)
                     || !isOutsideVanillaHeight(world, pos)
-                    || state.sent.contains(pos)) {
+                    || state.sent.contains(pos)
+                    || state.watches.get(pos) != watch) {
+                state.finish(watch);
                 continue;
             }
             if (!ServerPlayNetworking.canSend(player, CubeDataPayload.ID)) {
                 // The play channel can become ready a few ticks after the watcher
                 // is created. Keep the cube queued instead of losing it forever.
-                state.pending.addFirst(pos);
+                state.scheduleRetry(watch, world.getTime(), RetryTarget.SEND,
+                        SEND_RETRY_DELAY_TICKS);
                 break;
             }
             byte[] payload = CubicWorldManager.tryCubePayload(
-                    world, pos, cubePriority(pos, state.center));
+                    world, pos, watch.rank);
             if (payload == null) {
-                // Rotate pending reads so a slow region cannot head-of-line block
-                // cubes whose IO has already completed.
-                state.pending.addLast(pos);
+                // A FULL future normally makes this impossible, but generation
+                // dependencies and a lifecycle restart can still leave the
+                // payload temporarily unavailable. Defer without hot polling.
+                state.scheduleRetry(watch, world.getTime(), RetryTarget.SEND,
+                        SEND_RETRY_DELAY_TICKS);
                 continue;
             }
             workBudget.consume();
@@ -246,8 +276,61 @@ public final class CubeWatchManager {
             // but remembering them prevents rechecking the overlapping 3D view
             // every time the player crosses a section boundary.
             state.sent.add(pos);
+            state.finish(watch);
         }
         return rebuilt;
+    }
+
+    /**
+     * A completion callback may run on an IO or generation worker. It must only
+     * enqueue a server-thread action; no watcher state is touched here.
+     */
+    private static void dispatchPrefetchCompletion(
+            ServerWorld world, UUID playerId, WatchState state, Watch watch,
+            long generation, long version, Throwable failure) {
+        try {
+            world.getServer().execute(() -> onPrefetchCompletion(
+                    world, playerId, state, watch, generation, version, failure));
+        } catch (RejectedExecutionException | IllegalStateException ignored) {
+            // The server is stopping. The captured state will be discarded by
+            // world unload, and there is no queue work left to recover.
+        }
+    }
+
+    private static void onPrefetchCompletion(
+            ServerWorld world, UUID playerId, WatchState state, Watch watch,
+            long generation, long version, Throwable failure) {
+        // UUID lookup plus object identity prevents a late completion from
+        // reviving a replacement watcher after logout or a world switch.
+        if (WATCHERS.get(playerId) != state || state.world != world
+                || state.generation != generation
+                || state.watches.get(watch.pos) != watch
+                || watch.phase != WatchPhase.IN_FLIGHT
+                || watch.version != version) {
+            return;
+        }
+        if (failure == null) {
+            state.markReady(watch);
+        } else if (isCancellation(failure)) {
+            state.scheduleRetry(watch, world.getTime(), RetryTarget.START,
+                    PREFETCH_RETRY_DELAY_TICKS);
+        } else {
+            // CubeHolder failures are terminal for their lifecycle epoch. A
+            // blind retry would keep attaching to the same exceptional future
+            // forever, so preserve the old error-as-empty behavior and retire
+            // this watch until the player view is rebuilt.
+            state.sent.add(watch.pos);
+            state.finish(watch);
+        }
+    }
+
+    private static boolean isCancellation(Throwable failure) {
+        Throwable current = failure;
+        while (current != null) {
+            if (current instanceof java.util.concurrent.CancellationException) return true;
+            current = current.getCause();
+        }
+        return false;
     }
 
     private static void rebuildQueue(
@@ -282,21 +365,35 @@ public final class CubeWatchManager {
             }
         }
 
-        state.pending.clear();
-        ArrayList<CubePos> pending = new ArrayList<>();
+        Set<CubePos> desired = new HashSet<>();
         for (int dy = -VERTICAL_RADIUS; dy <= VERTICAL_RADIUS; dy++) {
             for (int dz = -horizontalRadius; dz <= horizontalRadius; dz++) {
                 for (int dx = -horizontalRadius; dx <= horizontalRadius; dx++) {
                     CubePos pos = new CubePos(center.x() + dx, center.y() + dy, center.z() + dz);
                     if (pos.isBlockRangeRepresentable() && isOutsideVanillaHeight(world, pos)
                             && !state.sent.contains(pos)) {
-                        pending.add(pos);
+                        desired.add(pos);
                     }
                 }
             }
         }
-        pending.sort(Comparator.comparingInt(pos -> cubePriority(pos, center)));
-        state.pending.addAll(pending);
+        // Retain a watch whose IO is already in flight, but invalidate every
+        // watch which left the new view. Newly entered positions get a fresh
+        // identity, so stale queue entries/callbacks cannot target them.
+        Iterator<Map.Entry<CubePos, Watch>> watches = state.watches.entrySet().iterator();
+        while (watches.hasNext()) {
+            Map.Entry<CubePos, Watch> entry = watches.next();
+            if (!desired.contains(entry.getKey())) {
+                entry.getValue().invalidate();
+                watches.remove();
+            }
+        }
+        for (CubePos pos : desired) {
+            if (!state.watches.containsKey(pos)) {
+                state.watches.put(pos, new Watch(pos, cubePriority(pos, center)));
+            }
+        }
+        state.rebuildQueues();
     }
 
     private static void unloadAll(ServerPlayerEntity player, WatchState state) {
@@ -306,15 +403,15 @@ public final class CubeWatchManager {
                         pos, CubicWorldManager.cubeRevision(state.world, pos)));
             }
         }
+        state.invalidate();
         state.sent.clear();
-        state.pending.clear();
     }
 
     private static void retainWorldPrefetches(ServerWorld world, WatchState excluded) {
         Set<CubePos> requestedReads = new HashSet<>();
         for (WatchState state : WATCHERS.values()) {
             if (state != excluded && state.world == world) {
-                requestedReads.addAll(state.pending);
+                requestedReads.addAll(state.activeUnsentPositions());
             }
         }
         CubicWorldManager.retainPrefetches(world, requestedReads);
@@ -350,12 +447,218 @@ public final class CubeWatchManager {
         return pos.y() < world.getBottomSectionCoord() || pos.y() >= world.getTopSectionCoord();
     }
 
-    private static final class WatchState {
+    enum WatchPhase {
+        PENDING_START,
+        IN_FLIGHT,
+        READY_SEND,
+        RETRY_WAIT,
+        FINISHED
+    }
+
+    enum RetryTarget {
+        START,
+        SEND
+    }
+
+    static final class Watch {
+        final CubePos pos;
+        int rank;
+        WatchPhase phase = WatchPhase.PENDING_START;
+        RetryTarget retryTarget;
+        long dueTick;
+        long version;
+
+        Watch(CubePos pos, int rank) {
+            this.pos = pos;
+            this.rank = rank;
+        }
+
+        private void invalidate() {
+            phase = WatchPhase.FINISHED;
+            retryTarget = null;
+            version++;
+        }
+    }
+
+    record QueueEntry(Watch watch, long version, int rank, long sequence) {
+    }
+
+    record RetryEntry(Watch watch, long version, RetryTarget target,
+                              long dueTick, int rank, long sequence) {
+    }
+
+    static final Comparator<QueueEntry> NEAR_TO_FAR = (first, second) -> {
+        int byRank = Integer.compare(first.rank(), second.rank());
+        if (byRank != 0) return byRank;
+        int byPosition = comparePosition(first.watch().pos, second.watch().pos);
+        return byPosition != 0
+                ? byPosition : Long.compare(first.sequence(), second.sequence());
+    };
+
+    static final Comparator<RetryEntry> DUE_RETRY_ORDER = (first, second) -> {
+        int byDue = Long.compare(first.dueTick(), second.dueTick());
+        if (byDue != 0) return byDue;
+        int byRank = Integer.compare(first.rank(), second.rank());
+        if (byRank != 0) return byRank;
+        int byPosition = comparePosition(first.watch().pos, second.watch().pos);
+        return byPosition != 0
+                ? byPosition : Long.compare(first.sequence(), second.sequence());
+    };
+
+    private static int comparePosition(CubePos first, CubePos second) {
+        int byY = Integer.compare(first.y(), second.y());
+        if (byY != 0) return byY;
+        int byZ = Integer.compare(first.z(), second.z());
+        return byZ != 0 ? byZ : Integer.compare(first.x(), second.x());
+    }
+
+    static final class WatchState {
         private ServerWorld world;
         private CubePos center;
         private int horizontalRadius;
+        long generation;
+        private long sequence;
         private final Set<CubePos> sent = new HashSet<>();
-        private final ArrayDeque<CubePos> pending = new ArrayDeque<>();
+        private final Map<CubePos, Watch> watches = new HashMap<>();
+        private final PriorityQueue<QueueEntry> pendingStarts =
+                new PriorityQueue<>(NEAR_TO_FAR);
+        private final PriorityQueue<QueueEntry> readySends =
+                new PriorityQueue<>(NEAR_TO_FAR);
+        private final PriorityQueue<RetryEntry> retries =
+                new PriorityQueue<>(DUE_RETRY_ORDER);
+
+        /** Package-visible hooks keep the queue state independently testable. */
+        Watch addForTest(CubePos pos, int rank) {
+            Watch watch = new Watch(pos, rank);
+            watches.put(pos, watch);
+            return watch;
+        }
+
+        void setCenterForTest(CubePos center) {
+            this.center = center;
+            rebuildQueues();
+        }
+
+        int pendingStartCountForTest() {
+            return pendingStarts.size();
+        }
+
+        int readySendCountForTest() {
+            return readySends.size();
+        }
+
+        int retryCountForTest() {
+            return retries.size();
+        }
+
+        private Set<CubePos> activeUnsentPositions() {
+            return Set.copyOf(watches.keySet());
+        }
+
+        void rebuildQueues() {
+            pendingStarts.clear();
+            readySends.clear();
+            retries.clear();
+            for (Watch watch : watches.values()) {
+                watch.rank = cubePriority(watch.pos, center);
+                switch (watch.phase) {
+                    case PENDING_START -> enqueuePendingStart(watch);
+                    case READY_SEND -> enqueueReadySend(watch);
+                    case RETRY_WAIT -> enqueueRetry(watch);
+                    case IN_FLIGHT, FINISHED -> { }
+                }
+            }
+        }
+
+        Watch pollPendingStart() {
+            while (!pendingStarts.isEmpty()) {
+                QueueEntry entry = pendingStarts.poll();
+                Watch watch = entry.watch();
+                if (entry.version() == watch.version && watch.phase == WatchPhase.PENDING_START
+                        && watches.get(watch.pos) == watch) {
+                    return watch;
+                }
+            }
+            return null;
+        }
+
+        Watch pollReadySend() {
+            while (!readySends.isEmpty()) {
+                QueueEntry entry = readySends.poll();
+                Watch watch = entry.watch();
+                if (entry.version() == watch.version && watch.phase == WatchPhase.READY_SEND
+                        && watches.get(watch.pos) == watch) {
+                    return watch;
+                }
+            }
+            return null;
+        }
+
+        void promoteDueRetries(long now) {
+            while (!retries.isEmpty() && retries.peek().dueTick() <= now) {
+                RetryEntry entry = retries.poll();
+                Watch watch = entry.watch();
+                if (entry.version() != watch.version || entry.target() != watch.retryTarget
+                        || watch.phase != WatchPhase.RETRY_WAIT
+                        || watches.get(watch.pos) != watch) {
+                    continue;
+                }
+                watch.retryTarget = null;
+                watch.version++;
+                if (entry.target() == RetryTarget.START) {
+                    watch.phase = WatchPhase.PENDING_START;
+                    enqueuePendingStart(watch);
+                } else {
+                    watch.phase = WatchPhase.READY_SEND;
+                    enqueueReadySend(watch);
+                }
+            }
+        }
+
+        void markReady(Watch watch) {
+            if (watch.phase != WatchPhase.IN_FLIGHT || watches.get(watch.pos) != watch) return;
+            watch.phase = WatchPhase.READY_SEND;
+            watch.version++;
+            enqueueReadySend(watch);
+        }
+
+        void scheduleRetry(
+                Watch watch, long now, RetryTarget target, long delayTicks) {
+            if (watches.get(watch.pos) != watch || watch.phase == WatchPhase.FINISHED) return;
+            watch.phase = WatchPhase.RETRY_WAIT;
+            watch.retryTarget = target;
+            watch.dueTick = now + Math.max(1L, delayTicks);
+            watch.version++;
+            enqueueRetry(watch);
+        }
+
+        void finish(Watch watch) {
+            watch.invalidate();
+            watches.remove(watch.pos, watch);
+        }
+
+        private void invalidate() {
+            generation++;
+            watches.values().forEach(Watch::invalidate);
+            watches.clear();
+            pendingStarts.clear();
+            readySends.clear();
+            retries.clear();
+        }
+
+        private void enqueuePendingStart(Watch watch) {
+            pendingStarts.offer(new QueueEntry(watch, watch.version, watch.rank, sequence++));
+        }
+
+        private void enqueueReadySend(Watch watch) {
+            readySends.offer(new QueueEntry(watch, watch.version, watch.rank, sequence++));
+        }
+
+        private void enqueueRetry(Watch watch) {
+            retries.offer(new RetryEntry(
+                    watch, watch.version, watch.retryTarget, watch.dueTick,
+                    watch.rank, sequence++));
+        }
     }
 
     private static final class CubeWorkBudget {

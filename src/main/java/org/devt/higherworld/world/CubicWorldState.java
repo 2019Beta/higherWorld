@@ -209,20 +209,49 @@ final class CubicWorldState implements AutoCloseable {
         return finishCubePayload(pos, stored);
     }
 
-    void prefetchCubePayload(CubePos pos, int priority) {
+    /**
+     * Requests/adopts the cube's FULL lifecycle without waiting for IO or
+     * server-thread stage commits.  Completion is signalled by the holder's
+     * FULL future; its payload is intentionally not exposed here because the
+     * watcher can encode it after the completion callback runs on the server
+     * thread.
+     */
+    CompletableFuture<Void> prefetchCubePayload(CubePos pos, int priority) {
+        CubeHolder holder;
         LoadedCube loaded = loadedCube(pos);
         if (loaded == null) {
-            taskScheduler.request(pos, CubeStatus.FULL, priority);
+            holder = taskScheduler.request(pos, CubeStatus.FULL, priority);
         } else {
             LoadContext context = loadContexts.get(pos);
             if (context != null && context.full) {
-                taskScheduler.adoptLoaded(loaded);
-                return;
+                holder = taskScheduler.adoptLoaded(loaded);
+            } else {
+                holder = taskScheduler.holder(pos);
+                if (holder.status().isAtLeast(CubeStatus.FULL)) {
+                    holder = taskScheduler.adoptLoaded(loaded);
+                } else {
+                    holder = taskScheduler.request(pos, CubeStatus.FULL, priority);
+                }
             }
-            CubeHolder holder = taskScheduler.holder(pos);
-            if (holder.status().isAtLeast(CubeStatus.FULL)) taskScheduler.adoptLoaded(loaded);
-            else taskScheduler.request(pos, CubeStatus.FULL, priority);
         }
+        return fullReadyFuture(holder);
+    }
+
+    /** Mirrors a holder's FULL future while preserving exceptional completion
+     * and cancellation on the payload-free API exposed to watchers. */
+    private static CompletableFuture<Void> fullReadyFuture(CubeHolder holder) {
+        CompletableFuture<Void> ready = new CompletableFuture<>();
+        CompletableFuture<Optional<LoadedCube>> full = holder.fullFuture();
+        full.whenComplete((ignored, failure) -> {
+            if (failure == null) {
+                ready.complete(null);
+            } else {
+                // completeExceptionally preserves the holder's original
+                // throwable, including CancellationException identity.
+                ready.completeExceptionally(failure);
+            }
+        });
+        return ready;
     }
 
     void retainPrefetches(Set<CubePos> retained) {
