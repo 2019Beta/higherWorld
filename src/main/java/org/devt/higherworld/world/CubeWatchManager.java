@@ -118,6 +118,28 @@ public final class CubeWatchManager {
         }
     }
 
+    /**
+     * Loading follows the client's view distance, but simulation must follow
+     * the server's (usually smaller) simulation distance.  Ticking every FULL
+     * cube in the streaming view makes block entities such as sculk catalysts
+     * run across thousands of otherwise inactive sections.
+     */
+    static boolean shouldTick(ServerWorld world, CubePos pos) {
+        int simulationDistance = world.getServer().getPlayerManager().getSimulationDistance();
+        for (ServerPlayerEntity player : world.getPlayers()) {
+            CubePos center = CubePos.fromBlock(
+                    player.getBlockX(), player.getBlockY(), player.getBlockZ());
+            if (withinSimulationDistance(pos, center, simulationDistance)) return true;
+        }
+        return false;
+    }
+
+    static boolean withinSimulationDistance(CubePos pos, CubePos center, int distance) {
+        return Math.abs((long) pos.x() - center.x()) <= distance
+                && Math.abs((long) pos.z() - center.z()) <= distance
+                && Math.abs((long) pos.y() - center.y()) <= VERTICAL_RADIUS;
+    }
+
     public static void broadcastCubeUpdate(ServerWorld world, BlockPos blockPos) {
         CubePos pos = CubePos.fromBlock(blockPos.getX(), blockPos.getY(), blockPos.getZ());
         if (CubicWorldManager.suppressingGenerationUpdates(world)) {

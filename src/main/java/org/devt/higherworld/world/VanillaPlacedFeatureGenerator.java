@@ -16,6 +16,7 @@ import java.util.function.Predicate;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.BlockEntityProvider;
 import net.minecraft.block.Blocks;
+import net.minecraft.block.MultifaceBlock;
 import net.minecraft.block.entity.BlockEntity;
 import net.minecraft.fluid.FluidState;
 import net.minecraft.fluid.Fluids;
@@ -27,6 +28,8 @@ import net.minecraft.server.world.ServerWorld;
 import net.minecraft.util.math.BlockBox;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.ChunkPos;
+import net.minecraft.util.math.Direction;
+import net.minecraft.world.BlockView;
 import net.minecraft.util.math.random.ChunkRandom;
 import net.minecraft.util.math.random.Xoroshiro128PlusPlusRandom;
 import net.minecraft.world.HeightLimitView;
@@ -170,14 +173,14 @@ final class VanillaPlacedFeatureGenerator {
                 VanillaPlacedFeatureGenerator.class.getClassLoader(),
                 new Class<?>[] {StructureWorldAccess.class},
                 (proxy, method, arguments) -> invoke(
-                        world, cube, virtualCube, virtualMinY, offsetY,
+                        proxy, world, cube, virtualCube, virtualMinY, offsetY,
                         legacyBoundaryReads, featureChunks, clippedBlockEntities,
                         method, arguments));
     }
 
     @SuppressWarnings("unchecked")
     private static Object invoke(
-            ServerWorld world, LoadedCube cube, BlockBox virtualCube,
+            Object proxy, ServerWorld world, LoadedCube cube, BlockBox virtualCube,
             int virtualMinY, int offsetY, boolean legacyBoundaryReads,
             Map<Long, Chunk> featureChunks, Map<BlockPos, BlockEntity> clippedBlockEntities,
             Method method, Object[] arguments) throws Throwable {
@@ -218,6 +221,9 @@ final class VanillaPlacedFeatureGenerator {
         BlockPos virtualPos = firstPos(arguments);
         if ("setBlockState".equals(name) && virtualPos != null
                 && arguments.length >= 2 && arguments[1] instanceof BlockState state) {
+            if (state.isOf(Blocks.SCULK_VEIN)) {
+                state = removeUnsupportedSculkFaces((BlockView) proxy, virtualPos, state);
+            }
             if (!virtualCube.contains(virtualPos)) {
                 // Features from the eight neighbouring origins are replayed so
                 // their writes can spill into this cube. Keep writes outside the
@@ -385,6 +391,23 @@ final class VanillaPlacedFeatureGenerator {
         } catch (InvocationTargetException exception) {
             throw exception.getCause();
         }
+    }
+
+    /**
+     * Sparse cubes do not have ProtoChunk's post-processing pass. Validate
+     * sculk-vein faces as they are written so a clipped neighbouring feature
+     * cannot leave an unsupported sheet at a cube boundary.
+     */
+    private static BlockState removeUnsupportedSculkFaces(
+            BlockView world, BlockPos pos, BlockState state) {
+        for (Direction direction : Direction.values()) {
+            if (MultifaceBlock.hasDirection(state, direction)
+                    && !MultifaceBlock.canGrowOn(world, pos, direction)) {
+                state = state.with(MultifaceBlock.getProperty(direction), false);
+            }
+        }
+        return !MultifaceBlock.collectDirections(state).isEmpty()
+                ? state : state.getFluidState().getBlockState();
     }
 
     private static BlockPos firstPos(Object[] arguments) {

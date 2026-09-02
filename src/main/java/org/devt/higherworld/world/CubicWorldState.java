@@ -429,6 +429,7 @@ final class CubicWorldState implements AutoCloseable {
                 // otherwise the old FULL state would keep ticking forever.
                 if (!holder.target().isAtLeast(CubeStatus.FULL)
                         || !holder.status().isAtLeast(CubeStatus.FULL)) return;
+                if (!CubeWatchManager.shouldTick(world, cube.pos())) return;
                 cube.tickBlockEntities(world);
                 cube.tickRandomly(world, randomTickSpeed);
             });

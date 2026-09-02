@@ -25,6 +25,18 @@ class CubeSchedulingTest {
     Path directory;
 
     @Test
+    void simulationDistanceDoesNotFollowTheLargerStreamingView() {
+        CubePos center = new CubePos(10, -20, 30);
+
+        assertTrue(CubeWatchManager.withinSimulationDistance(
+                new CubePos(14, -16, 26), center, 4));
+        assertFalse(CubeWatchManager.withinSimulationDistance(
+                new CubePos(15, -20, 30), center, 4));
+        assertFalse(CubeWatchManager.withinSimulationDistance(
+                new CubePos(10, -15, 30), center, 4));
+    }
+
+    @Test
     void dependencyRadiusIsAnisotropic() {
         CubeDependencyRadius radius = new CubeDependencyRadius(2, 0, 1);
         java.util.HashSet<CubePos> positions = new java.util.HashSet<>();
