@@ -344,7 +344,7 @@ public final class CubicWorldManager {
                     world.updateNeighborsAlways(pos, blockState.getBlock(), null);
                 }
                 if (!result.changedLight().isEmpty()) {
-                    CubeWatchManager.broadcastCubeUpdates(world, result.changedLight());
+                    CubeWatchManager.broadcastLightUpdates(world, result.changedLight());
                 }
             }
             return changed;
@@ -377,6 +377,11 @@ public final class CubicWorldManager {
         return state == null ? 0L : state.cubeRevision(pos);
     }
 
+    static byte[] cubeLightPayload(ServerWorld world, CubePos pos) {
+        CubicWorldState state = WORLDS.get(world);
+        return state == null ? new byte[0] : state.cubeLightPayload(pos);
+    }
+
     /**
      * Returns whether this thread is committing generated cube state for the
      * given world.  ServerWorld.updateListeners is invoked by some structure
@@ -389,10 +394,11 @@ public final class CubicWorldManager {
     }
 
     /**
-     * Requests a watched cube's FULL lifecycle and returns when that lifecycle
-     * is ready.  The returned future is deliberately payload-free: callers
-     * only need a completion signal and should use {@link #tryCubePayload} when
-     * they actually need encoded data.
+     * Requests a watched cube's FULL lifecycle and returns when its block and
+     * feature PAYLOAD is ready. Lighting continues asynchronously. The
+     * returned future is deliberately payload-free: callers only need a
+     * completion signal and should use {@link #tryCubePayload} when they need
+     * encoded data.
      *
      * <p>If this world has not been opened yet, there is no lifecycle to wait
      * for, so the method returns an already completed future.</p>
@@ -403,6 +409,15 @@ public final class CubicWorldManager {
         return state == null
                 ? CompletableFuture.completedFuture(null)
                 : state.prefetchCubePayload(pos, priority);
+    }
+
+    /** Requests the complete lifecycle for simulation/entity restoration. */
+    static CompletableFuture<Void> prefetchCubeFull(
+            ServerWorld world, CubePos pos, int priority) {
+        CubicWorldState state = WORLDS.get(world);
+        return state == null
+                ? CompletableFuture.completedFuture(null)
+                : state.prefetchCubeFull(pos, priority);
     }
 
     /** Drops queued read-ahead work after its last 3D watcher ticket disappears. */
@@ -450,7 +465,7 @@ public final class CubicWorldManager {
             if (!scheduled.add(owner)) continue;
             CompletableFuture<Void> ready;
             try {
-                ready = prefetchCubePayload(world, owner, ticket.effectivePriority());
+                ready = prefetchCubeFull(world, owner, ticket.effectivePriority());
             } catch (RuntimeException exception) {
                 scheduled.remove(owner);
                 continue;

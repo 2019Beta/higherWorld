@@ -1,7 +1,11 @@
 package org.devt.higherworld.world;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.DataInput;
+import java.io.DataInputStream;
 import java.io.DataOutput;
+import java.io.DataOutputStream;
 import java.io.IOException;
 
 /** Block and sky light attached to one sparse cube. */
@@ -71,6 +75,30 @@ public final class CubeLightData {
 
     static Snapshot read(DataInput input) throws IOException {
         return new Snapshot(readVolume(input), readVolume(input));
+    }
+
+    /** Encodes only the two light volumes for an eventual light delta packet. */
+    public static byte[] encodeSnapshot(Snapshot light) {
+        try {
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream(4_104);
+            DataOutputStream output = new DataOutputStream(bytes);
+            write(output, light);
+            output.flush();
+            return bytes.toByteArray();
+        } catch (IOException exception) {
+            throw new IllegalStateException("Cannot encode cube light", exception);
+        }
+    }
+
+    /** Decodes a light-only packet and rejects trailing or malformed data. */
+    public static Snapshot decodeSnapshot(byte[] data) throws IOException {
+        if (data == null || data.length == 0 || data.length > 8_192) {
+            throw new IOException("Invalid cube light payload length");
+        }
+        DataInputStream input = new DataInputStream(new ByteArrayInputStream(data));
+        Snapshot snapshot = read(input);
+        if (input.available() != 0) throw new IOException("Trailing cube light payload data");
+        return snapshot;
     }
 
     private static void writeVolume(DataOutput output, SparseLightVolume.Snapshot volume) throws IOException {

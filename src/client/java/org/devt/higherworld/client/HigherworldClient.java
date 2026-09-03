@@ -6,6 +6,7 @@ import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import org.devt.higherworld.world.CubeBlockUpdatePayload;
 import org.devt.higherworld.world.CubeDataPayload;
+import org.devt.higherworld.world.CubeLightUpdatePayload;
 import org.devt.higherworld.world.CubeUnloadPayload;
 
 public class HigherworldClient implements ClientModInitializer {
@@ -21,6 +22,14 @@ public class HigherworldClient implements ClientModInitializer {
             context.client().execute(() -> {
                 if (context.client().world != null) {
                     ClientCubeCache.put(context.client().world, payload.pos(), payload.revision(), payload.data());
+                }
+            });
+        });
+        ClientPlayNetworking.registerGlobalReceiver(CubeLightUpdatePayload.ID, (payload, context) -> {
+            context.client().execute(() -> {
+                if (context.client().world != null) {
+                    ClientCubeCache.updateLight(
+                            context.client().world, payload.pos(), payload.revision(), payload.data());
                 }
             });
         });

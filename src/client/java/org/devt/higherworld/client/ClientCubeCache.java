@@ -34,6 +34,15 @@ public final class ClientCubeCache {
     private static final int LIGHT_STEPS_PER_TICK = 8_192;
     private static final long LIGHT_BUDGET_NANOS = 1_000_000L;
     private static final ConcurrentMap<CubePos, CubeEntry> CUBES = new ConcurrentHashMap<>();
+    /**
+     * A light packet can arrive in the same network tick as the first cube
+     * payload. Retain the newest one until that payload installs the cube;
+     * otherwise an early eventual-light packet would be discarded and the cube
+     * would remain dark until another light change happened.
+     */
+    private static final ConcurrentMap<CubePos, PendingLight> PENDING_LIGHTS =
+            new ConcurrentHashMap<>();
+    private static final int MAX_PENDING_LIGHTS = 4_096;
     /** Height of each loaded cube's 16 x 16 block columns, indexed by cube X/Z. */
     private static final ConcurrentMap<CubeColumnPos, Map<Integer, HeightIndex>> CUBE_HEIGHTS =
             new ConcurrentHashMap<>();
@@ -83,12 +92,59 @@ public final class ClientCubeCache {
             }
             CUBES.put(pos, replacement);
             putCubeHeightsLocked(pos, replacement.heightIndex());
+            PendingLight pending = PENDING_LIGHTS.remove(pos);
+            if (pending != null) {
+                CubeRevisionGate.Decision decision = CubeRevisionGate.delta(
+                        replacement.revision(), pending.revision());
+                if (decision.accepted()) {
+                    replacement.light().load(pending.light());
+                    replacement = replacement.withRevision(decision.revision());
+                    CUBES.put(pos, replacement);
+                }
+            }
         }
         removeBlockEntities(pos);
         for (BlockEntity blockEntity : decoded.blockEntities()) {
             BLOCK_ENTITIES.put(blockEntity.getPos().toImmutable(), blockEntity);
         }
         LIGHT_ENGINE.queueCube(pos, !decoded.hasLight());
+        queueRenderNeighborhood(pos);
+    }
+
+    /** Applies an eventual server light snapshot without re-sending block data. */
+    public static void updateLight(ClientWorld world, CubePos pos, long revision, byte[] payload) {
+        ensureOwner(world);
+        if (!pos.isBlockRangeRepresentable()) return;
+        CubeLightData.Snapshot light;
+        try {
+            light = CubeLightData.decodeSnapshot(payload);
+        } catch (java.io.IOException exception) {
+            throw new IllegalArgumentException("Invalid cube light payload for " + pos, exception);
+        }
+        synchronized (ClientCubeCache.class) {
+            CubeEntry current = CUBES.get(pos);
+            if (current == null) {
+                PENDING_LIGHTS.compute(pos, (ignored, existing) -> {
+                    if (existing == null || CubeRevisionGate.delta(
+                            existing.revision(), revision).accepted()) {
+                        return new PendingLight(revision, light);
+                    }
+                    return existing;
+                });
+                trimPendingLights();
+                return;
+            }
+            CubeRevisionGate.Decision decision = CubeRevisionGate.delta(current.revision(), revision);
+            if (!decision.accepted()) return;
+            current.light().load(light);
+            if (decision.revision() != current.revision()) {
+                CUBES.put(pos, current.withRevision(decision.revision()));
+            }
+        }
+        // The authoritative snapshot is already installed. Queue only the
+        // boundary so adjacent loaded cubes can reconcile without recreating
+        // the old 4096-node initialization storm.
+        LIGHT_ENGINE.queueCube(pos, false);
         queueRenderNeighborhood(pos);
     }
 
@@ -102,6 +158,7 @@ public final class ClientCubeCache {
         if (!pos.isBlockRangeRepresentable()) return;
         boolean removed;
         synchronized (ClientCubeCache.class) {
+            PENDING_LIGHTS.remove(pos);
             CubeEntry current = CUBES.get(pos);
             if (current == null || !CubeRevisionGate.removal(current.revision(), revision).accepted()) {
                 return;
@@ -182,6 +239,7 @@ public final class ClientCubeCache {
     public static void clear() {
         synchronized (ClientCubeCache.class) {
             CUBES.clear();
+            PENDING_LIGHTS.clear();
             CUBE_HEIGHTS.clear();
             HIGHEST_BLOCKS.clear();
             BLOCK_ENTITIES.clear();
@@ -254,6 +312,7 @@ public final class ClientCubeCache {
             synchronized (ClientCubeCache.class) {
                 if (owner != world) {
                     CUBES.clear();
+                    PENDING_LIGHTS.clear();
                     CUBE_HEIGHTS.clear();
                     HIGHEST_BLOCKS.clear();
                     BLOCK_ENTITIES.clear();
@@ -408,6 +467,14 @@ public final class ClientCubeCache {
         return Math.floorMod(coordinate, CubePos.SIZE);
     }
 
+    private static void trimPendingLights() {
+        while (PENDING_LIGHTS.size() > MAX_PENDING_LIGHTS) {
+            var iterator = PENDING_LIGHTS.keySet().iterator();
+            if (!iterator.hasNext()) return;
+            PENDING_LIGHTS.remove(iterator.next());
+        }
+    }
+
     private record CubeEntry(ChunkSection section, CubeLightData light, long revision, HeightIndex heightIndex) {
         private CubeEntry {
             if (heightIndex == null) throw new NullPointerException("heightIndex");
@@ -447,6 +514,8 @@ public final class ClientCubeCache {
             return new CubeEntry(section, light, revision, new HeightIndex(updatedTops, updatedPresent));
         }
     }
+
+    private record PendingLight(long revision, CubeLightData.Snapshot light) {}
 
     private record HeightIndex(int[] tops, boolean[] present) {
         private HeightIndex {

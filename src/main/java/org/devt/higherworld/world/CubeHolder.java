@@ -23,11 +23,12 @@ final class CubeHolder {
     boolean failed() { return lifecycle.failed; }
     long epoch() { return lifecycle.epoch; }
     CompletableFuture<Optional<byte[]>> ioFuture() { return lifecycle.ioFuture; }
-    CompletableFuture<CustomCubeGenerator.TerrainSnapshot> terrainPreparationFuture() {
+    CompletableFuture<CubeTerrainSnapshot> terrainPreparationFuture() {
         return lifecycle.terrainPreparationFuture;
     }
     CompletableFuture<Void> terrainFuture() { return lifecycle.stage(CubeStatus.TERRAIN); }
     CompletableFuture<Void> featureFuture() { return lifecycle.stage(CubeStatus.FEATURES); }
+    CompletableFuture<Void> payloadFuture() { return lifecycle.stage(CubeStatus.PAYLOAD); }
     CompletableFuture<Void> lightFuture() { return lifecycle.stage(CubeStatus.LIGHT); }
     CompletableFuture<Optional<LoadedCube>> fullFuture() { return lifecycle.fullFuture; }
     CompletableFuture<Void> saveFuture() { return saveFuture; }
@@ -75,11 +76,18 @@ final class CubeHolder {
         return current.ioFuture;
     }
 
-    synchronized CompletableFuture<CustomCubeGenerator.TerrainSnapshot> startTerrain(
-            Supplier<CompletableFuture<CustomCubeGenerator.TerrainSnapshot>> starter) {
+    synchronized CompletableFuture<CubeTerrainSnapshot> startTerrain(
+            Supplier<CompletableFuture<CubeTerrainSnapshot>> starter) {
         Lifecycle current = lifecycle;
         if (current.terrainPreparationFuture == null || current.terrainPreparationFuture.isCancelled()) {
-            current.terrainPreparationFuture = starter.get();
+            long epoch = current.epoch;
+            CompletableFuture<CubeTerrainSnapshot> started = starter.get();
+            current.terrainPreparationFuture = started;
+            started.whenComplete((ignored, failure) -> {
+                if (failure != null && !isCancellation(failure)) {
+                    fail(epoch, failure);
+                }
+            });
         }
         return current.terrainPreparationFuture;
     }
@@ -137,6 +145,15 @@ final class CubeHolder {
         return current.epoch == epoch && !current.cancelled;
     }
 
+    private static boolean isCancellation(Throwable failure) {
+        Throwable current = failure;
+        while (current != null) {
+            if (current instanceof CancellationException) return true;
+            current = current.getCause();
+        }
+        return false;
+    }
+
     CompletableFuture<Void> localStageFuture(CubeStatus stage) {
         if (stage == CubeStatus.EMPTY) return CompletableFuture.completedFuture(null);
         return lifecycle.stage(stage);
@@ -152,7 +169,7 @@ final class CubeHolder {
         private volatile boolean cancelled;
         private volatile boolean failed;
         private volatile CompletableFuture<Optional<byte[]>> ioFuture;
-        private volatile CompletableFuture<CustomCubeGenerator.TerrainSnapshot> terrainPreparationFuture;
+        private volatile CompletableFuture<CubeTerrainSnapshot> terrainPreparationFuture;
 
         private Lifecycle(long epoch) {
             this.epoch = epoch;

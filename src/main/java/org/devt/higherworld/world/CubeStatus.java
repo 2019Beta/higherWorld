@@ -6,6 +6,8 @@ public enum CubeStatus {
     IO_READY(CubeDependencyRadius.NONE),
     TERRAIN(CubeDependencyRadius.NONE),
     FEATURES(new CubeDependencyRadius(1, 1, 1)),
+    /** Block/feature data can be streamed before eventual lighting finishes. */
+    PAYLOAD(CubeDependencyRadius.NONE),
     LIGHT(new CubeDependencyRadius(1, 1, 1)),
     FULL(CubeDependencyRadius.NONE);
 
@@ -21,6 +23,7 @@ public enum CubeStatus {
             case IO_READY -> EMPTY;
             case TERRAIN -> IO_READY;
             case FEATURES -> TERRAIN;
+            case PAYLOAD -> FEATURES;
             case LIGHT -> FEATURES;
             case FULL -> LIGHT;
         };

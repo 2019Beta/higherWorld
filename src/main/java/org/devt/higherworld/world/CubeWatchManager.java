@@ -24,11 +24,11 @@ import org.devt.higherworld.storage.CubePos;
 /** Maintains a bounded three-dimensional cube view around every player. */
 public final class CubeWatchManager {
     private static final int VERTICAL_RADIUS = 4;
-    // Cube creation runs vanilla noise and biome decoration. A small world-wide
-    // budget keeps initial view streaming from monopolizing the server thread.
-    // Generation and decoding cross into Minecraft code and must stay on the
-    // server thread. Share this budget across all players so additional players
-    // cannot multiply the amount of synchronous cube work in a single tick.
+    // Cube creation still commits palettes, features and light on the server
+    // thread. A small world-wide budget keeps initial view streaming from
+    // monopolizing that thread; pure vanilla terrain sampling is dispatched by
+    // CubeTaskScheduler. Share this budget across all players so additional
+    // players cannot multiply synchronous cube work in a single tick.
     private static final int CUBE_WORK_PER_WORLD_TICK = 1;
     private static final int POLL_ATTEMPTS_PER_PLAYER_TICK = 2;
     private static final int READ_AHEAD_PER_WORLD_TICK = 2;
@@ -175,20 +175,21 @@ public final class CubeWatchManager {
         }
     }
 
-    /** Sends authoritative light snapshots for every cube touched by propagation. */
-    public static void broadcastCubeUpdates(ServerWorld world, Set<CubePos> positions) {
+    /** Sends authoritative light-only snapshots for every cube touched by propagation. */
+    public static void broadcastLightUpdates(ServerWorld world, Set<CubePos> positions) {
         if (CubicWorldManager.suppressingGenerationUpdates(world)) return;
         for (CubePos pos : positions) {
             List<ServerPlayerEntity> recipients = new ArrayList<>();
             for (ServerPlayerEntity player : world.getPlayers()) {
-                if (watches(player, pos) && ServerPlayNetworking.canSend(player, CubeDataPayload.ID)) {
+                if (watches(player, pos)
+                        && ServerPlayNetworking.canSend(player, CubeLightUpdatePayload.ID)) {
                     recipients.add(player);
                 }
             }
             if (recipients.isEmpty()) continue;
-            byte[] data = CubicWorldManager.cubePayload(world, pos);
-            if (data.length == 0 || !CubeDataPayload.canEncode(data)) continue;
-            CubeDataPayload payload = new CubeDataPayload(
+            byte[] data = CubicWorldManager.cubeLightPayload(world, pos);
+            if (data.length == 0) continue;
+            CubeLightUpdatePayload payload = new CubeLightUpdatePayload(
                     pos, CubicWorldManager.cubeRevision(world, pos), data);
             for (ServerPlayerEntity player : recipients) {
                 ServerPlayNetworking.send(player, payload);

@@ -136,13 +136,15 @@ final class CubicWorldState implements AutoCloseable {
     BlockState getBlockState(BlockPos pos) throws IOException {
         GenerationReadContext generation = generationReadContexts.get();
         if (generation != null) return generation.blockState(pos);
-        return cubeForRead(pos).getBlockState(pos);
+        LoadedCube cube = cubeForRead(pos);
+        return cube == null ? Blocks.AIR.getDefaultState() : cube.getBlockState(pos);
     }
 
     FluidState getFluidState(BlockPos pos) throws IOException {
         GenerationReadContext generation = generationReadContexts.get();
         if (generation != null) return generation.fluidState(pos);
-        return cubeForRead(pos).getFluidState(pos);
+        LoadedCube cube = cubeForRead(pos);
+        return cube == null ? Fluids.EMPTY.getDefaultState() : cube.getFluidState(pos);
     }
 
     /**
@@ -153,8 +155,7 @@ final class CubicWorldState implements AutoCloseable {
      * exhausted.  Terrain is sufficient for generation-time reads and is also
      * the declared prerequisite for neighbouring features.
      */
-    private LoadedCube cubeForRead(BlockPos blockPos) throws IOException {
-        if (!committingFeatures.get()) return cube(blockPos);
+    private LoadedCube cubeForRead(BlockPos blockPos) {
         CubePos pos = CubePos.fromBlock(blockPos.getX(), blockPos.getY(), blockPos.getZ());
         LoadedCube loaded = loadedCube(pos);
         if (loaded != null) {
@@ -166,7 +167,13 @@ final class CubicWorldState implements AutoCloseable {
             throw new IllegalStateException(
                     "Cube read requested during feature generation: " + pos);
         }
-        return ensureStage(pos, CubeStatus.TERRAIN, SYNCHRONOUS_IO_PRIORITY, null);
+        // Reads made by vanilla callbacks (fluid/redstone neighbour probes in
+        // particular) must never turn into a synchronous chunk load. Vanilla
+        // treats an unavailable chunk as an empty view for these probes; doing
+        // the same here keeps the server thread from joining a multi-second
+        // terrain future. The active watcher/dependency tickets already start
+        // every cube that is supposed to become available.
+        return null;
     }
 
     BlockChange setBlockState(BlockPos pos, BlockState state) throws IOException {
@@ -176,7 +183,23 @@ final class CubicWorldState implements AutoCloseable {
             // feature is being committed, but they must not mutate or load it.
             return new BlockChange(generation.blockState(pos), Set.of(), false);
         }
-        LoadedCube cube = cube(pos);
+        LoadedCube cube;
+        if (generation != null) {
+            // The owning cube is already registered before terrain/features
+            // invoke any World callbacks.
+            cube = cube(pos);
+        } else {
+            CubePos cubePos = CubePos.fromBlock(pos.getX(), pos.getY(), pos.getZ());
+            cube = loadedCubeForMutation(cubePos);
+            if (cube == null) {
+                // Vanilla chunk post-processing can flow fluids across the
+                // bottom build boundary while the corresponding sparse cube
+                // is still generating. A write must not turn that callback
+                // into a synchronous FULL load: report an unavailable target
+                // just as an unloaded vanilla chunk would.
+                return new BlockChange(Blocks.AIR.getDefaultState(), Set.of(), false);
+            }
+        }
         BlockState previous = cube.setBlockState(pos, state);
         Set<CubePos> changedLight = Set.of();
         if (previous != state) {
@@ -194,6 +217,16 @@ final class CubicWorldState implements AutoCloseable {
                     LIGHT_STEPS_PER_SLICE, LIGHT_NANOS_PER_SLICE).changedCubes();
         }
         return new BlockChange(previous, changedLight, previous != state);
+    }
+
+    /** Returns a cube that is safe for ordinary gameplay mutation without waiting. */
+    private LoadedCube loadedCubeForMutation(CubePos pos) {
+        LoadedCube loaded = loadedCube(pos);
+        if (loaded == null) return null;
+        LoadContext context = loadContexts.get(pos);
+        if (context != null && (context.committing || context.full)) return loaded;
+        CubeHolder holder = taskScheduler.holder(pos);
+        return holder.status().isAtLeast(CubeStatus.FULL) ? loaded : null;
     }
 
     /** Schedules a block tick in the sparse queue when the position is cubic. */
@@ -229,20 +262,29 @@ final class CubicWorldState implements AutoCloseable {
     BlockEntity getBlockEntity(BlockPos pos) throws IOException {
         GenerationReadContext generation = generationReadContexts.get();
         if (generation != null) return generation.blockEntity(pos);
-        return cubeForRead(pos).getBlockEntity(pos);
+        LoadedCube cube = cubeForRead(pos);
+        return cube == null ? null : cube.getBlockEntity(pos);
     }
 
     void putBlockEntity(BlockEntity blockEntity) throws IOException {
         GenerationReadContext generation = generationReadContexts.get();
         if (generation != null && !generation.owns(blockEntity.getPos())) return;
+        CubePos pos = CubePos.fromBlock(
+                blockEntity.getPos().getX(), blockEntity.getPos().getY(), blockEntity.getPos().getZ());
+        LoadedCube cube = generation != null
+                ? cube(pos) : loadedCubeForMutation(pos);
+        if (cube == null) return;
         blockEntity.setWorld(world);
-        cube(blockEntity.getPos()).putBlockEntity(blockEntity);
+        cube.putBlockEntity(blockEntity);
     }
 
     void removeBlockEntity(BlockPos pos) throws IOException {
         GenerationReadContext generation = generationReadContexts.get();
         if (generation != null && !generation.owns(pos)) return;
-        cube(pos).removeBlockEntity(pos);
+        CubePos cubePos = CubePos.fromBlock(pos.getX(), pos.getY(), pos.getZ());
+        LoadedCube cube = generation != null
+                ? cube(cubePos) : loadedCubeForMutation(cubePos);
+        if (cube != null) cube.removeBlockEntity(pos);
     }
 
     void markDirty(BlockPos pos) throws IOException {
@@ -255,7 +297,8 @@ final class CubicWorldState implements AutoCloseable {
         // call World#markDirty while FEATURES is still being committed.  Do not
         // advance a neighbouring cube to FULL from that callback, or feature
         // generation recursively starts again through the LIGHT dependencies.
-        cubeForRead(pos).markDirty();
+        LoadedCube cube = cubeForRead(pos);
+        if (cube != null) cube.markDirty();
     }
 
     LoadedCube cube(BlockPos blockPos) throws IOException {
@@ -331,6 +374,12 @@ final class CubicWorldState implements AutoCloseable {
         return loaded == null ? 0L : loaded.revision();
     }
 
+    byte[] cubeLightPayload(CubePos pos) {
+        LoadedCube loaded = loadedCube(pos);
+        return loaded == null ? EMPTY_PAYLOAD
+                : CubeLightData.encodeSnapshot(loaded.light().snapshot());
+    }
+
     boolean suppressingGenerationUpdates() {
         return suppressingGenerationUpdates.get();
     }
@@ -371,12 +420,19 @@ final class CubicWorldState implements AutoCloseable {
 
     /**
      * Requests/adopts the cube's FULL lifecycle without waiting for IO or
-     * server-thread stage commits.  Completion is signalled by the holder's
-     * FULL future; its payload is intentionally not exposed here because the
-     * watcher can encode it after the completion callback runs on the server
-     * thread.
+     * server-thread stage commits. The watcher is released at PAYLOAD; the
+     * requested FULL lifecycle continues lighting in the background.
      */
     CompletableFuture<Void> prefetchCubePayload(CubePos pos, int priority) {
+        return payloadReadyFuture(requestFull(pos, priority));
+    }
+
+    /** Full completion is still required before restoring live entities. */
+    CompletableFuture<Void> prefetchCubeFull(CubePos pos, int priority) {
+        return fullReadyFuture(requestFull(pos, priority));
+    }
+
+    private CubeHolder requestFull(CubePos pos, int priority) {
         CubeHolder holder;
         LoadedCube loaded = loadedCube(pos);
         if (loaded == null) {
@@ -394,20 +450,33 @@ final class CubicWorldState implements AutoCloseable {
                 }
             }
         }
-        return fullReadyFuture(holder);
+        return holder;
     }
 
-    /** Mirrors a holder's FULL future while preserving exceptional completion
-     * and cancellation on the payload-free API exposed to watchers. */
-    private static CompletableFuture<Void> fullReadyFuture(CubeHolder holder) {
+    private static CompletableFuture<Void> payloadReadyFuture(CubeHolder holder) {
+        return stageReadyFuture(holder, CubeStatus.PAYLOAD);
+    }
+
+    /** Mirrors a holder stage future while preserving exceptional completion. */
+    private static CompletableFuture<Void> stageReadyFuture(CubeHolder holder, CubeStatus stage) {
         CompletableFuture<Void> ready = new CompletableFuture<>();
-        CompletableFuture<Optional<LoadedCube>> full = holder.fullFuture();
-        full.whenComplete((ignored, failure) -> {
+        holder.localStageFuture(stage).whenComplete((ignored, failure) -> {
             if (failure == null) {
                 ready.complete(null);
             } else {
-                // completeExceptionally preserves the holder's original
-                // throwable, including CancellationException identity.
+                ready.completeExceptionally(failure);
+            }
+        });
+        return ready;
+    }
+
+    /** Mirrors a holder's FULL future while preserving exceptional completion. */
+    private static CompletableFuture<Void> fullReadyFuture(CubeHolder holder) {
+        CompletableFuture<Void> ready = new CompletableFuture<>();
+        holder.fullFuture().whenComplete((ignored, failure) -> {
+            if (failure == null) {
+                ready.complete(null);
+            } else {
                 ready.completeExceptionally(failure);
             }
         });
@@ -431,11 +500,13 @@ final class CubicWorldState implements AutoCloseable {
                 return CubeRecordCodec.encode(loaded, world);
             }
             CubeHolder holder = taskScheduler.holder(pos);
-            if (!holder.status().isAtLeast(CubeStatus.FULL)) {
-                if (!holder.fullFuture().isDone()) return null;
-            } else {
-                taskScheduler.adoptLoaded(loaded);
+            if (!holder.status().isAtLeast(CubeStatus.PAYLOAD)) {
+                if (!holder.payloadFuture().isDone()) return null;
             }
+            // PAYLOAD is intentionally not LIGHT/FULL.  Do not adopt the
+            // placeholder as an already-complete cube here: doing so would
+            // skip eventual lighting and could mark the lifecycle FULL while
+            // the first packet is still being assembled.
             return CubeRecordCodec.encode(loaded, world);
         }
 
@@ -445,7 +516,7 @@ final class CubicWorldState implements AutoCloseable {
             return null;
         }
         try {
-            return finishCubePayload(pos, read.join(), priority, true);
+            return finishCubePayload(pos, read.join(), priority, true, CubeStatus.PAYLOAD);
         } catch (CompletionException exception) {
             Throwable cause = exception.getCause();
             if (cause instanceof IOException io) throw io;
@@ -458,11 +529,13 @@ final class CubicWorldState implements AutoCloseable {
     }
 
     private byte[] finishCubePayload(CubePos pos, Optional<byte[]> stored) throws IOException {
-        return finishCubePayload(pos, stored, SYNCHRONOUS_IO_PRIORITY, false);
+        return finishCubePayload(
+                pos, stored, SYNCHRONOUS_IO_PRIORITY, false, CubeStatus.FULL);
     }
 
     private byte[] finishCubePayload(
-            CubePos pos, Optional<byte[]> stored, int priority, boolean allowPending) throws IOException {
+            CubePos pos, Optional<byte[]> stored, int priority, boolean allowPending,
+            CubeStatus payloadStage) throws IOException {
         // A missing sparse cube is implicitly air unless this world's selected
         // preset asks HigherWorld to lazily generate the terrain below it.
         if (stored.isEmpty()) {
@@ -473,18 +546,18 @@ final class CubicWorldState implements AutoCloseable {
                 return EMPTY_PAYLOAD;
             }
             CubeHolder holder = taskScheduler.request(pos, CubeStatus.FULL, priority);
-            if (customWorld) {
-                var terrain = taskScheduler.prepareTerrain(holder, world.getSeed(), customWorldSettings, priority);
-                if (allowPending && !terrain.isDone()) {
-                    return null;
-                }
+            CompletableFuture<CubeTerrainSnapshot> terrain = customWorld
+                    ? taskScheduler.prepareTerrain(
+                            holder, world.getSeed(), customWorldSettings, priority)
+                    : taskScheduler.prepareVanillaTerrain(holder, world, priority);
+            if (terrain != null && allowPending && !terrain.isDone()) {
+                return null;
             }
             LoadedCube generated;
             if (allowPending) {
-                Optional<LoadedCube> completed = holder.fullFuture().getNow(null);
-                if (completed == null) return null;
-                generated = completed.orElse(null);
-                if (generated == null) return EMPTY_PAYLOAD;
+                if (!holder.localStageFuture(payloadStage).isDone()) return null;
+                generated = loadedCube(pos);
+                if (generated == null) return null;
             } else {
                 generated = ensureStage(pos, CubeStatus.FULL, priority, Optional.empty());
             }
@@ -496,10 +569,9 @@ final class CubicWorldState implements AutoCloseable {
         CubeHolder holder = taskScheduler.request(pos, CubeStatus.FULL, priority);
         LoadedCube created;
         if (allowPending) {
-            Optional<LoadedCube> completed = holder.fullFuture().getNow(null);
-            if (completed == null) return null;
-            created = completed.orElse(null);
-            if (created == null) return EMPTY_PAYLOAD;
+            if (!holder.localStageFuture(payloadStage).isDone()) return null;
+            created = loadedCube(pos);
+            if (created == null) return null;
         } else {
             created = ensureStage(pos, CubeStatus.FULL, priority, stored);
         }
@@ -604,15 +676,10 @@ final class CubicWorldState implements AutoCloseable {
                     iterator.remove();
                     continue;
                 }
-                LoadContext context = loadContexts.get(pos);
-                // Encoding a partial cube would synchronously force its whole
-                // lifecycle from this maintenance path. Keep the update
-                // coalesced until the normal bounded scheduler reaches FULL.
-                if (context != null && !context.full) continue;
                 iterator.remove();
                 batch.add(pos);
             }
-            if (!batch.isEmpty()) CubeWatchManager.broadcastCubeUpdates(world, batch);
+            if (!batch.isEmpty()) CubeWatchManager.broadcastLightUpdates(world, batch);
         }
         int randomTickSpeed = world.getGameRules().getValue(GameRules.RANDOM_TICK_SPEED);
         for (CubeColumn<LoadedCube> column : columns.values()) {
@@ -741,7 +808,17 @@ final class CubicWorldState implements AutoCloseable {
                     throw new CompletionException(exception);
                 }
             });
+            if (context.payload == null && !customWorld && shouldGenerate(pos)) {
+                for (CubePos dependency : VanillaPlacedFeatureGenerator.terrainBatchPositions(
+                        world, pos)) {
+                    ensureStage(dependency, CubeStatus.TERRAIN, priority + 1, null);
+                }
+            }
             commitFeatures(holder, context);
+        }
+        if (target.isAtLeast(CubeStatus.PAYLOAD)
+                && !holder.status().isAtLeast(CubeStatus.PAYLOAD)) {
+            holder.advance(CubeStatus.PAYLOAD);
         }
         if (target.isAtLeast(CubeStatus.LIGHT) && !holder.status().isAtLeast(CubeStatus.LIGHT)) {
             CubeStatus.LIGHT.dependencyRadius().forEach(pos, dependency -> {
@@ -777,9 +854,19 @@ final class CubicWorldState implements AutoCloseable {
         }
         if (!holder.status().isAtLeast(CubeStatus.FEATURES)) {
             if (!taskScheduler.dependenciesReady(holder, CubeStatus.FEATURES, priority)) return false;
+            if (context.payload == null && !customWorld && shouldGenerate(holder.pos())
+                    && !taskScheduler.featureBatchTerrainReady(world, holder, priority)) {
+                return false;
+            }
             commitFeatures(holder, context);
             return true;
         }
+        if (holder.target().isAtLeast(CubeStatus.PAYLOAD)
+                && !holder.status().isAtLeast(CubeStatus.PAYLOAD)) {
+            holder.advance(CubeStatus.PAYLOAD);
+            return true;
+        }
+        if (!holder.target().isAtLeast(CubeStatus.LIGHT)) return false;
         if (!holder.status().isAtLeast(CubeStatus.LIGHT)) {
             if (!taskScheduler.dependenciesReady(holder, CubeStatus.LIGHT, priority)) return false;
             return commitLight(holder, context);
@@ -889,28 +976,35 @@ final class CubicWorldState implements AutoCloseable {
                 } finally {
                     context.committing = false;
                 }
-            } else if (shouldGenerate(pos) && customWorld) {
-                CompletableFuture<CustomCubeGenerator.TerrainSnapshot> preparation =
-                        taskScheduler.prepareTerrain(holder, world.getSeed(), customWorldSettings, priority);
-                if (!wait && !preparation.isDone()) return false;
-                try {
+            } else if (shouldGenerate(pos)) {
+                CompletableFuture<CubeTerrainSnapshot> preparation = customWorld
+                        ? taskScheduler.prepareTerrain(
+                                holder, world.getSeed(), customWorldSettings, priority)
+                        : taskScheduler.prepareVanillaTerrain(holder, world, priority);
+                if (preparation != null) {
+                    if (!wait && !preparation.isDone()) return false;
+                    try {
+                        context.committing = true;
+                        try {
+                            preparation.join().applyTo(context.cube);
+                        } finally {
+                            context.committing = false;
+                        }
+                    } catch (CompletionException exception) {
+                        Throwable cause = exception.getCause();
+                        if (cause instanceof RuntimeException runtime) throw runtime;
+                        throw new IOException("Cannot prepare terrain for cube " + pos, cause);
+                    }
+                } else {
+                    // Non-noise generators have no pure column-sampling path.
+                    // Keep the old server-thread fallback for compatibility;
+                    // ordinary Overworld noise never enters this branch.
                     context.committing = true;
                     try {
-                        CustomCubeGenerator.applyTerrain(context.cube, preparation.join());
+                        InfiniteDownwardGenerator.generateTerrain(world, context.cube);
                     } finally {
                         context.committing = false;
                     }
-                } catch (CompletionException exception) {
-                    Throwable cause = exception.getCause();
-                    if (cause instanceof RuntimeException runtime) throw runtime;
-                    throw new IOException("Cannot prepare terrain for cube " + pos, cause);
-                }
-            } else if (shouldGenerate(pos)) {
-                context.committing = true;
-                try {
-                    InfiniteDownwardGenerator.generateTerrain(world, context.cube);
-                } finally {
-                    context.committing = false;
                 }
             }
             holder.advance(CubeStatus.TERRAIN);
@@ -970,7 +1064,9 @@ final class CubicWorldState implements AutoCloseable {
     private boolean commitLightBody(CubeHolder holder, LoadContext context) {
         if (!context.lightQueued) {
             indexHeights(context.cube);
-            lightEngine.queueCube(holder.pos(), !context.hasSavedLight);
+            boolean initializeAllCells = !context.hasSavedLight
+                    && !hasUniformLightFastPath(context.cube);
+            lightEngine.queueCube(holder.pos(), initializeAllCells);
             context.lightQueued = true;
         }
         SparseCubeLightEngine.Result result = lightEngine.propagate(
@@ -978,6 +1074,30 @@ final class CubicWorldState implements AutoCloseable {
         pendingLightBroadcasts.addAll(result.changedCubes());
         if (!result.complete()) return false;
         holder.advance(CubeStatus.LIGHT);
+        return true;
+    }
+
+    /**
+     * Uniform cubes do not need 4096 initial light nodes.  Boundary seeding is
+     * sufficient for empty cubes and for non-emitting opaque cubes; propagation
+     * still expands into an empty interior when a neighbouring source exists.
+     */
+    private static boolean hasUniformLightFastPath(LoadedCube cube) {
+        if (!cube.blockEntities().isEmpty()) return false;
+        BlockState reference = cube.section().getBlockState(0, 0, 0);
+        if (!reference.isAir()
+                && (reference.getOpacity() < 15 || reference.getLuminance() != 0)) {
+            return false;
+        }
+        for (int localY = 0; localY < CubePos.SIZE; localY++) {
+            for (int localZ = 0; localZ < CubePos.SIZE; localZ++) {
+                for (int localX = 0; localX < CubePos.SIZE; localX++) {
+                    if (!cube.section().getBlockState(localX, localY, localZ).equals(reference)) {
+                        return false;
+                    }
+                }
+            }
+        }
         return true;
     }
 

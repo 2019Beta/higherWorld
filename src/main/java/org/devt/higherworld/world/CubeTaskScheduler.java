@@ -16,6 +16,7 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import net.minecraft.server.world.ServerWorld;
 import org.devt.higherworld.storage.CubeIoScheduler;
 import org.devt.higherworld.storage.CubePos;
 
@@ -189,6 +190,25 @@ final class CubeTaskScheduler implements AutoCloseable {
         return ready;
     }
 
+    /**
+     * Starts/inspects the terrain-only read set for a batched underground
+     * feature pass.  The extra positions are deliberately not FEATURES
+     * dependencies: they provide read-only terrain to the immutable batch and
+     * must never recursively start another feature pass.
+     */
+    boolean featureBatchTerrainReady(ServerWorld world, CubeHolder holder, int priority) {
+        boolean ready = true;
+        for (CubePos dependency : VanillaPlacedFeatureGenerator.terrainBatchPositions(
+                world, holder.pos())) {
+            CubeHolder dependencyHolder = request(dependency, CubeStatus.TERRAIN, priority + 1);
+            if (dependencyHolder.failed()
+                    || !dependencyHolder.status().isAtLeast(CubeStatus.TERRAIN)) {
+                ready = false;
+            }
+        }
+        return ready;
+    }
+
     void awaitNeighbourDependencies(CubeHolder holder, CubeStatus stage, int priority) {
         neighbourDependenciesFuture(holder, stage, priority).join();
     }
@@ -211,24 +231,68 @@ final class CubeTaskScheduler implements AutoCloseable {
         dependenciesFuture(holder, stage, priority).join();
     }
 
-    CompletableFuture<CustomCubeGenerator.TerrainSnapshot> prepareTerrain(
+    CompletableFuture<CubeTerrainSnapshot> prepareTerrain(
             CubeHolder holder, long seed, CustomWorldSettings settings, int priority) {
         return holder.startTerrain(() -> dependenciesFuture(holder, CubeStatus.TERRAIN, priority)
                 .thenCompose(ignored -> {
-                    CompletableFuture<CustomCubeGenerator.TerrainSnapshot> result = new CompletableFuture<>();
+                    CompletableFuture<CubeTerrainSnapshot> result = new CompletableFuture<>();
                     long epoch = holder.epoch();
-                    generationExecutor.execute(new GenerationTask(priority, sequence.getAndIncrement(), () -> {
-                        if (!holder.isCurrent(epoch) || !holder.target().isAtLeast(CubeStatus.TERRAIN)) {
-                            result.cancel(false);
-                            return;
-                        }
-                        try {
-                            result.complete(CustomCubeGenerator.prepareTerrain(seed, holder.pos(), settings));
-                        } catch (Throwable throwable) {
-                            result.completeExceptionally(throwable);
-                            holder.fail(epoch, throwable);
-                        }
-                    }));
+                    try {
+                        generationExecutor.execute(new GenerationTask(priority, sequence.getAndIncrement(), () -> {
+                            if (!holder.isCurrent(epoch) || !holder.target().isAtLeast(CubeStatus.TERRAIN)) {
+                                result.cancel(false);
+                                return;
+                            }
+                            try {
+                                result.complete(CustomCubeGenerator.prepareTerrain(seed, holder.pos(), settings));
+                            } catch (Throwable throwable) {
+                                result.completeExceptionally(throwable);
+                                holder.fail(epoch, throwable);
+                            }
+                        }));
+                    } catch (RuntimeException exception) {
+                        result.completeExceptionally(exception);
+                        holder.fail(epoch, exception);
+                    }
+                    return result;
+                }));
+    }
+
+    /**
+     * Captures the vanilla noise inputs on the server thread, then samples a
+     * 16 x 16 x 64 immutable batch on a generation worker. The worker never
+     * receives a ServerWorld or LoadedCube; its structure accessor and palette
+     * factory are the read-only collaborators vanilla passes to the same
+     * asynchronous noise-fill operation.
+     */
+    CompletableFuture<CubeTerrainSnapshot> prepareVanillaTerrain(
+            CubeHolder holder, ServerWorld world, int priority) {
+        VanillaCubeTerrainGenerator.TerrainRequest request =
+                VanillaCubeTerrainGenerator.prepareRequest(world, holder.pos());
+        if (request == null) return null;
+        return holder.startTerrain(() -> dependenciesFuture(holder, CubeStatus.TERRAIN, priority)
+                .thenCompose(ignored -> {
+                    CompletableFuture<CubeTerrainSnapshot> result = new CompletableFuture<>();
+                    long epoch = holder.epoch();
+                    try {
+                        generationExecutor.execute(new GenerationTask(
+                                priority, sequence.getAndIncrement(), () -> {
+                                    if (!holder.isCurrent(epoch)
+                                            || !holder.target().isAtLeast(CubeStatus.TERRAIN)) {
+                                        result.cancel(false);
+                                        return;
+                                    }
+                                    try {
+                                        result.complete(VanillaCubeTerrainGenerator.prepareTerrain(request));
+                                    } catch (Throwable throwable) {
+                                        result.completeExceptionally(throwable);
+                                        holder.fail(epoch, throwable);
+                                    }
+                                }));
+                    } catch (RuntimeException exception) {
+                        result.completeExceptionally(exception);
+                        holder.fail(epoch, exception);
+                    }
                     return result;
                 }));
     }
@@ -270,6 +334,16 @@ final class CubeTaskScheduler implements AutoCloseable {
                     || !holder.target().isAtLeast(CubeStatus.TERRAIN)
                     || !holder.status().isAtLeast(CubeStatus.IO_READY)
                     || holder.status().isAtLeast(holder.target())) {
+                continue;
+            }
+
+            // The first visit starts terrain preparation. Once preparation is
+            // in flight, leave this holder out until the worker completes;
+            // repeatedly polling the same future on the server thread can
+            // consume the whole bounded commit slice during view rebuilds.
+            CompletableFuture<CubeTerrainSnapshot> terrain = holder.terrainPreparationFuture();
+            if (holder.status() == CubeStatus.IO_READY
+                    && terrain != null && !terrain.isDone()) {
                 continue;
             }
 

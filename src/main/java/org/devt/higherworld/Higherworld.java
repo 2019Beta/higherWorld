@@ -11,6 +11,7 @@ import net.minecraft.world.dimension.DimensionType;
 import net.minecraft.world.gen.WorldPreset;
 import org.devt.higherworld.world.CubeBlockUpdatePayload;
 import org.devt.higherworld.world.CubeDataPayload;
+import org.devt.higherworld.world.CubeLightUpdatePayload;
 import org.devt.higherworld.world.CubeUnloadPayload;
 import org.devt.higherworld.world.CubeWatchManager;
 import org.devt.higherworld.world.CubicWorldManager;
@@ -30,6 +31,7 @@ public class Higherworld implements ModInitializer {
     @Override
     public void onInitialize() {
         PayloadTypeRegistry.playS2C().register(CubeDataPayload.ID, CubeDataPayload.CODEC);
+        PayloadTypeRegistry.playS2C().register(CubeLightUpdatePayload.ID, CubeLightUpdatePayload.CODEC);
         PayloadTypeRegistry.playS2C().register(CubeUnloadPayload.ID, CubeUnloadPayload.CODEC);
         PayloadTypeRegistry.playS2C().register(CubeBlockUpdatePayload.ID, CubeBlockUpdatePayload.CODEC);
 

@@ -62,11 +62,12 @@ final class CustomCubeGenerator {
 
     /** Main-thread commit of the immutable worker result. */
     static void applyTerrain(LoadedCube cube, TerrainSnapshot snapshot) {
+        boolean[] solid = snapshot.solid();
         for (int localY = 0; localY < CubePos.SIZE; localY++) {
             for (int localZ = 0; localZ < CubePos.SIZE; localZ++) {
                 for (int localX = 0; localX < CubePos.SIZE; localX++) {
                     cube.setGeneratedBlockState(localX, localY, localZ,
-                            snapshot.solid()[blockIndex(localX, localY, localZ)]
+                            solid[blockIndex(localX, localY, localZ)]
                                     ? Blocks.DEEPSLATE.getDefaultState()
                                     : Blocks.AIR.getDefaultState());
                 }
@@ -184,11 +185,22 @@ final class CustomCubeGenerator {
         return first + (second - first) * amount;
     }
 
-    record TerrainSnapshot(boolean[] solid) {
+    record TerrainSnapshot(boolean[] solid) implements CubeTerrainSnapshot {
         TerrainSnapshot {
             if (solid.length != CubePos.SIZE * CubePos.SIZE * CubePos.SIZE) {
                 throw new IllegalArgumentException("A terrain snapshot must contain exactly 4096 blocks");
             }
+            solid = solid.clone();
+        }
+
+        @Override
+        public boolean[] solid() {
+            return solid.clone();
+        }
+
+        @Override
+        public void applyTo(LoadedCube cube) {
+            CustomCubeGenerator.applyTerrain(cube, this);
         }
     }
 }

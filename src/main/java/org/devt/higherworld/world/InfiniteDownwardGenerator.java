@@ -41,6 +41,7 @@ final class InfiniteDownwardGenerator {
         LEGACY_CAVE_DENSITIES.remove(world);
         EXTENDED_OVERWORLD_DENSITIES.remove(world);
         VanillaCubeTerrainGenerator.release(world);
+        VanillaPlacedFeatureGenerator.release(world);
     }
 
     static void generate(
