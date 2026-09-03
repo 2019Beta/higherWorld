@@ -419,17 +419,26 @@ final class CubicWorldState implements AutoCloseable {
     }
 
     /**
-     * Requests/adopts the cube's FULL lifecycle without waiting for IO or
-     * server-thread stage commits. The watcher is released at PAYLOAD; the
-     * requested FULL lifecycle continues lighting in the background.
+     * Requests only the block/feature payload needed for the first client
+     * packet. Deferring FULL avoids expanding the lighting dependency graph
+     * for thousands of not-yet-visible cubes during a view rebuild.
      */
     CompletableFuture<Void> prefetchCubePayload(CubePos pos, int priority) {
-        return payloadReadyFuture(requestFull(pos, priority));
+        return payloadReadyFuture(requestTarget(pos, CubeStatus.PAYLOAD, priority));
     }
 
     /** Full completion is still required before restoring live entities. */
     CompletableFuture<Void> prefetchCubeFull(CubePos pos, int priority) {
         return fullReadyFuture(requestFull(pos, priority));
+    }
+
+    private CubeHolder requestTarget(CubePos pos, CubeStatus target, int priority) {
+        LoadedCube loaded = loadedCube(pos);
+        LoadContext context = loadContexts.get(pos);
+        if (loaded != null && context != null && context.full) {
+            return taskScheduler.adoptLoaded(loaded);
+        }
+        return taskScheduler.request(pos, target, priority);
     }
 
     private CubeHolder requestFull(CubePos pos, int priority) {
@@ -510,7 +519,7 @@ final class CubicWorldState implements AutoCloseable {
             return CubeRecordCodec.encode(loaded, world);
         }
 
-        CubeHolder holder = taskScheduler.request(pos, CubeStatus.FULL, priority);
+        CubeHolder holder = taskScheduler.request(pos, CubeStatus.PAYLOAD, priority);
         CompletableFuture<Optional<byte[]>> read = holder.ioFuture();
         if (!read.isDone()) {
             return null;
@@ -545,7 +554,8 @@ final class CubicWorldState implements AutoCloseable {
                 holder.complete(null);
                 return EMPTY_PAYLOAD;
             }
-            CubeHolder holder = taskScheduler.request(pos, CubeStatus.FULL, priority);
+            CubeStatus requestedTarget = allowPending ? payloadStage : CubeStatus.FULL;
+            CubeHolder holder = taskScheduler.request(pos, requestedTarget, priority);
             CompletableFuture<CubeTerrainSnapshot> terrain = customWorld
                     ? taskScheduler.prepareTerrain(
                             holder, world.getSeed(), customWorldSettings, priority)
@@ -566,7 +576,8 @@ final class CubicWorldState implements AutoCloseable {
 
         // Real stored cubes still enter the runtime so their block entities and
         // random-ticking blocks continue to simulate while watched.
-        CubeHolder holder = taskScheduler.request(pos, CubeStatus.FULL, priority);
+        CubeStatus requestedTarget = allowPending ? payloadStage : CubeStatus.FULL;
+        CubeHolder holder = taskScheduler.request(pos, requestedTarget, priority);
         LoadedCube created;
         if (allowPending) {
             if (!holder.localStageFuture(payloadStage).isDone()) return null;
@@ -705,7 +716,7 @@ final class CubicWorldState implements AutoCloseable {
     /** Commits completed worker terrain during a bounded mid-tick slice. */
     void advanceReadyTasks(long budgetNanos) {
         long deadline = System.nanoTime() + Math.max(0L, budgetNanos);
-        for (CubeHolder holder : taskScheduler.readyForCommit(64)) {
+        for (CubeHolder holder : taskScheduler.readyForCommit(256)) {
             if (System.nanoTime() >= deadline) break;
             try {
                 tryAdvance(holder, taskScheduler.priority(holder.pos()));

@@ -86,6 +86,24 @@ class CubeTaskSchedulerLifecycleTest {
     }
 
     @Test
+    void payloadFirstRequestDefersTheOuterLightingDependencyHalo() {
+        CubePos center = new CubePos(12, -20, -7);
+        try (CubeStorage storage = new CubeStorage(directory);
+                CubeIoScheduler io = new CubeIoScheduler(storage);
+                CubeTaskScheduler scheduler = new CubeTaskScheduler(io)) {
+            CubeHolder payload = scheduler.request(center, CubeStatus.PAYLOAD, 0);
+
+            assertEquals(CubeStatus.PAYLOAD, payload.target());
+            assertEquals(27, scheduler.holderCount());
+
+            scheduler.request(center, CubeStatus.FULL, 0);
+
+            assertEquals(CubeStatus.FULL, payload.target());
+            assertEquals(125, scheduler.holderCount());
+        }
+    }
+
+    @Test
     void readyCommitSkipsHighPriorityStageWhoseDependenciesAreBlocked() {
         CubePos blockedHighPriorityPos = new CubePos(100, -20, 100);
         CubePos lowPriorityTerrainPos = new CubePos(-100, -20, -100);

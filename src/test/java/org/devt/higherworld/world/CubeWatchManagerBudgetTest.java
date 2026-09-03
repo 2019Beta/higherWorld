@@ -13,11 +13,9 @@ class CubeWatchManagerBudgetTest {
         assertTrue(budget.claimCommitNanos() > 0L);
         budget.recordCommit(12_000_000L);
 
-        assertEquals(10_000_000L, budget.debtNanos());
+        assertEquals(6_000_000L, budget.debtNanos());
         assertEquals(0, budget.cubeAllowance());
-        for (int tick = 0; tick < 5; tick++) {
-            assertEquals(0L, budget.claimCommitNanos());
-        }
+        assertEquals(0L, budget.claimCommitNanos());
         assertEquals(0L, budget.debtNanos());
         assertTrue(budget.claimCommitNanos() > 0L);
     }
@@ -28,6 +26,6 @@ class CubeWatchManagerBudgetTest {
 
         budget.recordCommit(2_000_000_000L);
 
-        assertEquals(200_000_000L, budget.debtNanos());
+        assertEquals(300_000_000L, budget.debtNanos());
     }
 }

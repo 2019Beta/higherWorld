@@ -29,9 +29,9 @@ public final class CubeWatchManager {
     // monopolizing that thread; pure vanilla terrain sampling is dispatched by
     // CubeTaskScheduler. Share this budget across all players so additional
     // players cannot multiply synchronous cube work in a single tick.
-    private static final int CUBE_WORK_PER_WORLD_TICK = 1;
-    private static final int POLL_ATTEMPTS_PER_PLAYER_TICK = 2;
-    private static final int READ_AHEAD_PER_WORLD_TICK = 2;
+    private static final int CUBE_WORK_PER_WORLD_TICK = 4;
+    private static final int POLL_ATTEMPTS_PER_PLAYER_TICK = 32;
+    private static final int READ_AHEAD_PER_WORLD_TICK = 8;
     private static final long PREFETCH_RETRY_DELAY_TICKS = 2L;
     private static final long SEND_RETRY_DELAY_TICKS = 1L;
     private static final Map<UUID, WatchState> WATCHERS = new HashMap<>();
@@ -89,9 +89,12 @@ public final class CubeWatchManager {
             }
             CubicWorldManager.evictExcept(world, retained);
         }
+        // Feed send throttling with watcher work, not simulation/save time.
+        // Including the rest of the world tick made one unrelated slow block
+        // entity collapse streaming back to a single cube per tick.
+        adaptive.record(System.nanoTime() - workStarted);
         CubicWorldManager.tick(world);
         CubicWorldManager.flushDirty(world);
-        adaptive.record(System.nanoTime() - workStarted);
     }
 
     /** Drains completed lifecycle work once per world tick on the server thread. */
@@ -278,6 +281,14 @@ public final class CubeWatchManager {
             // every time the player crosses a section boundary.
             state.sent.add(pos);
             state.finish(watch);
+            // Render PAYLOAD immediately, then expand the more expensive
+            // lighting/FULL graph after the first packet has left the server.
+            try {
+                CubicWorldManager.prefetchCubeFull(world, pos, watch.rank);
+            } catch (RuntimeException ignored) {
+                // A later simulation/entity ticket can retry FULL; the visible
+                // payload has already been delivered successfully.
+            }
         }
         return rebuilt;
     }
@@ -680,15 +691,15 @@ public final class CubeWatchManager {
 
     /** Keeps cube work near a small tick slice using an EWMA of actual cost. */
     static final class AdaptiveBudget {
-        private static final long TARGET_NANOS = 2_000_000L;
-        private static final long MAX_DEBT_NANOS = 200_000_000L;
+        private static final long TARGET_NANOS = 6_000_000L;
+        private static final long MAX_DEBT_NANOS = 300_000_000L;
         private double averageNanos = TARGET_NANOS;
         private long debtNanos;
 
         int cubeAllowance() {
             if (debtNanos > 0L) return 0;
             double ratio = TARGET_NANOS / Math.max(250_000.0, averageNanos);
-            return Math.max(1, Math.min(4, (int) Math.round(CUBE_WORK_PER_WORLD_TICK * ratio)));
+            return Math.max(1, Math.min(32, (int) Math.round(CUBE_WORK_PER_WORLD_TICK * ratio)));
         }
 
         long claimCommitNanos() {
@@ -696,7 +707,7 @@ public final class CubeWatchManager {
                 debtNanos = Math.max(0L, debtNanos - TARGET_NANOS);
                 return 0L;
             }
-            return Math.max(250_000L, Math.min(TARGET_NANOS, (long) (TARGET_NANOS *
+            return Math.max(500_000L, Math.min(TARGET_NANOS, (long) (TARGET_NANOS *
                     TARGET_NANOS / Math.max(TARGET_NANOS, averageNanos))));
         }
 

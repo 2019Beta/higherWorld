@@ -394,11 +394,11 @@ public final class CubicWorldManager {
     }
 
     /**
-     * Requests a watched cube's FULL lifecycle and returns when its block and
-     * feature PAYLOAD is ready. Lighting continues asynchronously. The
-     * returned future is deliberately payload-free: callers only need a
-     * completion signal and should use {@link #tryCubePayload} when they need
-     * encoded data.
+     * Requests a watched cube through its block/feature PAYLOAD stage. The
+     * watcher promotes it to FULL only after sending that first packet, so
+     * lighting dependencies cannot delay initial visibility. The returned
+     * future is deliberately payload-free: callers should use
+     * {@link #tryCubePayload} when they need encoded data.
      *
      * <p>If this world has not been opened yet, there is no lifecycle to wait
      * for, so the method returns an already completed future.</p>
