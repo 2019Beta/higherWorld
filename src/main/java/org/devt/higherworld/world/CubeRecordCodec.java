@@ -21,8 +21,10 @@ public final class CubeRecordCodec {
     private static final int MAGIC_V2 = 0x48574332; // HWC2
     private static final int MAGIC_V3 = 0x48574333; // HWC3, includes generator version
     private static final int MAGIC_V4 = 0x48574334; // HWC4, includes sparse cube light
+    private static final int MAGIC_V5 = 0x48574335; // HWC5, includes cube scheduled ticks
     private static final int MAX_SECTION_BYTES = 2 * 1024 * 1024;
     private static final int MAX_BLOCK_ENTITIES = 4096;
+    private static final int MAX_SCHEDULED_TICKS = 8192;
 
     private CubeRecordCodec() {
     }
@@ -31,7 +33,7 @@ public final class CubeRecordCodec {
         byte[] sectionPayload = ChunkSectionCodec.encode(cube.section());
         ByteArrayOutputStream bytes = new ByteArrayOutputStream(sectionPayload.length + 128);
         try (DataOutputStream output = new DataOutputStream(bytes)) {
-            output.writeInt(MAGIC_V4);
+            output.writeInt(MAGIC_V5);
             output.writeInt(cube.generationVersion());
             output.writeInt(sectionPayload.length);
             output.write(sectionPayload);
@@ -40,20 +42,30 @@ public final class CubeRecordCodec {
                 NbtIo.writeCompound(blockEntity.createNbtWithIdentifyingData(world.getRegistryManager()), output);
             }
             CubeLightData.write(output, cube.light().snapshot());
+            CubeScheduledTickQueue queue = world instanceof net.minecraft.server.world.ServerWorld serverWorld
+                    ? CubeScheduledTickQueue.forWorld(serverWorld) : null;
+            List<CubeScheduledTick> ticks = queue == null ? List.of() : queue.snapshot(cube.pos());
+            if (ticks.size() > MAX_SCHEDULED_TICKS) {
+                throw new IOException("Too many scheduled ticks in cube " + cube.pos());
+            }
+            output.writeInt(ticks.size());
+            for (CubeScheduledTick tick : ticks) {
+                tick.write(output);
+            }
         }
         return bytes.toByteArray();
     }
 
     public static DecodedCube decode(byte[] payload, ChunkSection section, World world) throws IOException {
         int magic = payload.length < Integer.BYTES ? 0 : readMagic(payload);
-        if (magic != MAGIC_V2 && magic != MAGIC_V3 && magic != MAGIC_V4) {
+        if (magic != MAGIC_V2 && magic != MAGIC_V3 && magic != MAGIC_V4 && magic != MAGIC_V5) {
             ChunkSectionCodec.decodeInto(payload, section);
-            return new DecodedCube(List.of(), CubeLightData.Snapshot.dark(), false);
+            return new DecodedCube(List.of(), CubeLightData.Snapshot.dark(), false, List.of());
         }
 
         try (DataInputStream input = new DataInputStream(new ByteArrayInputStream(payload))) {
             input.readInt();
-            if (magic == MAGIC_V3 || magic == MAGIC_V4) {
+            if (magic == MAGIC_V3 || magic == MAGIC_V4 || magic == MAGIC_V5) {
                 input.readInt();
             }
             int sectionLength = input.readInt();
@@ -79,20 +91,33 @@ public final class CubeRecordCodec {
                 }
             }
             CubeLightData.Snapshot light = CubeLightData.Snapshot.dark();
-            boolean hasLight = magic == MAGIC_V4;
+            boolean hasLight = magic == MAGIC_V4 || magic == MAGIC_V5;
             if (hasLight) {
                 light = CubeLightData.read(input);
+            }
+            List<CubeScheduledTick> scheduledTicks = List.of();
+            if (magic == MAGIC_V5) {
+                int tickCount = input.readInt();
+                if (tickCount < 0 || tickCount > MAX_SCHEDULED_TICKS) {
+                    throw new IOException("Invalid scheduled tick count: " + tickCount);
+                }
+                List<CubeScheduledTick> decodedTicks = new ArrayList<>(tickCount);
+                for (int index = 0; index < tickCount; index++) {
+                    decodedTicks.add(CubeScheduledTick.read(input));
+                }
+                scheduledTicks = List.copyOf(decodedTicks);
             }
             if (input.available() != 0) {
                 throw new IOException("Trailing bytes in cube record: " + input.available());
             }
-            return new DecodedCube(List.copyOf(blockEntities), light, hasLight);
+            return new DecodedCube(List.copyOf(blockEntities), light, hasLight, scheduledTicks);
         }
     }
 
     static int generationVersion(byte[] payload) {
         int magic = payload.length < Integer.BYTES ? 0 : readMagic(payload);
-        if (payload.length < Integer.BYTES * 2 || (magic != MAGIC_V3 && magic != MAGIC_V4)) {
+        if (payload.length < Integer.BYTES * 2
+                || (magic != MAGIC_V3 && magic != MAGIC_V4 && magic != MAGIC_V5)) {
             return 0;
         }
         return (payload[4] & 0xFF) << 24 | (payload[5] & 0xFF) << 16
@@ -105,5 +130,6 @@ public final class CubeRecordCodec {
     }
 
     public record DecodedCube(
-            List<BlockEntity> blockEntities, CubeLightData.Snapshot light, boolean hasLight) {}
+            List<BlockEntity> blockEntities, CubeLightData.Snapshot light, boolean hasLight,
+            List<CubeScheduledTick> scheduledTicks) {}
 }

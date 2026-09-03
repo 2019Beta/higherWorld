@@ -18,6 +18,12 @@ class CubeRecordCodecTest {
     }
 
     @Test
+    void readsGenerationVersionFromHwc5Header() {
+        byte[] payload = {0x48, 0x57, 0x43, 0x35, 0, 0, 0, 9};
+        assertEquals(9, CubeRecordCodec.generationVersion(payload));
+    }
+
+    @Test
     void treatsOlderAndTruncatedRecordsAsUnversioned() {
         assertEquals(0, CubeRecordCodec.generationVersion(
                 new byte[] {0x48, 0x57, 0x43, 0x32, 0, 0, 0, 9}));

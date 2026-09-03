@@ -4,11 +4,16 @@ import org.devt.higherworld.storage.CubePos;
 
 /** An anisotropic 3D dependency radius; vertical work is never implied by X/Z. */
 public record CubeDependencyRadius(int x, int y, int z) {
+    /** Keeps dependency expansion and spatial-lock allocation bounded. */
+    public static final int MAX_RADIUS = 128;
     public static final CubeDependencyRadius NONE = new CubeDependencyRadius(0, 0, 0);
 
     public CubeDependencyRadius {
         if (x < 0 || y < 0 || z < 0) {
             throw new IllegalArgumentException("Cube dependency radii cannot be negative");
+        }
+        if (x > MAX_RADIUS || y > MAX_RADIUS || z > MAX_RADIUS) {
+            throw new IllegalArgumentException("Cube dependency radii are out of bounds");
         }
     }
 

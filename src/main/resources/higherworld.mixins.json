@@ -13,6 +13,7 @@
     "PacketByteBufMixin",
     "ServerPlayNetworkHandlerMixin",
     "ServerWorldMixin",
+    "ScheduledTickViewMixin",
     "WorldMixin"
   ],
   "injectors": {

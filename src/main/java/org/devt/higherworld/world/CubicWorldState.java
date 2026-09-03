@@ -1,6 +1,7 @@
 package org.devt.higherworld.world;
 
 import java.io.IOException;
+import java.nio.file.Path;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -13,14 +14,19 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.CompletableFuture;
 
+import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.entity.BlockEntity;
+import net.minecraft.fluid.Fluid;
 import net.minecraft.fluid.FluidState;
+import net.minecraft.registry.Registries;
 import net.minecraft.server.world.ServerWorld;
+import net.minecraft.util.Identifier;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.world.chunk.ChunkSection;
 import net.minecraft.world.Heightmap;
 import net.minecraft.world.rule.GameRules;
+import net.minecraft.world.tick.TickPriority;
 import org.devt.higherworld.Higherworld;
 import org.devt.higherworld.storage.CubeIoScheduler;
 import org.devt.higherworld.storage.CubePos;
@@ -50,6 +56,10 @@ final class CubicWorldState implements AutoCloseable {
     private final ConcurrentMap<CubePos, LoadContext> loadContexts = new ConcurrentHashMap<>();
     private final ConcurrentMap<BlockColumnPos, Integer> highestBlocks = new ConcurrentHashMap<>();
     private final SparseCubeLightEngine lightEngine = new SparseCubeLightEngine(new LightAccess());
+    private final CubeScheduledTickQueue scheduledTicks;
+    private final CubeScheduledTickJournal scheduledTickJournal;
+    private final CubePathfindingAccess pathfindingAccess;
+    private final CubeSimulationServices simulationServices;
     private final Set<CubePos> pendingLightBroadcasts = new HashSet<>();
     private final ThreadLocal<Boolean> committingFeatures = ThreadLocal.withInitial(() -> false);
     /**
@@ -62,7 +72,7 @@ final class CubicWorldState implements AutoCloseable {
             ThreadLocal.withInitial(() -> false);
 
     CubicWorldState(
-            ServerWorld world, CubeStorage storage, boolean generateStructures,
+            ServerWorld world, CubeStorage storage, Path simulationRoot, boolean generateStructures,
             StructureGenerationSettings structureSettings,
             CustomWorldSettings customWorldSettings) {
         this.world = world;
@@ -74,6 +84,41 @@ final class CubicWorldState implements AutoCloseable {
         this.generateStructures = generateStructures;
         this.structureSettings = structureSettings;
         this.customWorldSettings = customWorldSettings;
+        this.scheduledTicks = new CubeScheduledTickQueue(this::markScheduledTickDirty);
+        this.scheduledTickJournal = new CubeScheduledTickJournal(
+                simulationRoot.resolve(CubeScheduledTickJournal.FILE_NAME));
+        scheduledTicks.restoreAll(scheduledTickJournal.load());
+        CubeScheduledTickQueue.register(world, scheduledTicks);
+        this.pathfindingAccess = new CubePathfindingAccess() {
+            @Override
+            public CubeStatus status(CubePos pos) {
+                LoadContext context = loadContexts.get(pos);
+                return cubes.containsKey(pos) && context != null && context.full
+                        ? CubeStatus.FULL : CubeStatus.EMPTY;
+            }
+
+            @Override
+            public boolean isPassable(CubePathNode node) {
+                if (status(node.cube()) != CubeStatus.FULL) return false;
+                LoadedCube cube = cubes.get(node.cube());
+                return cube != null && cube.getBlockState(
+                        new BlockPos(node.x(), node.y(), node.z())).isAir();
+            }
+        };
+        this.simulationServices = new CubeSimulationServices(
+                simulationRoot.resolve("simulation_services.bin"), pathfindingAccess,
+                this::simulationWindows,
+                new CubeSimulationServices.EntityTicketSink() {
+                    @Override
+                    public void replace(CubeTicket ticket) {
+                        replaceTicket(ticket);
+                    }
+
+                    @Override
+                    public void remove(Object owner) {
+                        removeTicket(owner);
+                    }
+                });
     }
 
     BlockState getBlockState(BlockPos pos) throws IOException {
@@ -109,6 +154,13 @@ final class CubicWorldState implements AutoCloseable {
         BlockState previous = cube.setBlockState(pos, state);
         Set<CubePos> changedLight = Set.of();
         if (previous != state) {
+            try {
+                simulationServices.onBlockStateChanged(pos, previous, state);
+            } catch (RuntimeException exception) {
+                // POI indexing is auxiliary state; a registry/API mismatch
+                // must never roll back the authoritative block mutation.
+                Higherworld.LOGGER.warn("Cannot update sparse POI index at {}", pos, exception);
+            }
             updateHeight(pos, state);
             lightEngine.queueBlock(pos.getX(), pos.getY(), pos.getZ());
             queueLoadedSkyColumn(pos.getX(), pos.getZ());
@@ -116,6 +168,36 @@ final class CubicWorldState implements AutoCloseable {
                     LIGHT_STEPS_PER_SLICE, LIGHT_NANOS_PER_SLICE).changedCubes();
         }
         return new BlockChange(previous, changedLight);
+    }
+
+    /** Schedules a block tick in the sparse queue when the position is cubic. */
+    boolean scheduleBlockTick(BlockPos pos, Block block, int delay, TickPriority priority) {
+        net.minecraft.util.Identifier id = Registries.BLOCK.getId(block);
+        if (id == null) return false;
+        return scheduledTicks.schedule(
+                CubeScheduledTick.block(pos, id.toString(), safeTrigger(world.getTime(), delay),
+                        priority, nextSubTickOrder()));
+    }
+
+    /** Schedules a fluid tick in the sparse queue when the position is cubic. */
+    boolean scheduleFluidTick(BlockPos pos, Fluid fluid, int delay, TickPriority priority) {
+        net.minecraft.util.Identifier id = Registries.FLUID.getId(fluid);
+        if (id == null) return false;
+        return scheduledTicks.schedule(
+                CubeScheduledTick.fluid(pos, id.toString(), safeTrigger(world.getTime(), delay),
+                        priority, nextSubTickOrder()));
+    }
+
+    private long nextSubTickOrder() {
+        // The queue's public world hook uses the same monotonic order. Keeping
+        // this method here makes state-owned callers deterministic as well.
+        return scheduledTicks.nextOrderForState();
+    }
+
+    private static long safeTrigger(long now, int delay) {
+        long nonNegativeDelay = Math.max(0L, delay);
+        return nonNegativeDelay > 0L && now > Long.MAX_VALUE - nonNegativeDelay
+                ? Long.MAX_VALUE : now + nonNegativeDelay;
     }
 
     BlockEntity getBlockEntity(BlockPos pos) throws IOException {
@@ -164,6 +246,40 @@ final class CubicWorldState implements AutoCloseable {
 
     int loadedCubeCount() {
         return cubes.size();
+    }
+
+    CubeSimulationServices simulationServices() {
+        return simulationServices;
+    }
+
+    CubePathfindingAccess cubePathfindingAccess() {
+        return pathfindingAccess;
+    }
+
+    void openSimulationServices() {
+        simulationServices.open();
+    }
+
+    private Collection<CubePos> loadedFullCubes() {
+        Set<CubePos> result = new HashSet<>();
+        for (Map.Entry<CubePos, LoadedCube> entry : cubes.entrySet()) {
+            LoadContext context = loadContexts.get(entry.getKey());
+            if (context != null && context.full) result.add(entry.getKey());
+        }
+        return Set.copyOf(result);
+    }
+
+    private Collection<CubeSpawnPolicy.SimulationWindow> simulationWindows() {
+        int simulationDistance = Math.max(
+                0, world.getServer().getPlayerManager().getSimulationDistance());
+        List<CubeSpawnPolicy.SimulationWindow> result = new java.util.ArrayList<>();
+        for (var player : world.getPlayers()) {
+            BlockPos position = player.getBlockPos();
+            result.add(new CubeSpawnPolicy.SimulationWindow(
+                    CubePos.fromBlock(position.getX(), position.getY(), position.getZ()),
+                    simulationDistance, 4));
+        }
+        return List.copyOf(result);
     }
 
     long cubeRevision(CubePos pos) {
@@ -422,6 +538,15 @@ final class CubicWorldState implements AutoCloseable {
     }
 
     void tick() {
+        simulationServices.tick(loadedFullCubes(), world.getTime());
+        // Vanilla's scheduled tick phase has already run by the time the
+        // HigherWorld END_WORLD_TICK callback arrives. Cube events are kept
+        // in a separate deterministic queue and are drained with a hard
+        // world-wide budget, so a redstone/fluid cascade cannot monopolize a
+        // server tick. An unloaded or non-simulating cube defers its event.
+        scheduledTicks.drain(
+                world.getTime(), CubeScheduledTickQueue.MAX_TICKS_PER_WORLD_TICK,
+                this::executeScheduledTick);
         SparseCubeLightEngine.Result lightWork = lightEngine.propagate(
                 LIGHT_STEPS_PER_SLICE, LIGHT_NANOS_PER_SLICE);
         pendingLightBroadcasts.addAll(lightWork.changedCubes());
@@ -516,6 +641,38 @@ final class CubicWorldState implements AutoCloseable {
         }
     }
 
+    private CubeScheduledTickQueue.Execution executeScheduledTick(CubeScheduledTick tick) {
+        CubePos cubePos = CubePos.fromBlock(
+                tick.pos().getX(), tick.pos().getY(), tick.pos().getZ());
+        LoadedCube cube = loadedCube(cubePos);
+        if (cube == null || !taskScheduler.isRequired(cubePos)
+                || !taskScheduler.holder(cubePos).status().isAtLeast(CubeStatus.FULL)
+                || !CubeWatchManager.shouldTick(world, cubePos)) {
+            return CubeScheduledTickQueue.Execution.DEFERRED;
+        }
+        try {
+            BlockState blockState = cube.getBlockState(tick.pos());
+            if (tick.kind() == CubeScheduledTick.Kind.BLOCK) {
+                Block block = Registries.BLOCK.getOptionalValue(Identifier.of(tick.typeId())).orElse(null);
+                if (block == null || blockState.getBlock() != block) {
+                    return CubeScheduledTickQueue.Execution.CONSUMED;
+                }
+                blockState.scheduledTick(world, tick.pos(), world.getRandom());
+            } else {
+                Fluid fluid = Registries.FLUID.getOptionalValue(Identifier.of(tick.typeId())).orElse(null);
+                FluidState fluidState = cube.getFluidState(tick.pos());
+                if (fluid == null || fluidState.getFluid() != fluid) {
+                    return CubeScheduledTickQueue.Execution.CONSUMED;
+                }
+                fluidState.onScheduledTick(world, tick.pos(), blockState);
+            }
+            return CubeScheduledTickQueue.Execution.CONSUMED;
+        } catch (RuntimeException exception) {
+            Higherworld.LOGGER.error("Cannot execute cube scheduled tick at {}", tick.pos(), exception);
+            return CubeScheduledTickQueue.Execution.CONSUMED;
+        }
+    }
+
     private LoadedCube ensureStage(
             CubePos pos, CubeStatus target, int priority, Optional<byte[]> knownPayload)
             throws IOException {
@@ -551,11 +708,11 @@ final class CubicWorldState implements AutoCloseable {
         }
         if (target == CubeStatus.FULL && !holder.fullFuture().isDone()) {
             holder.complete(context.cube);
-            context.full = true;
+            markCubeFull(context);
         } else if (target == CubeStatus.FULL
                 && holder.fullFuture().getNow(Optional.empty()).isEmpty()) {
             holder.materialize(context.cube);
-            context.full = true;
+            markCubeFull(context);
         }
         return context.cube;
     }
@@ -578,10 +735,22 @@ final class CubicWorldState implements AutoCloseable {
         }
         if (holder.target() == CubeStatus.FULL && !holder.fullFuture().isDone()) {
             holder.complete(context.cube);
-            context.full = true;
+            markCubeFull(context);
             return true;
         }
         return false;
+    }
+
+    private void markCubeFull(LoadContext context) {
+        if (context.full) return;
+        context.full = true;
+        try {
+            simulationServices.indexFullCube(context.cube);
+        } catch (RuntimeException exception) {
+            // A POI registry mismatch must not fail an otherwise valid cube
+            // lifecycle; the next FULL reload can rebuild the auxiliary index.
+            Higherworld.LOGGER.warn("Cannot scan sparse POIs in {}", context.cube.pos(), exception);
+        }
     }
 
     private Optional<byte[]> joinIo(CubePos pos, CubeHolder holder) throws IOException {
@@ -632,6 +801,11 @@ final class CubicWorldState implements AutoCloseable {
                         context.cube.light().load(decoded.light());
                         context.hasSavedLight = true;
                     }
+                    // HWC5 stores absolute trigger times and a stable
+                    // sub-tick order. Restore before any lifecycle stage can
+                    // execute callbacks; deduplication keeps a live queue
+                    // intact across an unload/reload race.
+                    scheduledTicks.restore(pos, decoded.scheduledTicks());
                     if (!customWorld && shouldGenerate(pos)) {
                         // A legacy upgrade may deterministically replay placed
                         // features. Route any neighbour reads through TERRAIN
@@ -815,6 +989,16 @@ final class CubicWorldState implements AutoCloseable {
         return cubes.values();
     }
 
+    private void markScheduledTickDirty(CubePos pos) {
+        LoadedCube cube = loadedCube(pos);
+        if (cube != null) cube.markDirty();
+    }
+
+    /** Persists the world-level queue, including events for unloaded cubes. */
+    void saveScheduledTicks() throws IOException {
+        scheduledTickJournal.save(scheduledTicks.snapshotAll());
+    }
+
     private void save(LoadedCube cube, boolean force, boolean wait) throws IOException {
         LoadContext context = loadContexts.get(cube.pos());
         if (context != null && !context.full) return;
@@ -857,6 +1041,18 @@ final class CubicWorldState implements AutoCloseable {
                 }
             }
         }
+        try {
+            saveScheduledTicks();
+        } catch (IOException exception) {
+            if (failure == null) failure = exception;
+            else failure.addSuppressed(exception);
+        }
+        try {
+            simulationServices.close();
+        } catch (IOException exception) {
+            if (failure == null) failure = exception;
+            else failure.addSuppressed(exception);
+        }
         taskScheduler.close();
         try {
             ioScheduler.close();
@@ -876,6 +1072,7 @@ final class CubicWorldState implements AutoCloseable {
         columns.clear();
         cubes.clear();
         loadContexts.clear();
+        CubeScheduledTickQueue.unregister(world, scheduledTicks);
         if (failure != null) {
             throw failure;
         }

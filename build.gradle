@@ -51,6 +51,15 @@ test {
     useJUnitPlatform()
 }
 
+// Reproducible, non-asserting microbenchmarks for sparse cube seams.
+tasks.register("cubeMicrobenchmark", JavaExec) {
+    group = "verification"
+    description = "Run the fixed-seed HigherWorld cube microbenchmark harness"
+    dependsOn(testClasses)
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = "org.devt.higherworld.benchmark.CubeMicroBenchmark"
+}
+
 processResources {
     inputs.property "version", project.version
     inputs.property "minecraft_version", project.minecraft_version
