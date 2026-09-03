@@ -51,7 +51,7 @@ public final class CubicWorldManager {
     }
 
     public static void open(MinecraftServer server, ServerWorld world) {
-        Path cubicRoot = server.getSavePath(WorldSavePath.ROOT).resolve("cubic_chunks");
+        Path cubicRoot = server.getSavePath(WorldSavePath.ROOT).resolve("hw_chunks");
         Path root = cubicRoot
                 .resolve(world.getRegistryKey().getValue().getNamespace())
                 .resolve(world.getRegistryKey().getValue().getPath())
