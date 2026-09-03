@@ -16,9 +16,11 @@ import java.util.concurrent.CompletableFuture;
 
 import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
+import net.minecraft.block.Blocks;
 import net.minecraft.block.entity.BlockEntity;
 import net.minecraft.fluid.Fluid;
 import net.minecraft.fluid.FluidState;
+import net.minecraft.fluid.Fluids;
 import net.minecraft.registry.Registries;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.util.Identifier;
@@ -62,6 +64,16 @@ final class CubicWorldState implements AutoCloseable {
     private final CubeSimulationServices simulationServices;
     private final Set<CubePos> pendingLightBroadcasts = new HashSet<>();
     private final ThreadLocal<Boolean> committingFeatures = ThreadLocal.withInitial(() -> false);
+    /**
+     * Generation callbacks must observe a bounded, read-only cube view. In
+     * particular, a feature probing an unloaded translated neighbour must not
+     * call back into cube(...), which would synchronously start that neighbour's
+     * FULL lifecycle and recursively re-enter feature generation.
+     */
+    private final ThreadLocal<GenerationReadContext> generationReadContexts = new ThreadLocal<>();
+    /** Detects a same-cube lifecycle stage re-entering itself through a callback. */
+    private final ThreadLocal<Set<GenerationStage>> generationStages =
+            ThreadLocal.withInitial(() -> new HashSet<>());
     /**
      * World listener callbacks are not safe while terrain/features are being
      * committed.  Structure block entities can call ServerWorld.updateListeners
@@ -122,10 +134,14 @@ final class CubicWorldState implements AutoCloseable {
     }
 
     BlockState getBlockState(BlockPos pos) throws IOException {
+        GenerationReadContext generation = generationReadContexts.get();
+        if (generation != null) return generation.blockState(pos);
         return cubeForRead(pos).getBlockState(pos);
     }
 
     FluidState getFluidState(BlockPos pos) throws IOException {
+        GenerationReadContext generation = generationReadContexts.get();
+        if (generation != null) return generation.fluidState(pos);
         return cubeForRead(pos).getFluidState(pos);
     }
 
@@ -144,12 +160,22 @@ final class CubicWorldState implements AutoCloseable {
         if (loaded != null) {
             LoadContext context = loadContexts.get(pos);
             if (context != null && context.committing) return loaded;
-            if (taskScheduler.holder(pos).status().isAtLeast(CubeStatus.TERRAIN)) return loaded;
+            if (taskScheduler.reached(pos, CubeStatus.TERRAIN)) return loaded;
+        }
+        if (committingFeatures.get()) {
+            throw new IllegalStateException(
+                    "Cube read requested during feature generation: " + pos);
         }
         return ensureStage(pos, CubeStatus.TERRAIN, SYNCHRONOUS_IO_PRIORITY, null);
     }
 
     BlockChange setBlockState(BlockPos pos, BlockState state) throws IOException {
+        GenerationReadContext generation = generationReadContexts.get();
+        if (generation != null && !generation.owns(pos)) {
+            // World callbacks are allowed to probe a neighbouring cube while a
+            // feature is being committed, but they must not mutate or load it.
+            return new BlockChange(generation.blockState(pos), Set.of(), false);
+        }
         LoadedCube cube = cube(pos);
         BlockState previous = cube.setBlockState(pos, state);
         Set<CubePos> changedLight = Set.of();
@@ -167,7 +193,7 @@ final class CubicWorldState implements AutoCloseable {
             changedLight = lightEngine.propagate(
                     LIGHT_STEPS_PER_SLICE, LIGHT_NANOS_PER_SLICE).changedCubes();
         }
-        return new BlockChange(previous, changedLight);
+        return new BlockChange(previous, changedLight, previous != state);
     }
 
     /** Schedules a block tick in the sparse queue when the position is cubic. */
@@ -201,19 +227,30 @@ final class CubicWorldState implements AutoCloseable {
     }
 
     BlockEntity getBlockEntity(BlockPos pos) throws IOException {
+        GenerationReadContext generation = generationReadContexts.get();
+        if (generation != null) return generation.blockEntity(pos);
         return cubeForRead(pos).getBlockEntity(pos);
     }
 
     void putBlockEntity(BlockEntity blockEntity) throws IOException {
+        GenerationReadContext generation = generationReadContexts.get();
+        if (generation != null && !generation.owns(blockEntity.getPos())) return;
         blockEntity.setWorld(world);
         cube(blockEntity.getPos()).putBlockEntity(blockEntity);
     }
 
     void removeBlockEntity(BlockPos pos) throws IOException {
+        GenerationReadContext generation = generationReadContexts.get();
+        if (generation != null && !generation.owns(pos)) return;
         cube(pos).removeBlockEntity(pos);
     }
 
     void markDirty(BlockPos pos) throws IOException {
+        GenerationReadContext generation = generationReadContexts.get();
+        if (generation != null) {
+            generation.markDirty(pos);
+            return;
+        }
         // Block entities created by placed features (notably dungeon spawners)
         // call World#markDirty while FEATURES is still being committed.  Do not
         // advance a neighbouring cube to FULL from that callback, or feature
@@ -226,6 +263,13 @@ final class CubicWorldState implements AutoCloseable {
     }
 
     LoadedCube cube(CubePos pos) throws IOException {
+        GenerationReadContext generation = generationReadContexts.get();
+        if (generation != null) {
+            LoadedCube readable = generation.readableCube(pos);
+            if (readable != null) return readable;
+            throw new IllegalStateException(
+                    "Cube load requested during generation: " + pos);
+        }
         ColumnPos columnPos = new ColumnPos(pos.x(), pos.z());
         CubeColumn<LoadedCube> column = columns.get(columnPos);
         LoadedCube loaded = column == null ? null : column.get(pos.y());
@@ -676,6 +720,13 @@ final class CubicWorldState implements AutoCloseable {
     private LoadedCube ensureStage(
             CubePos pos, CubeStatus target, int priority, Optional<byte[]> knownPayload)
             throws IOException {
+        GenerationReadContext generation = generationReadContexts.get();
+        if (generation != null) {
+            LoadedCube readable = generation.readableCube(pos);
+            if (readable != null && taskScheduler.reached(pos, target)) return readable;
+            throw new IllegalStateException(
+                    "Cube stage requested during generation: " + target + " for " + pos);
+        }
         CubeHolder holder = taskScheduler.request(pos, target, priority);
         Optional<byte[]> payload = knownPayload == null ? joinIo(pos, holder) : knownPayload;
         LoadContext context = context(holder, payload);
@@ -784,6 +835,14 @@ final class CubicWorldState implements AutoCloseable {
 
     private boolean commitTerrain(
             CubeHolder holder, LoadContext context, int priority, boolean wait) throws IOException {
+        try (GenerationStageScope stageScope = enterGenerationStage(
+                holder.pos(), CubeStatus.TERRAIN)) {
+            return commitTerrainBody(holder, context, priority, wait);
+        }
+    }
+
+    private boolean commitTerrainBody(
+            CubeHolder holder, LoadContext context, int priority, boolean wait) throws IOException {
         CubePos pos = holder.pos();
         boolean wasSuppressing = suppressingGenerationUpdates.get();
         suppressingGenerationUpdates.set(true);
@@ -794,6 +853,7 @@ final class CubicWorldState implements AutoCloseable {
                     context.cube.setGenerationVersion(CubeRecordCodec.generationVersion(context.payload));
                     CubeRecordCodec.DecodedCube decoded = CubeRecordCodec.decode(
                             context.payload, context.cube.section(), world);
+                    if (decoded.hadInvalidBlockEntities()) context.cube.markDirty();
                     for (BlockEntity blockEntity : decoded.blockEntities()) {
                         context.cube.putLoadedBlockEntity(blockEntity);
                     }
@@ -813,7 +873,9 @@ final class CubicWorldState implements AutoCloseable {
                         // asking for FULL here recursively re-enters generation.
                         boolean alreadyCommittingFeatures = committingFeatures.get();
                         committingFeatures.set(true);
-                        try {
+                        try (GenerationReadScope generationRead = beginGenerationRead(context.cube);
+                                GenerationStageScope featureStage = enterGenerationStage(
+                                        pos, CubeStatus.FEATURES)) {
                             if (InfiniteDownwardGenerator.upgradeLegacyTerrain(
                                     world, context.cube, effectiveStructureSettings())) {
                                 Higherworld.LOGGER.debug(
@@ -863,12 +925,19 @@ final class CubicWorldState implements AutoCloseable {
     }
 
     private void commitFeatures(CubeHolder holder, LoadContext context) {
+        try (GenerationStageScope stageScope = enterGenerationStage(
+                holder.pos(), CubeStatus.FEATURES)) {
+            commitFeaturesBody(holder, context);
+        }
+    }
+
+    private void commitFeaturesBody(CubeHolder holder, LoadContext context) {
         boolean alreadyCommittingFeatures = committingFeatures.get();
         boolean wasSuppressing = suppressingGenerationUpdates.get();
         committingFeatures.set(true);
         suppressingGenerationUpdates.set(true);
         context.committing = true;
-        try {
+        try (GenerationReadScope readScope = beginGenerationRead(context.cube)) {
             if (context.payload == null && shouldGenerate(holder.pos())) {
                 try (CubeSpatialLock.Scope ignored = generationLocks.lock(
                         holder.pos(), CubeStatus.FEATURES.dependencyRadius())) {
@@ -892,6 +961,13 @@ final class CubicWorldState implements AutoCloseable {
     }
 
     private boolean commitLight(CubeHolder holder, LoadContext context) {
+        try (GenerationStageScope stageScope = enterGenerationStage(
+                holder.pos(), CubeStatus.LIGHT)) {
+            return commitLightBody(holder, context);
+        }
+    }
+
+    private boolean commitLightBody(CubeHolder holder, LoadContext context) {
         if (!context.lightQueued) {
             indexHeights(context.cube);
             lightEngine.queueCube(holder.pos(), !context.hasSavedLight);
@@ -1113,7 +1189,107 @@ final class CubicWorldState implements AutoCloseable {
         }
     }
 
-    record BlockChange(BlockState previous, Set<CubePos> changedLight) {
+    record BlockChange(BlockState previous, Set<CubePos> changedLight, boolean changed) {
+    }
+
+    private GenerationStageScope enterGenerationStage(CubePos pos, CubeStatus stage) {
+        GenerationStage key = new GenerationStage(pos, stage);
+        Set<GenerationStage> active = generationStages.get();
+        if (!active.add(key)) {
+            throw new IllegalStateException(
+                    "Recursive cube stage " + stage + " for " + pos);
+        }
+        return new GenerationStageScope(active, key);
+    }
+
+    private GenerationReadScope beginGenerationRead(LoadedCube owner) {
+        GenerationReadContext previous = generationReadContexts.get();
+        GenerationReadContext current = new GenerationReadContext(owner, previous);
+        generationReadContexts.set(current);
+        return new GenerationReadScope(previous, current);
+    }
+
+    private final class GenerationReadContext {
+        private final LoadedCube owner;
+        private final GenerationReadContext parent;
+
+        private GenerationReadContext(LoadedCube owner, GenerationReadContext parent) {
+            this.owner = owner;
+            this.parent = parent;
+        }
+
+        private boolean owns(BlockPos pos) {
+            return owner.pos().equals(CubePos.fromBlock(
+                    pos.getX(), pos.getY(), pos.getZ()));
+        }
+
+        private void markDirty(BlockPos pos) {
+            if (owns(pos)) owner.markDirty();
+        }
+
+        private BlockState blockState(BlockPos pos) {
+            LoadedCube cube = readableCube(CubePos.fromBlock(
+                    pos.getX(), pos.getY(), pos.getZ()));
+            return cube == null ? Blocks.AIR.getDefaultState() : cube.getBlockState(pos);
+        }
+
+        private FluidState fluidState(BlockPos pos) {
+            LoadedCube cube = readableCube(CubePos.fromBlock(
+                    pos.getX(), pos.getY(), pos.getZ()));
+            return cube == null ? Fluids.EMPTY.getDefaultState() : cube.getFluidState(pos);
+        }
+
+        private BlockEntity blockEntity(BlockPos pos) {
+            LoadedCube cube = readableCube(CubePos.fromBlock(
+                    pos.getX(), pos.getY(), pos.getZ()));
+            return cube == null ? null : cube.getBlockEntity(pos);
+        }
+
+        private LoadedCube readableCube(CubePos pos) {
+            for (GenerationReadContext context = this;
+                    context != null; context = context.parent) {
+                if (context.owner.pos().equals(pos)) return context.owner;
+            }
+            LoadedCube cube = loadedCube(pos);
+            return cube != null && taskScheduler.reached(pos, CubeStatus.TERRAIN)
+                    ? cube : null;
+        }
+    }
+
+    private final class GenerationReadScope implements AutoCloseable {
+        private final GenerationReadContext previous;
+        private final GenerationReadContext current;
+
+        private GenerationReadScope(
+                GenerationReadContext previous, GenerationReadContext current) {
+            this.previous = previous;
+            this.current = current;
+        }
+
+        @Override
+        public void close() {
+            if (generationReadContexts.get() != current) return;
+            if (previous == null) generationReadContexts.remove();
+            else generationReadContexts.set(previous);
+        }
+    }
+
+    private static final class GenerationStageScope implements AutoCloseable {
+        private final Set<GenerationStage> active;
+        private final GenerationStage key;
+
+        private GenerationStageScope(Set<GenerationStage> active, GenerationStage key) {
+            this.active = active;
+            this.key = key;
+        }
+
+        @Override
+        public void close() {
+            active.remove(key);
+        }
+    }
+
+    private record GenerationStage(CubePos pos, CubeStatus stage) {
     }
 
     private final class LightAccess implements SparseCubeLightEngine.Access {

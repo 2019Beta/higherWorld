@@ -9,9 +9,11 @@ import java.util.ArrayList;
 import java.util.List;
 
 import net.minecraft.block.entity.BlockEntity;
+import net.minecraft.block.BlockEntityProvider;
 import net.minecraft.nbt.NbtCompound;
 import net.minecraft.nbt.NbtIo;
 import net.minecraft.nbt.NbtSizeTracker;
+import net.minecraft.registry.Registries;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.world.World;
 import net.minecraft.world.chunk.ChunkSection;
@@ -60,7 +62,7 @@ public final class CubeRecordCodec {
         int magic = payload.length < Integer.BYTES ? 0 : readMagic(payload);
         if (magic != MAGIC_V2 && magic != MAGIC_V3 && magic != MAGIC_V4 && magic != MAGIC_V5) {
             ChunkSectionCodec.decodeInto(payload, section);
-            return new DecodedCube(List.of(), CubeLightData.Snapshot.dark(), false, List.of());
+            return new DecodedCube(List.of(), CubeLightData.Snapshot.dark(), false, List.of(), false);
         }
 
         try (DataInputStream input = new DataInputStream(new ByteArrayInputStream(payload))) {
@@ -79,12 +81,31 @@ public final class CubeRecordCodec {
                 throw new IOException("Invalid cube block entity count: " + count);
             }
             List<BlockEntity> blockEntities = new ArrayList<>(count);
+            boolean hadInvalidBlockEntities = false;
             for (int index = 0; index < count; index++) {
                 NbtCompound nbt = NbtIo.readCompound(input, NbtSizeTracker.ofUnlimitedBytes());
                 BlockPos pos = new BlockPos(nbt.getInt("x", 0), nbt.getInt("y", 0), nbt.getInt("z", 0));
-                BlockEntity blockEntity = BlockEntity.createFromNbt(
-                        pos, section.getBlockState(Math.floorMod(pos.getX(), 16), Math.floorMod(pos.getY(), 16),
-                                Math.floorMod(pos.getZ(), 16)), nbt, world.getRegistryManager());
+                var state = section.getBlockState(
+                        Math.floorMod(pos.getX(), 16), Math.floorMod(pos.getY(), 16),
+                        Math.floorMod(pos.getZ(), 16));
+                BlockEntity blockEntity = null;
+                if (state.getBlock() instanceof BlockEntityProvider provider) {
+                    BlockEntity expected = provider.createBlockEntity(pos, state);
+                    String storedType = nbt.getString("id", "");
+                    String expectedType = expected == null
+                            ? "" : String.valueOf(Registries.BLOCK_ENTITY_TYPE.getId(expected.getType()));
+                    if (expected != null && (storedType.isEmpty() || expectedType.equals(storedType))) {
+                        try {
+                            blockEntity = BlockEntity.createFromNbt(pos, state, nbt, world.getRegistryManager());
+                        } catch (RuntimeException ignored) {
+                            hadInvalidBlockEntities = true;
+                        }
+                    } else {
+                        hadInvalidBlockEntities = true;
+                    }
+                } else {
+                    hadInvalidBlockEntities = true;
+                }
                 if (blockEntity != null) {
                     blockEntity.setWorld(world);
                     blockEntities.add(blockEntity);
@@ -110,7 +131,9 @@ public final class CubeRecordCodec {
             if (input.available() != 0) {
                 throw new IOException("Trailing bytes in cube record: " + input.available());
             }
-            return new DecodedCube(List.copyOf(blockEntities), light, hasLight, scheduledTicks);
+            return new DecodedCube(
+                    List.copyOf(blockEntities), light, hasLight, scheduledTicks,
+                    hadInvalidBlockEntities);
         }
     }
 
@@ -131,5 +154,5 @@ public final class CubeRecordCodec {
 
     public record DecodedCube(
             List<BlockEntity> blockEntities, CubeLightData.Snapshot light, boolean hasLight,
-            List<CubeScheduledTick> scheduledTicks) {}
+            List<CubeScheduledTick> scheduledTicks, boolean hadInvalidBlockEntities) {}
 }

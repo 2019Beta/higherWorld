@@ -318,7 +318,7 @@ public final class CubicWorldManager {
         try {
             CubicWorldState.BlockChange result = state.setBlockState(pos, blockState);
             BlockState previous = result.previous();
-            boolean changed = previous != blockState;
+            boolean changed = result.changed();
             if (changed) {
                 if (previous.hasBlockEntity() && !previous.keepBlockEntityWhenReplacedWith(blockState)) {
                     BlockEntity removed = state.getBlockEntity(pos);

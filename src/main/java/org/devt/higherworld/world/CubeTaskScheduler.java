@@ -112,6 +112,16 @@ final class CubeTaskScheduler implements AutoCloseable {
         return holders.computeIfAbsent(pos, CubeHolder::new);
     }
 
+    /**
+     * Reads lifecycle state without creating a holder. Generation-time reads
+     * use this method so a missing neighbour cannot silently become a new
+     * synchronous dependency request.
+     */
+    boolean reached(CubePos pos, CubeStatus status) {
+        CubeHolder holder = holders.get(pos);
+        return holder != null && holder.status().isAtLeast(status);
+    }
+
     /** Package-private inspection hook used by lifecycle tests. */
     int holderCount() {
         return holders.size();
