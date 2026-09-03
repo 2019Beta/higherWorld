@@ -25,7 +25,7 @@ HigherWorld 是面向 Minecraft 1.21.11 / Fabric 的稀疏立方区块运行层�
 cube 文件位于：
 
 ```text
-<world>/cubic_chunks/<dimension namespace>/<dimension path>/region3d/r.<x>.<y>.<z>.hwr
+<world>/hw_chunks/<dimension namespace>/<dimension path>/region3d/r.<x>.<y>.<z>.hwr
 ```
 
 实现结构参考了 1.12.2 Forge 的第一代 Cubic Chunks（稀疏 CubeMap、三维玩家视距、
