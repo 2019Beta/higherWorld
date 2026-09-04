@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Path;
+import java.util.Set;
 import org.devt.higherworld.storage.CubeIoScheduler;
 import org.devt.higherworld.storage.CubePos;
 import org.devt.higherworld.storage.CubeStorage;
@@ -17,7 +18,7 @@ class CubeTaskSchedulerLifecycleTest {
     Path directory;
 
     @Test
-    void ticketClosureRetainsDependencyHaloUntilTicketRemoval() {
+    void ticketClosureRetainsDependencyHaloUntilTicketRemoval() throws Exception {
         CubePos center = new CubePos(12, -20, -7);
         try (CubeStorage storage = new CubeStorage(directory);
                 CubeIoScheduler io = new CubeIoScheduler(storage);
@@ -40,7 +41,7 @@ class CubeTaskSchedulerLifecycleTest {
     }
 
     @Test
-    void largeTicketClosureDoesNotMaterializeHolders() {
+    void largeTicketClosureDoesNotMaterializeHolders() throws Exception {
         CubePos center = new CubePos(12, -20, -7);
         try (CubeStorage storage = new CubeStorage(directory);
                 CubeIoScheduler io = new CubeIoScheduler(storage);
@@ -54,7 +55,7 @@ class CubeTaskSchedulerLifecycleTest {
     }
 
     @Test
-    void fullTicketClosureExpandsToTwoDependencyCubes() {
+    void fullTicketClosureExpandsToTwoDependencyCubes() throws Exception {
         CubePos center = new CubePos(12, -20, -7);
         try (CubeStorage storage = new CubeStorage(directory);
                 CubeIoScheduler io = new CubeIoScheduler(storage);
@@ -69,7 +70,7 @@ class CubeTaskSchedulerLifecycleTest {
     }
 
     @Test
-    void explicitRequestMaterializesHolderAfterTicketRefresh() {
+    void explicitRequestMaterializesHolderAfterTicketRefresh() throws Exception {
         CubePos center = new CubePos(12, -20, -7);
         try (CubeStorage storage = new CubeStorage(directory);
                 CubeIoScheduler io = new CubeIoScheduler(storage);
@@ -86,7 +87,7 @@ class CubeTaskSchedulerLifecycleTest {
     }
 
     @Test
-    void payloadFirstRequestDefersTheOuterLightingDependencyHalo() {
+    void payloadFirstRequestDefersTheOuterLightingDependencyHalo() throws Exception {
         CubePos center = new CubePos(12, -20, -7);
         try (CubeStorage storage = new CubeStorage(directory);
                 CubeIoScheduler io = new CubeIoScheduler(storage);
@@ -104,7 +105,7 @@ class CubeTaskSchedulerLifecycleTest {
     }
 
     @Test
-    void retainingWatcherPayloadKeepsItsDependencyClosureWithoutATicket() {
+    void retainingWatcherPayloadKeepsItsDependencyClosureWithoutATicket() throws Exception {
         CubePos center = new CubePos(12, -20, -7);
         try (CubeStorage storage = new CubeStorage(directory);
                 CubeIoScheduler io = new CubeIoScheduler(storage);
@@ -125,7 +126,7 @@ class CubeTaskSchedulerLifecycleTest {
     }
 
     @Test
-    void readyCommitSkipsHighPriorityStageWhoseDependenciesAreBlocked() {
+    void readyCommitSkipsHighPriorityStageWhoseDependenciesAreBlocked() throws Exception {
         CubePos blockedHighPriorityPos = new CubePos(100, -20, 100);
         CubePos lowPriorityTerrainPos = new CubePos(-100, -20, -100);
         try (CubeStorage storage = new CubeStorage(directory);
@@ -151,7 +152,7 @@ class CubeTaskSchedulerLifecycleTest {
     }
 
     @Test
-    void readyCommitDoesNotLetDistantIoReadyWorkStarveNearbyFeatures() {
+    void readyCommitDoesNotLetDistantIoReadyWorkStarveNearbyFeatures() throws Exception {
         CubePos center = new CubePos(0, -20, 0);
         try (CubeStorage storage = new CubeStorage(directory);
                 CubeIoScheduler io = new CubeIoScheduler(storage);
@@ -182,7 +183,7 @@ class CubeTaskSchedulerLifecycleTest {
     }
 
     @Test
-    void releasingUnticketedHolderCancelsItsLifecycle() {
+    void releasingUnticketedHolderCancelsItsLifecycle() throws Exception {
         CubePos pos = new CubePos(1, -30, 4);
         try (CubeStorage storage = new CubeStorage(directory);
                 CubeIoScheduler io = new CubeIoScheduler(storage);
