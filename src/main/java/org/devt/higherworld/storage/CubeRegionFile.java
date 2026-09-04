@@ -10,8 +10,11 @@ import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.StandardCopyOption;
 import java.util.Optional;
 import java.util.Map;
+import java.util.Arrays;
 import java.util.zip.CRC32;
 import java.util.zip.DeflaterOutputStream;
 import java.util.zip.InflaterInputStream;
@@ -23,17 +26,24 @@ final class CubeRegionFile implements Closeable {
     private static final int HEADER_BYTES = 20;
     private static final int RECORD_MAGIC = 0x43554245; // CUBE
     private static final int SLOT_COUNT = 4096;
+    private static final int RECORD_HEADER_BYTES = 20;
     private static final int MAX_COMPRESSED_BYTES = 4 * 1024 * 1024;
     private static final int MAX_UNCOMPRESSED_BYTES = 16 * 1024 * 1024;
+    private static final long COMPACTION_MIN_BYTES = 8L * 1024L * 1024L;
 
-    private final RandomAccessFile file;
+    private final Path path;
+    private final RegionPos position;
+    private RandomAccessFile file;
     private final long[] offsets = new long[SLOT_COUNT];
     private final int[] compressedLengths = new int[SLOT_COUNT];
     private final int[] uncompressedLengths = new int[SLOT_COUNT];
     private final int[] checksums = new int[SLOT_COUNT];
+    private long liveBytes;
     private boolean dirty;
 
     CubeRegionFile(Path path, RegionPos pos) throws IOException {
+        this.path = path;
+        this.position = pos;
         Files.createDirectories(path.getParent());
         this.file = new RandomAccessFile(path.toFile(), "rw");
         if (file.length() == 0) {
@@ -85,6 +95,8 @@ final class CubeRegionFile implements Closeable {
         if (payload.length > MAX_UNCOMPRESSED_BYTES) {
             throw new IOException("Cube payload is too large: " + payload.length);
         }
+        long previousOffset = offsets[slot];
+        int previousCompressedLength = compressedLengths[slot];
 
         byte[] compressed = deflate(payload);
         if (compressed.length > MAX_COMPRESSED_BYTES) {
@@ -106,15 +118,23 @@ final class CubeRegionFile implements Closeable {
         compressedLengths[slot] = compressed.length;
         uncompressedLengths[slot] = payload.length;
         checksums[slot] = (int) crc.getValue();
+        if (previousOffset != 0L) {
+            liveBytes -= RECORD_HEADER_BYTES + previousCompressedLength;
+        }
+        liveBytes += RECORD_HEADER_BYTES + compressed.length;
         dirty = true;
     }
 
     private void writeHeader(RegionPos pos) throws IOException {
-        file.writeInt(MAGIC);
-        file.writeInt(VERSION);
-        file.writeInt(pos.x());
-        file.writeInt(pos.y());
-        file.writeInt(pos.z());
+        writeHeader(file, pos);
+    }
+
+    private static void writeHeader(RandomAccessFile output, RegionPos pos) throws IOException {
+        output.writeInt(MAGIC);
+        output.writeInt(VERSION);
+        output.writeInt(pos.x());
+        output.writeInt(pos.y());
+        output.writeInt(pos.z());
     }
 
     private void readHeader(RegionPos expected) throws IOException {
@@ -134,6 +154,11 @@ final class CubeRegionFile implements Closeable {
     }
 
     private void rebuildIndex() throws IOException {
+        Arrays.fill(offsets, 0L);
+        Arrays.fill(compressedLengths, 0);
+        Arrays.fill(uncompressedLengths, 0);
+        Arrays.fill(checksums, 0);
+        liveBytes = 0L;
         long cursor = HEADER_BYTES;
         while (cursor < file.length()) {
             file.seek(cursor);
@@ -156,10 +181,14 @@ final class CubeRegionFile implements Closeable {
                     dirty = true;
                     return;
                 }
+                if (offsets[slot] != 0L) {
+                    liveBytes -= RECORD_HEADER_BYTES + compressedLengths[slot];
+                }
                 offsets[slot] = payloadOffset;
                 compressedLengths[slot] = compressedLength;
                 uncompressedLengths[slot] = uncompressedLength;
                 checksums[slot] = checksum;
+                liveBytes += RECORD_HEADER_BYTES + compressedLength;
                 cursor = next;
             } catch (EOFException ignored) {
                 file.setLength(cursor);
@@ -167,6 +196,72 @@ final class CubeRegionFile implements Closeable {
                 return;
             }
         }
+    }
+
+    /** Compacts stale append-log records once the file has meaningful waste. */
+    synchronized void compactIfNeeded() throws IOException {
+        long length = file.length();
+        if (length < COMPACTION_MIN_BYTES
+                || length <= HEADER_BYTES + Math.max(liveBytes * 2L, liveBytes + RECORD_HEADER_BYTES)) {
+            return;
+        }
+
+        Path temporary = path.resolveSibling(path.getFileName() + ".compact");
+        Files.deleteIfExists(temporary);
+        try (RandomAccessFile compacted = new RandomAccessFile(temporary.toFile(), "rw")) {
+            writeHeader(compacted, position);
+            for (int slot = 0; slot < SLOT_COUNT; slot++) {
+                if (offsets[slot] == 0L) continue;
+                Optional<byte[]> stored = read(slot);
+                if (stored.isEmpty()) {
+                    throw new IOException("Missing live cube slot during compaction: " + slot);
+                }
+                byte[] payload = stored.get();
+                writeRecord(compacted, slot, payload);
+            }
+            compacted.getFD().sync();
+        }
+
+        try {
+            file.close();
+            try {
+                Files.move(temporary, path, StandardCopyOption.REPLACE_EXISTING,
+                        StandardCopyOption.ATOMIC_MOVE);
+            } catch (AtomicMoveNotSupportedException | java.nio.file.FileAlreadyExistsException unsupported) {
+                Files.move(temporary, path, StandardCopyOption.REPLACE_EXISTING);
+            }
+        } catch (IOException exception) {
+            // Reopen the original path so a failed replacement does not leave
+            // this live handle permanently closed.
+            file = new RandomAccessFile(path.toFile(), "rw");
+            Files.deleteIfExists(temporary);
+            throw exception;
+        }
+
+        file = new RandomAccessFile(path.toFile(), "rw");
+        readHeader(position);
+        rebuildIndex();
+        dirty = false;
+    }
+
+    private static void writeRecord(RandomAccessFile output, int slot, byte[] payload)
+            throws IOException {
+        validateSlot(slot);
+        if (payload.length > MAX_UNCOMPRESSED_BYTES) {
+            throw new IOException("Cube payload is too large: " + payload.length);
+        }
+        byte[] compressed = deflate(payload);
+        if (compressed.length > MAX_COMPRESSED_BYTES) {
+            throw new IOException("Compressed cube payload is too large: " + compressed.length);
+        }
+        CRC32 crc = new CRC32();
+        crc.update(payload);
+        output.writeInt(RECORD_MAGIC);
+        output.writeInt(slot);
+        output.writeInt(compressed.length);
+        output.writeInt(payload.length);
+        output.writeInt((int) crc.getValue());
+        output.write(compressed);
     }
 
     private static byte[] deflate(byte[] payload) throws IOException {

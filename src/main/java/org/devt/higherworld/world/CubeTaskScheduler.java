@@ -1,12 +1,10 @@
 package org.devt.higherworld.world;
 
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -25,14 +23,26 @@ final class CubeTaskScheduler implements AutoCloseable {
     private final CubeIoScheduler io;
     private final CubeTicketManager tickets = new CubeTicketManager();
     private final ConcurrentMap<CubePos, CubeHolder> holders = new ConcurrentHashMap<>();
+    /** Lowest request priority seen for each live lifecycle node. */
+    private final ConcurrentMap<CubePos, Integer> requestPriorities = new ConcurrentHashMap<>();
     /**
      * The complete closure currently demanded by live tickets.  Keeping this
      * separately from {@link #holders} is important: a dependency cube can be
      * required by a ticket without being part of a player's sent/pending view.
      */
     private volatile Set<CubePos> requiredPositions = Set.of();
+    /**
+     * Roots currently retained by the streaming watcher.  These roots are
+     * PAYLOAD demand, not simulation demand, so they must participate in the
+     * same closure calculation as tickets while remaining independently
+     * cancellable when a view leaves them.
+     */
+    private volatile Set<CubePos> prefetchPositions = Set.of();
     private final ThreadPoolExecutor generationExecutor;
     private final AtomicLong sequence = new AtomicLong();
+    private final PriorityBlockingQueue<ReadyEntry> readyQueue =
+            new PriorityBlockingQueue<>(256, CubeTaskScheduler::compareReadyEntries);
+    private volatile long priorityEpoch;
 
     CubeTaskScheduler(CubeIoScheduler io) {
         this.io = io;
@@ -53,7 +63,8 @@ final class CubeTaskScheduler implements AutoCloseable {
 
     private CubeHolder requestGraph(
             CubePos pos, CubeStatus target, int priority, Set<StageRequest> visited) {
-        CubeHolder holder = holders.computeIfAbsent(pos, CubeHolder::new);
+        requestPriorities.merge(pos, priority, Math::min);
+        CubeHolder holder = holders.computeIfAbsent(pos, this::newHolder);
         holder.request(target);
         if (target.isAtLeast(CubeStatus.IO_READY)) {
             holder.startIo(() -> io.readAsync(pos, priority));
@@ -81,6 +92,16 @@ final class CubeTaskScheduler implements AutoCloseable {
         refreshTargets();
     }
 
+    /**
+     * Retains the active watcher roots and their PAYLOAD dependency closure.
+     * A watcher is deliberately not represented as a FULL ticket: streaming a
+     * block payload must not start the lighting graph for the whole view.
+     */
+    void retainPrefetches(Set<CubePos> retained) {
+        prefetchPositions = Set.copyOf(retained);
+        refreshTargets();
+    }
+
     boolean isTicketed(CubePos pos) {
         return tickets.isActive(pos);
     }
@@ -98,11 +119,15 @@ final class CubeTaskScheduler implements AutoCloseable {
     void release(CubePos pos) {
         if (isRequired(pos)) return;
         CubeHolder holder = holders.remove(pos);
-        if (holder != null) holder.cancel();
+        if (holder != null) {
+            requestPriorities.remove(pos);
+            holder.cancel();
+        }
     }
 
     int priority(CubePos pos) {
-        return tickets.priority(pos);
+        return Math.min(
+                tickets.priority(pos), requestPriorities.getOrDefault(pos, Integer.MAX_VALUE));
     }
 
     Set<CubePos> activePositions() {
@@ -110,7 +135,23 @@ final class CubeTaskScheduler implements AutoCloseable {
     }
 
     CubeHolder holder(CubePos pos) {
-        return holders.computeIfAbsent(pos, CubeHolder::new);
+        return holders.computeIfAbsent(pos, this::newHolder);
+    }
+
+    private CubeHolder newHolder(CubePos pos) {
+        return new CubeHolder(pos, this::holderChanged);
+    }
+
+    private void holderChanged(CubeHolder holder) {
+        if (holder.target() == CubeStatus.EMPTY || holder.failed()) return;
+        readyQueue.offer(new ReadyEntry(
+                holder, holder.changeVersion(), priority(holder.pos()),
+                holder.status().ordinal(), priorityEpoch));
+    }
+
+    /** Requeues a holder whose next stage still needs a bounded commit slice. */
+    void requeue(CubeHolder holder) {
+        holderChanged(holder);
     }
 
     /**
@@ -129,7 +170,7 @@ final class CubeTaskScheduler implements AutoCloseable {
     }
 
     CubeHolder adoptLoaded(LoadedCube cube) {
-        CubeHolder holder = holders.computeIfAbsent(cube.pos(), CubeHolder::new);
+        CubeHolder holder = holders.computeIfAbsent(cube.pos(), this::newHolder);
         holder.request(CubeStatus.FULL);
         holder.advance(CubeStatus.LIGHT);
         holder.materialize(cube);
@@ -297,18 +338,6 @@ final class CubeTaskScheduler implements AutoCloseable {
                 }));
     }
 
-    List<CubeHolder> readyTerrain(int limit) {
-        return holders.values().stream()
-                .filter(holder -> holder.terrainPreparationFuture() != null
-                        && holder.terrainPreparationFuture().isDone())
-                .filter(holder -> !holder.terrainPreparationFuture().isCancelled()
-                        && !holder.terrainPreparationFuture().isCompletedExceptionally())
-                .filter(holder -> !holder.status().isAtLeast(CubeStatus.TERRAIN))
-                .sorted(Comparator.comparingInt(holder -> tickets.priority(holder.pos())))
-                .limit(limit)
-                .toList();
-    }
-
     /**
      * Returns lifecycle nodes that have finished IO but still need server-thread
      * stage commits. Dependencies are requested recursively by {@link #request}.
@@ -316,61 +345,57 @@ final class CubeTaskScheduler implements AutoCloseable {
     List<CubeHolder> readyForCommit(int limit) {
         if (limit <= 0) return List.of();
 
-        // Keep only the best limit candidates while scanning.  The previous
-        // stream.sorted() retained and ordered every ready holder, even though
-        // callers consume at most 64 per slice; during a view rebuild this list
-        // can contain the whole dependency closure.
-        PriorityQueue<ReadyCandidate> best = new PriorityQueue<>(limit, (first, second) ->
-                compareReady(second, first));
-        // Keep a second, dependency-first frontier. A high-priority LIGHT
-        // candidate can be blocked on FEATURES cubes outside the ticket's
-        // direct volume (and therefore with no ticket priority of their own).
-        // Reserving fallback candidates lets those prerequisites advance
-        // without making lifecycle stage the primary ordering again.
-        PriorityQueue<ReadyCandidate> prerequisites = new PriorityQueue<>(
-                limit, (first, second) -> comparePrerequisite(second, first));
-        for (CubeHolder holder : holders.values()) {
-            if (holder.failed()
-                    || !holder.target().isAtLeast(CubeStatus.TERRAIN)
-                    || !holder.status().isAtLeast(CubeStatus.IO_READY)
-                    || holder.status().isAtLeast(holder.target())) {
+        // Holder state transitions enqueue a versioned entry. Poll only the
+        // current frontier instead of scanning and partially sorting every
+        // holder on every server-thread commit slice.
+        ArrayList<CubeHolder> result = new ArrayList<>(limit);
+        Set<CubeHolder> selected = new HashSet<>();
+        ArrayList<ReadyEntry> blocked = new ArrayList<>();
+        int scanBudget = readyQueue.size();
+        while (result.size() < limit && scanBudget-- > 0) {
+            ReadyEntry entry = readyQueue.poll();
+            if (entry == null) break;
+            CubeHolder holder = entry.holder();
+            if (entry.changeVersion() != holder.changeVersion()
+                    || entry.priorityEpoch() != priorityEpoch
+                    || entry.priority() != priority(holder.pos())
+                    || entry.statusOrdinal() != holder.status().ordinal()) {
+                holderChanged(holder);
                 continue;
             }
-
-            // The first visit starts terrain preparation. Once preparation is
-            // in flight, leave this holder out until the worker completes;
-            // repeatedly polling the same future on the server thread can
-            // consume the whole bounded commit slice during view rebuilds.
-            CompletableFuture<CubeTerrainSnapshot> terrain = holder.terrainPreparationFuture();
-            if (holder.status() == CubeStatus.IO_READY
-                    && terrain != null && !terrain.isDone()) {
+            if (!isReadyCandidate(holder)) continue;
+            if (!nextCommitDependenciesReady(holder)) {
+                // Do not put a blocked high-priority node back at the head
+                // while scanning. Its lower-priority TERRAIN/FEATURES
+                // prerequisites are in this same queue; re-offering it here
+                // would make the priority queue return the same node until
+                // scanBudget is exhausted, so the dependency can never run.
+                blocked.add(entry);
                 continue;
             }
-
-            ReadyCandidate candidate = new ReadyCandidate(
-                    holder, tickets.priority(holder.pos()), holder.status().ordinal());
-            offerBounded(best, candidate, limit, CubeTaskScheduler::compareReady);
-            offerBounded(
-                    prerequisites, candidate, limit, CubeTaskScheduler::comparePrerequisite);
+            if (selected.add(holder)) result.add(holder);
         }
-
-        Set<ReadyCandidate> candidates = new HashSet<>(best);
-        candidates.addAll(prerequisites);
-        ArrayList<ReadyCandidate> ordered = new ArrayList<>(candidates.size());
-        for (ReadyCandidate candidate : candidates) {
-            if (nextCommitDependenciesReady(candidate.holder())) ordered.add(candidate);
-        }
-        ordered.sort(CubeTaskScheduler::compareReady);
-        ArrayList<CubeHolder> result = new ArrayList<>(Math.min(limit, ordered.size()));
-        for (ReadyCandidate candidate : ordered) {
-            if (result.size() >= limit) break;
-            result.add(candidate.holder());
-        }
+        blocked.forEach(readyQueue::offer);
         return result;
     }
 
+    private boolean isReadyCandidate(CubeHolder holder) {
+        if (holder.failed()
+                || !holder.target().isAtLeast(CubeStatus.TERRAIN)
+                || !holder.status().isAtLeast(CubeStatus.IO_READY)
+                || holder.status().isAtLeast(holder.target())) {
+            return false;
+        }
+
+        // The first visit starts terrain preparation. Once preparation is in
+        // flight, leave this holder out until the worker completes.
+        CompletableFuture<CubeTerrainSnapshot> terrain = holder.terrainPreparationFuture();
+        return holder.status() != CubeStatus.IO_READY
+                || terrain == null || terrain.isDone();
+    }
+
     void trackSave(CubePos pos, CompletableFuture<Void> save) {
-        CubeHolder holder = holders.computeIfAbsent(pos, CubeHolder::new);
+        CubeHolder holder = holders.computeIfAbsent(pos, this::newHolder);
         holder.trackSave(save);
         save.whenComplete((ignored, throwable) -> {
             if (!tickets.isActive(pos) && holder.target() == CubeStatus.EMPTY) {
@@ -386,14 +411,14 @@ final class CubeTaskScheduler implements AutoCloseable {
         return save.isDone() && !save.isCompletedExceptionally() && !save.isCancelled();
     }
 
-    void retainTicketedHolders() {
-        refreshTargets();
-    }
-
     private void refreshTargets() {
+        priorityEpoch++;
         Map<CubePos, CubeStatus> required = new HashMap<>();
         for (CubeTicket ticket : tickets.activeTickets()) {
             collectRequired(ticket.center(), ticket.radius(), ticket.targetStatus(), required);
+        }
+        for (CubePos pos : prefetchPositions) {
+            collectRequired(pos, CubeDependencyRadius.NONE, CubeStatus.PAYLOAD, required);
         }
 
         // Publish the closure before lowering/cancelling holders.  The world
@@ -410,6 +435,7 @@ final class CubeTaskScheduler implements AutoCloseable {
         holders.forEach((pos, holder) -> {
             CubeStatus target = required.get(pos);
             if (target == null) {
+                requestPriorities.remove(pos);
                 holder.cancel();
                 holders.remove(pos, holder);
             } else if (target.ordinal() < holder.target().ordinal()) {
@@ -464,12 +490,17 @@ final class CubeTaskScheduler implements AutoCloseable {
         generationExecutor.shutdownNow();
         holders.values().forEach(CubeHolder::cancel);
         holders.clear();
+        requestPriorities.clear();
         requiredPositions = Set.of();
+        prefetchPositions = Set.of();
+        readyQueue.clear();
     }
 
-    private record ReadyCandidate(CubeHolder holder, int priority, int statusOrdinal) {}
+    private record ReadyEntry(
+            CubeHolder holder, long changeVersion, int priority,
+            int statusOrdinal, long priorityEpoch) {}
 
-    private static int compareReady(ReadyCandidate first, ReadyCandidate second) {
+    private static int compareReadyEntries(ReadyEntry first, ReadyEntry second) {
         // Ticket priority includes distance from the ticket centre.  It must be
         // the primary key so newly arriving, distant IO_READY cubes cannot
         // indefinitely displace a nearby cube that is one commit from FULL.
@@ -481,23 +512,6 @@ final class CubeTaskScheduler implements AutoCloseable {
         // nextCommitDependenciesReady(), so this cannot starve their lower-stage
         // dependency cubes.
         return Integer.compare(second.statusOrdinal(), first.statusOrdinal());
-    }
-
-    private static int comparePrerequisite(ReadyCandidate first, ReadyCandidate second) {
-        int byStatus = Integer.compare(first.statusOrdinal(), second.statusOrdinal());
-        return byStatus != 0
-                ? byStatus : Integer.compare(first.priority(), second.priority());
-    }
-
-    private static void offerBounded(
-            PriorityQueue<ReadyCandidate> queue, ReadyCandidate candidate, int limit,
-            Comparator<ReadyCandidate> comparator) {
-        if (queue.size() < limit) {
-            queue.offer(candidate);
-        } else if (comparator.compare(candidate, queue.peek()) < 0) {
-            queue.poll();
-            queue.offer(candidate);
-        }
     }
 
     private boolean nextCommitDependenciesReady(CubeHolder holder) {

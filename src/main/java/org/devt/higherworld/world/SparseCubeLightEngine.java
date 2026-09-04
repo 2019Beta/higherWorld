@@ -1,7 +1,10 @@
 package org.devt.higherworld.world;
 
 import java.util.ArrayDeque;
+import java.util.BitSet;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
 import org.devt.higherworld.storage.CubePos;
 
@@ -16,7 +19,8 @@ public final class SparseCubeLightEngine {
     };
     private final Access access;
     private final ArrayDeque<Node> pending = new ArrayDeque<>();
-    private final Set<Node> queued = new HashSet<>();
+    /** One 4096-bit deduplication bitmap per queued cube avoids duplicate Node objects. */
+    private final Map<CubePos, BitSet> queued = new HashMap<>();
 
     public SparseCubeLightEngine(Access access) {
         this.access = access;
@@ -81,7 +85,11 @@ public final class SparseCubeLightEngine {
         while (!pending.isEmpty() && steps < maximumSteps
                 && ((steps & 63) != 0 || System.nanoTime() - started < budget)) {
             Node node = pending.removeFirst();
-            queued.remove(node);
+            BitSet cubeQueue = queued.get(node.cube());
+            if (cubeQueue != null) {
+                cubeQueue.clear(node.localIndex());
+                if (cubeQueue.isEmpty()) queued.remove(node.cube());
+            }
             steps++;
             if (!access.managed(node.x, node.y, node.z)) continue;
 
@@ -109,7 +117,7 @@ public final class SparseCubeLightEngine {
             boolean blockChanged = access.setBlock(node.x, node.y, node.z, block);
             boolean skyChanged = access.setSky(node.x, node.y, node.z, sky);
             if (blockChanged || skyChanged) {
-                changed.add(CubePos.fromBlock(node.x, node.y, node.z));
+                changed.add(node.cube());
                 for (int[] direction : DIRECTIONS) {
                     queueOffset(node.x, node.y, node.z,
                             direction[0], direction[1], direction[2]);
@@ -127,8 +135,12 @@ public final class SparseCubeLightEngine {
 
     private void queue(int x, int y, int z) {
         if (!access.managed(x, y, z)) return;
-        Node node = new Node(x, y, z);
-        if (queued.add(node)) pending.addLast(node);
+        CubePos cube = CubePos.fromBlock(x, y, z);
+        int localIndex = localIndex(cube, x, y, z);
+        BitSet cubeQueue = queued.computeIfAbsent(cube, ignored -> new BitSet(4096));
+        if (cubeQueue.get(localIndex)) return;
+        cubeQueue.set(localIndex);
+        pending.addLast(new Node(x, y, z, cube, localIndex));
     }
 
     private void queueOffset(int x, int y, int z, int dx, int dy, int dz) {
@@ -148,7 +160,14 @@ public final class SparseCubeLightEngine {
         return Math.max(0, Math.min(MAX_LIGHT_LEVEL, value));
     }
 
-    private record Node(int x, int y, int z) {}
+    private static int localIndex(CubePos cube, int x, int y, int z) {
+        int localX = x - cube.minBlockX();
+        int localY = y - cube.minBlockY();
+        int localZ = z - cube.minBlockZ();
+        return localX | localZ << 4 | localY << 8;
+    }
+
+    private record Node(int x, int y, int z, CubePos cube, int localIndex) {}
 
     public record Result(Set<CubePos> changedCubes, boolean complete, int steps) {}
 

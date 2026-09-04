@@ -5,6 +5,7 @@ import java.nio.file.Path;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -43,6 +44,7 @@ final class CubicWorldState implements AutoCloseable {
     private static final int EVICTIONS_PER_PASS = 32;
     private static final long EVICTION_NANOS_PER_PASS = 2_000_000L;
     private static final int LIGHT_BROADCASTS_PER_TICK = 2;
+    private static final long MAX_CACHED_PAYLOAD_BYTES = 32L * 1024L * 1024L;
     private final ServerWorld world;
     private final CubeStorage storage;
     private final CubeIoScheduler ioScheduler;
@@ -57,6 +59,9 @@ final class CubicWorldState implements AutoCloseable {
     private final ConcurrentMap<CubePos, LoadedCube> cubes = new ConcurrentHashMap<>();
     private final ConcurrentMap<CubePos, LoadContext> loadContexts = new ConcurrentHashMap<>();
     private final ConcurrentMap<BlockColumnPos, Integer> highestBlocks = new ConcurrentHashMap<>();
+    /** Small LRU of immutable codec results reused by send/save paths. */
+    private final Map<CubePos, EncodedPayload> payloadCache = new LinkedHashMap<>(32, 0.75f, true);
+    private long cachedPayloadBytes;
     private final SparseCubeLightEngine lightEngine = new SparseCubeLightEngine(new LightAccess());
     private final CubeScheduledTickQueue scheduledTicks;
     private final CubeScheduledTickJournal scheduledTickJournal;
@@ -402,7 +407,7 @@ final class CubicWorldState implements AutoCloseable {
             LoadContext context = loadContexts.get(pos);
             if (context != null && context.full) {
                 taskScheduler.adoptLoaded(loaded);
-                return CubeRecordCodec.encode(loaded, world);
+                return encodePayload(loaded);
             }
             CubeHolder holder = taskScheduler.holder(pos);
             if (!holder.status().isAtLeast(CubeStatus.FULL)) {
@@ -410,7 +415,7 @@ final class CubicWorldState implements AutoCloseable {
             } else {
                 taskScheduler.adoptLoaded(loaded);
             }
-            return CubeRecordCodec.encode(loaded, world);
+            return encodePayload(loaded);
         }
 
         CubeHolder holder = taskScheduler.request(pos, CubeStatus.FULL, SYNCHRONOUS_IO_PRIORITY);
@@ -493,7 +498,7 @@ final class CubicWorldState implements AutoCloseable {
     }
 
     void retainPrefetches(Set<CubePos> retained) {
-        taskScheduler.retainTicketedHolders();
+        taskScheduler.retainPrefetches(retained);
     }
 
     /**
@@ -506,7 +511,7 @@ final class CubicWorldState implements AutoCloseable {
             LoadContext context = loadContexts.get(pos);
             if (context != null && context.full) {
                 taskScheduler.adoptLoaded(loaded);
-                return CubeRecordCodec.encode(loaded, world);
+                return encodePayload(loaded);
             }
             CubeHolder holder = taskScheduler.holder(pos);
             if (!holder.status().isAtLeast(CubeStatus.PAYLOAD)) {
@@ -516,7 +521,7 @@ final class CubicWorldState implements AutoCloseable {
             // placeholder as an already-complete cube here: doing so would
             // skip eventual lighting and could mark the lifecycle FULL while
             // the first packet is still being assembled.
-            return CubeRecordCodec.encode(loaded, world);
+            return encodePayload(loaded);
         }
 
         CubeHolder holder = taskScheduler.request(pos, CubeStatus.PAYLOAD, priority);
@@ -571,7 +576,7 @@ final class CubicWorldState implements AutoCloseable {
             } else {
                 generated = ensureStage(pos, CubeStatus.FULL, priority, Optional.empty());
             }
-            return CubeRecordCodec.encode(generated, world);
+            return encodePayload(generated);
         }
 
         // Real stored cubes still enter the runtime so their block entities and
@@ -586,7 +591,7 @@ final class CubicWorldState implements AutoCloseable {
         } else {
             created = ensureStage(pos, CubeStatus.FULL, priority, stored);
         }
-        return created.isDirty() ? CubeRecordCodec.encode(created, world) : stored.get();
+        return created.isDirty() ? encodePayload(created) : stored.get();
     }
 
     void flushDirty() throws IOException {
@@ -636,6 +641,7 @@ final class CubicWorldState implements AutoCloseable {
                     if (!taskScheduler.saveComplete(cube.pos())) continue;
                     column.remove(cube.pos().y());
                     cubes.remove(cube.pos(), cube);
+                    invalidatePayload(cube.pos());
                     loadContexts.remove(cube.pos());
                     removeIndexedHeights(cube);
                     taskScheduler.release(cube.pos());
@@ -719,7 +725,8 @@ final class CubicWorldState implements AutoCloseable {
         for (CubeHolder holder : taskScheduler.readyForCommit(256)) {
             if (System.nanoTime() >= deadline) break;
             try {
-                tryAdvance(holder, taskScheduler.priority(holder.pos()));
+                boolean progressed = tryAdvance(holder, taskScheduler.priority(holder.pos()));
+                if (!progressed) taskScheduler.requeue(holder);
             } catch (IOException | RuntimeException exception) {
                 holder.fail(exception);
                 Higherworld.LOGGER.error("Cannot finish asynchronous cube {}", holder.pos(), exception);
@@ -923,6 +930,7 @@ final class CubicWorldState implements AutoCloseable {
                 if (column.isEmpty()) columns.remove(new ColumnPos(pos.x(), pos.z()), column);
             }
             cubes.remove(pos, existing.cube);
+            invalidatePayload(pos);
             removeIndexedHeights(existing.cube);
         }
         LoadedCube cube = registerPlaceholder(pos);
@@ -1196,6 +1204,51 @@ final class CubicWorldState implements AutoCloseable {
         return cubes.values();
     }
 
+    /**
+     * Encodes at most once per loaded-cube content revision.  The cache is
+     * bounded by bytes because a dense palette/NBT snapshot can be much larger
+     * than the usual sparse record.
+     */
+    private byte[] encodePayload(LoadedCube cube) throws IOException {
+        long revision = cube.revision();
+        synchronized (payloadCache) {
+            EncodedPayload cached = payloadCache.get(cube.pos());
+            if (cached != null && cached.cube() == cube && cached.revision() == revision) {
+                return cached.payload();
+            }
+        }
+
+        byte[] encoded = CubeRecordCodec.encode(cube, world);
+        if (encoded.length > MAX_CACHED_PAYLOAD_BYTES) return encoded;
+        synchronized (payloadCache) {
+            EncodedPayload previous = payloadCache.put(
+                    cube.pos(), new EncodedPayload(cube, revision, encoded));
+            if (previous != null) cachedPayloadBytes -= previous.payload().length;
+            cachedPayloadBytes += encoded.length;
+            while (cachedPayloadBytes > MAX_CACHED_PAYLOAD_BYTES && !payloadCache.isEmpty()) {
+                Iterator<Map.Entry<CubePos, EncodedPayload>> entries = payloadCache.entrySet().iterator();
+                Map.Entry<CubePos, EncodedPayload> eldest = entries.next();
+                entries.remove();
+                cachedPayloadBytes -= eldest.getValue().payload().length;
+            }
+        }
+        return encoded;
+    }
+
+    private void invalidatePayload(CubePos pos) {
+        synchronized (payloadCache) {
+            EncodedPayload removed = payloadCache.remove(pos);
+            if (removed != null) cachedPayloadBytes -= removed.payload().length;
+        }
+    }
+
+    private void clearPayloadCache() {
+        synchronized (payloadCache) {
+            payloadCache.clear();
+            cachedPayloadBytes = 0L;
+        }
+    }
+
     private void markScheduledTickDirty(CubePos pos) {
         LoadedCube cube = loadedCube(pos);
         if (cube != null) cube.markDirty();
@@ -1214,7 +1267,7 @@ final class CubicWorldState implements AutoCloseable {
             return;
         }
         try {
-            var write = ioScheduler.write(cube.pos(), CubeRecordCodec.encode(cube, world));
+            var write = ioScheduler.write(cube.pos(), encodePayload(cube));
             taskScheduler.trackSave(cube.pos(), write);
             write.whenComplete((ignored, exception) -> {
                 if (exception != null && wasDirty) cube.restoreDirty();
@@ -1279,6 +1332,7 @@ final class CubicWorldState implements AutoCloseable {
         columns.clear();
         cubes.clear();
         loadContexts.clear();
+        clearPayloadCache();
         CubeScheduledTickQueue.unregister(world, scheduledTicks);
         if (failure != null) {
             throw failure;
@@ -1289,6 +1343,9 @@ final class CubicWorldState implements AutoCloseable {
     }
 
     private record BlockColumnPos(int x, int z) {
+    }
+
+    private record EncodedPayload(LoadedCube cube, long revision, byte[] payload) {
     }
 
     private static final class LoadContext {

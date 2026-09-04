@@ -320,6 +320,7 @@ public final class CubeIoScheduler implements AutoCloseable {
                 payloads.put(task.write.pos, snapshot.payload());
             }
             storage.writeBatch(payloads);
+            storage.compactIfNeeded(region);
             for (WriteTask task : batch) {
                 PendingWrite write = task.write;
                 if (write.sealIfCurrent(snapshots.get(write.pos).version())) {

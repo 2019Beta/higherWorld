@@ -12,6 +12,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.function.Consumer;
 
 import net.fabricmc.fabric.api.networking.v1.PlayerLookup;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
@@ -281,14 +282,6 @@ public final class CubeWatchManager {
             // every time the player crosses a section boundary.
             state.sent.add(pos);
             state.finish(watch);
-            // Render PAYLOAD immediately, then expand the more expensive
-            // lighting/FULL graph after the first packet has left the server.
-            try {
-                CubicWorldManager.prefetchCubeFull(world, pos, watch.rank);
-            } catch (RuntimeException ignored) {
-                // A later simulation/entity ticket can retry FULL; the visible
-                // payload has already been delivered successfully.
-            }
         }
         return rebuilt;
     }
@@ -348,6 +341,9 @@ public final class CubeWatchManager {
     private static void rebuildQueue(
             ServerPlayerEntity player, WatchState state, ServerWorld world, CubePos center,
             int horizontalRadius) {
+        CubePos previousCenter = state.center;
+        int previousRadius = state.horizontalRadius;
+        boolean sameWorld = state.world == world;
         if (state.world != null && state.world != world) {
             ServerWorld previousWorld = state.world;
             CubicWorldManager.removeTicket(previousWorld, player.getUuid());
@@ -365,47 +361,127 @@ public final class CubeWatchManager {
             CubicWorldManager.removeTicket(world, player.getUuid());
         }
 
-        Iterator<CubePos> iterator = state.sent.iterator();
-        while (iterator.hasNext()) {
-            CubePos pos = iterator.next();
-            if (!withinView(pos, center, horizontalRadius)) {
-                if (ServerPlayNetworking.canSend(player, CubeUnloadPayload.ID)) {
-                    ServerPlayNetworking.send(player, new CubeUnloadPayload(
-                            pos, CubicWorldManager.cubeRevision(world, pos)));
-                }
-                iterator.remove();
-            }
+        if (sameWorld && previousCenter != null) {
+            updateWindowIncrementally(
+                    player, state, world, previousCenter, previousRadius, center, horizontalRadius);
+        } else {
+            rebuildFullWindow(state, world, center, horizontalRadius);
         }
+    }
 
-        Set<CubePos> desired = new HashSet<>();
-        for (int dy = -VERTICAL_RADIUS; dy <= VERTICAL_RADIUS; dy++) {
-            for (int dz = -horizontalRadius; dz <= horizontalRadius; dz++) {
-                for (int dx = -horizontalRadius; dx <= horizontalRadius; dx++) {
-                    CubePos pos = new CubePos(center.x() + dx, center.y() + dy, center.z() + dz);
-                    if (pos.isBlockRangeRepresentable() && isOutsideVanillaHeight(world, pos)
-                            && !state.sent.contains(pos)) {
-                        desired.add(pos);
-                    }
-                }
+    /**
+     * Slides an axis-aligned view by visiting only the old/new box difference.
+     * Queue entries for positions in the overlap are reprioritized lazily when
+     * polled, so a camera move no longer clears and recreates the full view PQ.
+     */
+    private static void updateWindowIncrementally(
+            ServerPlayerEntity player, WatchState state, ServerWorld world,
+            CubePos previousCenter, int previousRadius,
+            CubePos center, int horizontalRadius) {
+        CubeBox previous = CubeBox.around(previousCenter, previousRadius);
+        CubeBox current = CubeBox.around(center, horizontalRadius);
+        forEachBoxDifference(previous, current, pos -> {
+            Watch watch = state.watches.remove(pos);
+            if (watch != null) watch.invalidate();
+            if (state.sent.remove(pos) && ServerPlayNetworking.canSend(player, CubeUnloadPayload.ID)) {
+                ServerPlayNetworking.send(player, new CubeUnloadPayload(
+                        pos, CubicWorldManager.cubeRevision(world, pos)));
             }
-        }
-        // Retain a watch whose IO is already in flight, but invalidate every
-        // watch which left the new view. Newly entered positions get a fresh
-        // identity, so stale queue entries/callbacks cannot target them.
-        Iterator<Map.Entry<CubePos, Watch>> watches = state.watches.entrySet().iterator();
-        while (watches.hasNext()) {
-            Map.Entry<CubePos, Watch> entry = watches.next();
-            if (!desired.contains(entry.getKey())) {
-                entry.getValue().invalidate();
-                watches.remove();
+        });
+        forEachBoxDifference(current, previous, pos -> {
+            if (pos.isBlockRangeRepresentable() && isOutsideVanillaHeight(world, pos)
+                    && !state.sent.contains(pos)) {
+                state.addWatch(pos, cubePriority(pos, center));
             }
-        }
-        for (CubePos pos : desired) {
-            if (!state.watches.containsKey(pos)) {
+        });
+    }
+
+    private static void rebuildFullWindow(
+            WatchState state, ServerWorld world, CubePos center, int horizontalRadius) {
+        state.watches.values().forEach(Watch::invalidate);
+        state.watches.clear();
+        CubeBox current = CubeBox.around(center, horizontalRadius);
+        current.forEach(pos -> {
+            if (pos.isBlockRangeRepresentable() && isOutsideVanillaHeight(world, pos)
+                    && !state.sent.contains(pos)) {
                 state.watches.put(pos, new Watch(pos, cubePriority(pos, center)));
             }
-        }
+        });
         state.rebuildQueues();
+    }
+
+    private static void forEachBoxDifference(
+            CubeBox first, CubeBox second, Consumer<CubePos> consumer) {
+        CubeBox overlap = first.intersection(second);
+        if (overlap == null) {
+            first.forEach(consumer);
+            return;
+        }
+
+        forEachRange(
+                first.minX(), overlap.minX() - 1,
+                first.minY(), first.maxY(), first.minZ(), first.maxZ(), consumer);
+        forEachRange(
+                overlap.maxX() + 1, first.maxX(),
+                first.minY(), first.maxY(), first.minZ(), first.maxZ(), consumer);
+
+        int overlapMinX = overlap.minX();
+        int overlapMaxX = overlap.maxX();
+        forEachRange(
+                overlapMinX, overlapMaxX,
+                first.minY(), overlap.minY() - 1, first.minZ(), first.maxZ(), consumer);
+        forEachRange(
+                overlapMinX, overlapMaxX,
+                overlap.maxY() + 1, first.maxY(), first.minZ(), first.maxZ(), consumer);
+
+        int overlapMinY = overlap.minY();
+        int overlapMaxY = overlap.maxY();
+        forEachRange(
+                overlapMinX, overlapMaxX, overlapMinY, overlapMaxY,
+                first.minZ(), overlap.minZ() - 1, consumer);
+        forEachRange(
+                overlapMinX, overlapMaxX, overlapMinY, overlapMaxY,
+                overlap.maxZ() + 1, first.maxZ(), consumer);
+    }
+
+    private static void forEachRange(
+            int minX, int maxX, int minY, int maxY, int minZ, int maxZ,
+            Consumer<CubePos> consumer) {
+        if (minX > maxX || minY > maxY || minZ > maxZ) return;
+        for (int y = minY; y <= maxY; y++) {
+            for (int z = minZ; z <= maxZ; z++) {
+                for (int x = minX; x <= maxX; x++) {
+                    consumer.accept(new CubePos(x, y, z));
+                }
+            }
+        }
+    }
+
+    private record CubeBox(int minX, int maxX, int minY, int maxY, int minZ, int maxZ) {
+        static CubeBox around(CubePos center, int horizontalRadius) {
+            return new CubeBox(
+                    center.x() - horizontalRadius, center.x() + horizontalRadius,
+                    center.y() - VERTICAL_RADIUS, center.y() + VERTICAL_RADIUS,
+                    center.z() - horizontalRadius, center.z() + horizontalRadius);
+        }
+
+        void forEach(Consumer<CubePos> consumer) {
+            forEachRange(minX, maxX, minY, maxY, minZ, maxZ, consumer);
+        }
+
+        CubeBox intersection(CubeBox other) {
+            int resultMinX = Math.max(minX, other.minX);
+            int resultMaxX = Math.min(maxX, other.maxX);
+            int resultMinY = Math.max(minY, other.minY);
+            int resultMaxY = Math.min(maxY, other.maxY);
+            int resultMinZ = Math.max(minZ, other.minZ);
+            int resultMaxZ = Math.min(maxZ, other.maxZ);
+            return resultMinX > resultMaxX || resultMinY > resultMaxY || resultMinZ > resultMaxZ
+                    ? null
+                    : new CubeBox(
+                            resultMinX, resultMaxX, resultMinY, resultMaxY,
+                            resultMinZ, resultMaxZ);
+        }
     }
 
     private static void unloadAll(ServerPlayerEntity player, WatchState state) {
@@ -567,6 +643,13 @@ public final class CubeWatchManager {
             return Set.copyOf(watches.keySet());
         }
 
+        private Watch addWatch(CubePos pos, int rank) {
+            Watch watch = new Watch(pos, rank);
+            watches.put(pos, watch);
+            enqueuePendingStart(watch);
+            return watch;
+        }
+
         void rebuildQueues() {
             pendingStarts.clear();
             readySends.clear();
@@ -588,6 +671,12 @@ public final class CubeWatchManager {
                 Watch watch = entry.watch();
                 if (entry.version() == watch.version && watch.phase == WatchPhase.PENDING_START
                         && watches.get(watch.pos) == watch) {
+                    int currentRank = currentRank(watch);
+                    if (entry.rank() != currentRank) {
+                        watch.rank = currentRank;
+                        enqueuePendingStart(watch);
+                        continue;
+                    }
                     return watch;
                 }
             }
@@ -600,6 +689,12 @@ public final class CubeWatchManager {
                 Watch watch = entry.watch();
                 if (entry.version() == watch.version && watch.phase == WatchPhase.READY_SEND
                         && watches.get(watch.pos) == watch) {
+                    int currentRank = currentRank(watch);
+                    if (entry.rank() != currentRank) {
+                        watch.rank = currentRank;
+                        enqueueReadySend(watch);
+                        continue;
+                    }
                     return watch;
                 }
             }
@@ -670,6 +765,10 @@ public final class CubeWatchManager {
             retries.offer(new RetryEntry(
                     watch, watch.version, watch.retryTarget, watch.dueTick,
                     watch.rank, sequence++));
+        }
+
+        private int currentRank(Watch watch) {
+            return center == null ? watch.rank : cubePriority(watch.pos, center);
         }
     }
 
