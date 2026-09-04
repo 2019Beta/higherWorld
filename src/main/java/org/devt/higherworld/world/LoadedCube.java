@@ -136,6 +136,7 @@ final class LoadedCube {
             if (blockEntity.isRemoved()) {
                 if (blockEntities.remove(blockEntity.getPos(), blockEntity)) {
                     dirty.set(true);
+                    revision.incrementAndGet();
                 }
                 continue;
             }

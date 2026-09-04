@@ -50,7 +50,12 @@ public final class ClientCubeCache {
     private static final ConcurrentMap<BlockColumnPos, Integer> HIGHEST_BLOCKS =
             new ConcurrentHashMap<>();
     private static volatile ClientWorld owner;
-    private static final ConcurrentMap<BlockPos, BlockEntity> BLOCK_ENTITIES = new ConcurrentHashMap<>();
+    /** Block entities are indexed by their owning cube to keep render rebuilds local. */
+    private static final ConcurrentMap<CubePos, ConcurrentMap<BlockPos, BlockEntity>> BLOCK_ENTITIES =
+            new ConcurrentHashMap<>();
+    private static final int[][] NEIGHBOUR_DIRECTIONS = {
+            {-1, 0, 0}, {1, 0, 0}, {0, -1, 0}, {0, 1, 0}, {0, 0, -1}, {0, 0, 1}
+    };
     private static final SparseCubeLightEngine LIGHT_ENGINE = new SparseCubeLightEngine(new ClientLightAccess());
     /**
      * Render invalidations are produced only on the client thread. Keep them in
@@ -104,8 +109,10 @@ public final class ClientCubeCache {
             }
         }
         removeBlockEntities(pos);
+        ConcurrentMap<BlockPos, BlockEntity> cubeBlockEntities =
+                BLOCK_ENTITIES.computeIfAbsent(pos, ignored -> new ConcurrentHashMap<>());
         for (BlockEntity blockEntity : decoded.blockEntities()) {
-            BLOCK_ENTITIES.put(blockEntity.getPos().toImmutable(), blockEntity);
+            cubeBlockEntities.put(blockEntity.getPos().toImmutable(), blockEntity);
         }
         LIGHT_ENGINE.queueCube(pos, !decoded.hasLight());
         queueRenderNeighborhood(pos);
@@ -271,7 +278,9 @@ public final class ClientCubeCache {
 
     public static BlockEntity getBlockEntity(ClientWorld world, BlockPos pos) {
         ensureOwner(world);
-        return BLOCK_ENTITIES.get(pos);
+        ConcurrentMap<BlockPos, BlockEntity> cubeBlockEntities =
+                BLOCK_ENTITIES.get(CubePos.fromBlock(pos.getX(), pos.getY(), pos.getZ()));
+        return cubeBlockEntities == null ? null : cubeBlockEntities.get(pos);
     }
 
     public static int getLightLevel(ClientWorld world, LightType type, BlockPos pos) {
@@ -285,15 +294,9 @@ public final class ClientCubeCache {
 
     public static Collection<BlockEntity> getBlockEntities(ClientWorld world, CubePos pos) {
         ensureOwner(world);
-        int minX = pos.minBlockX();
-        int minY = pos.minBlockY();
-        int minZ = pos.minBlockZ();
-        return BLOCK_ENTITIES.entrySet().stream()
-                .filter(entry -> (long) entry.getKey().getX() >= minX && entry.getKey().getX() < (long) minX + 16
-                        && (long) entry.getKey().getY() >= minY && entry.getKey().getY() < (long) minY + 16
-                        && (long) entry.getKey().getZ() >= minZ && entry.getKey().getZ() < (long) minZ + 16)
-                .map(Map.Entry::getValue)
-                .toList();
+        Map<BlockPos, BlockEntity> cubeBlockEntities = BLOCK_ENTITIES.get(pos);
+        return cubeBlockEntities == null ? java.util.List.of()
+                : java.util.List.copyOf(cubeBlockEntities.values());
     }
 
     public static Integer highestBlockY(ClientWorld world, int blockX, int blockZ) {
@@ -359,18 +362,11 @@ public final class ClientCubeCache {
     }
 
     private static void removeBlockEntities(CubePos pos) {
-        int minX = pos.minBlockX();
-        int minY = pos.minBlockY();
-        int minZ = pos.minBlockZ();
-        BLOCK_ENTITIES.keySet().removeIf(blockPos -> (long) blockPos.getX() >= minX
-                && blockPos.getX() < (long) minX + 16
-                && (long) blockPos.getY() >= minY && blockPos.getY() < (long) minY + 16
-                && (long) blockPos.getZ() >= minZ && blockPos.getZ() < (long) minZ + 16);
+        BLOCK_ENTITIES.remove(pos);
     }
 
     private static void queueLoadedNeighbours(CubePos pos) {
-        int[][] directions = {{-1, 0, 0}, {1, 0, 0}, {0, -1, 0}, {0, 1, 0}, {0, 0, -1}, {0, 0, 1}};
-        for (int[] direction : directions) {
+        for (int[] direction : NEIGHBOUR_DIRECTIONS) {
             long x = (long) pos.x() + direction[0];
             long y = (long) pos.y() + direction[1];
             long z = (long) pos.z() + direction[2];

@@ -4,17 +4,26 @@ import java.util.EnumMap;
 import java.util.Optional;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
 import java.util.function.Supplier;
 import org.devt.higherworld.storage.CubePos;
 
 /** Deduplicated, restartable lifecycle and cancellation boundary for one cube. */
 final class CubeHolder {
     private final CubePos pos;
+    private final Consumer<CubeHolder> changeListener;
+    private final AtomicLong changeVersion = new AtomicLong();
     private volatile Lifecycle lifecycle = new Lifecycle(0L);
     private volatile CompletableFuture<Void> saveFuture = CompletableFuture.completedFuture(null);
 
     CubeHolder(CubePos pos) {
+        this(pos, null);
+    }
+
+    CubeHolder(CubePos pos, Consumer<CubeHolder> changeListener) {
         this.pos = pos;
+        this.changeListener = changeListener;
     }
 
     CubePos pos() { return pos; }
@@ -32,21 +41,31 @@ final class CubeHolder {
     CompletableFuture<Void> lightFuture() { return lifecycle.stage(CubeStatus.LIGHT); }
     CompletableFuture<Optional<LoadedCube>> fullFuture() { return lifecycle.fullFuture; }
     CompletableFuture<Void> saveFuture() { return saveFuture; }
+    long changeVersion() { return changeVersion.get(); }
 
     synchronized void request(CubeStatus requested) {
         Lifecycle current = lifecycle;
+        boolean changed = false;
         if (current.cancelled) {
             current = lifecycle = new Lifecycle(current.epoch + 1L);
+            changed = true;
         }
-        if (requested.ordinal() > current.target.ordinal()) current.target = requested;
+        if (requested.ordinal() > current.target.ordinal()) {
+            current.target = requested;
+            changed = true;
+        }
+        if (changed) notifyChanged();
     }
 
     synchronized void lowerTarget(CubeStatus requested) {
+        if (requested.ordinal() >= lifecycle.target.ordinal()) return;
         lifecycle.target = requested;
+        notifyChanged();
     }
 
     void advance(CubeStatus reached) {
         Lifecycle current = lifecycle;
+        boolean changed = false;
         synchronized (current) {
             // A failed epoch is terminal.  In particular, do not let a late
             // dependency completion turn an exceptional lifecycle back into a
@@ -58,7 +77,9 @@ final class CubeHolder {
                 current.stage(stage).complete(null);
             }
             current.status = reached;
+            changed = true;
         }
+        if (changed) notifyChanged();
     }
 
     synchronized CompletableFuture<Optional<byte[]>> startIo(
@@ -87,6 +108,7 @@ final class CubeHolder {
                 if (failure != null && !isCancellation(failure)) {
                     fail(epoch, failure);
                 }
+                notifyChanged();
             });
         }
         return current.terrainPreparationFuture;
@@ -121,6 +143,7 @@ final class CubeHolder {
         current.failed = true;
         current.stageFutures.values().forEach(future -> future.completeExceptionally(throwable));
         current.fullFuture.completeExceptionally(throwable);
+        notifyChanged();
     }
 
     synchronized void cancel() {
@@ -134,6 +157,7 @@ final class CubeHolder {
         if (current.terrainPreparationFuture != null) current.terrainPreparationFuture.cancel(false);
         current.stageFutures.values().forEach(future -> future.completeExceptionally(cancelled));
         current.fullFuture.completeExceptionally(cancelled);
+        notifyChanged();
     }
 
     synchronized void trackSave(CompletableFuture<Void> future) {
@@ -152,6 +176,11 @@ final class CubeHolder {
             current = current.getCause();
         }
         return false;
+    }
+
+    private void notifyChanged() {
+        changeVersion.incrementAndGet();
+        if (changeListener != null) changeListener.accept(this);
     }
 
     CompletableFuture<Void> localStageFuture(CubeStatus stage) {

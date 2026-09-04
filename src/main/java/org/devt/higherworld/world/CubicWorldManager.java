@@ -365,7 +365,10 @@ public final class CubicWorldManager {
             return new byte[0];
         }
         try {
-            return state.cubePayload(pos);
+            // The state may return its bounded encoded-payload cache entry;
+            // preserve the public API's defensive-copy contract at this
+            // boundary so callers cannot mutate a cached snapshot.
+            return state.cubePayload(pos).clone();
         } catch (IOException | RuntimeException exception) {
             Higherworld.LOGGER.error("Cannot encode cube {} in {}", pos, world.getRegistryKey().getValue(), exception);
             return new byte[0];
@@ -420,7 +423,7 @@ public final class CubicWorldManager {
                 : state.prefetchCubeFull(pos, priority);
     }
 
-    /** Drops queued read-ahead work after its last 3D watcher ticket disappears. */
+    /** Retains active watcher payload demand while dropping stale read-ahead work. */
     public static void retainPrefetches(ServerWorld world, Set<CubePos> retained) {
         CubicWorldState state = WORLDS.get(world);
         if (state != null) {

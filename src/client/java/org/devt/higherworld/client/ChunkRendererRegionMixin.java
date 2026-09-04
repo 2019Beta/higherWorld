@@ -9,6 +9,7 @@ import net.minecraft.util.math.BlockPos;
 import net.minecraft.world.LightType;
 import net.minecraft.world.World;
 import org.devt.higherworld.client.ClientCubeCache;
+import org.devt.higherworld.world.CubeLightMath;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
@@ -62,8 +63,9 @@ abstract class ChunkRendererRegionMixin {
         if (!outsideVanillaHeight(pos)) {
             return world.getBaseLightLevel(pos, ambientDarkness);
         }
-        int sky = Math.max(0, getLightLevel(LightType.SKY, pos) - ambientDarkness);
-        return Math.max(sky, world.getBlockState(pos).getLuminance());
+        return CubeLightMath.externalBaseLightLevel(
+                getLightLevel(LightType.SKY, pos), ambientDarkness,
+                ClientCubeCache.getBlockState((ClientWorld) world, pos).getLuminance());
     }
 
     public boolean isSkyVisible(BlockPos pos) {

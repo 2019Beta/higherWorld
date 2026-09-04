@@ -97,6 +97,16 @@ public final class CubeStorage implements Closeable {
         }
     }
 
+    /** Runs bounded append-log compaction for one region on the IO worker. */
+    void compactIfNeeded(RegionPos pos) throws IOException {
+        RegionHandle handle = acquire(pos, true);
+        try {
+            handle.file.compactIfNeeded();
+        } finally {
+            release(handle);
+        }
+    }
+
     public int openRegionCount() {
         synchronized (regionCacheLock) {
             return regions.size();

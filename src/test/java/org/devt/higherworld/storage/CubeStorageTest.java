@@ -108,4 +108,27 @@ class CubeStorageTest {
             assertTrue(result.get(second).isEmpty());
         }
     }
+
+    @Test
+    void compactsStaleAppendRecordsWithoutChangingTheLatestPayload() throws Exception {
+        CubePos position = new CubePos(2, -40, 3);
+        byte[] payload = new byte[100_000];
+        new java.util.Random(41L).nextBytes(payload);
+
+        try (CubeStorage storage = new CubeStorage(directory)) {
+            for (int version = 0; version < 128; version++) {
+                payload[0] = (byte) version;
+                storage.write(position, payload);
+            }
+            Path region = directory.resolve(position.region().fileName());
+            long before = Files.size(region);
+
+            storage.compactIfNeeded(position.region());
+
+            long after = Files.size(region);
+            assertTrue(before > 8L * 1024L * 1024L);
+            assertTrue(after < before);
+            assertArrayEquals(payload, storage.read(position).orElseThrow());
+        }
+    }
 }
