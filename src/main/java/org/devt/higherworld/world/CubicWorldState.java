@@ -224,14 +224,18 @@ final class CubicWorldState implements AutoCloseable {
         return new BlockChange(previous, changedLight, previous != state);
     }
 
-    /** Returns a cube that is safe for ordinary gameplay mutation without waiting. */
+    /** Returns a fully generated cube that is safe for ordinary gameplay mutation. */
     private LoadedCube loadedCubeForMutation(CubePos pos) {
         LoadedCube loaded = loadedCube(pos);
         if (loaded == null) return null;
         LoadContext context = loadContexts.get(pos);
         if (context != null && (context.committing || context.full)) return loaded;
         CubeHolder holder = taskScheduler.holder(pos);
-        return holder.status().isAtLeast(CubeStatus.FULL) ? loaded : null;
+        // Watchers deliberately stop at PAYLOAD so lighting and entity
+        // restoration do not block visible cube streaming. PAYLOAD already
+        // guarantees TERRAIN + FEATURES (including ores), so rejecting writes
+        // until FULL made every normally streamed deep cube read-only.
+        return holder.status().isAtLeast(CubeStatus.PAYLOAD) ? loaded : null;
     }
 
     /** Schedules a block tick in the sparse queue when the position is cubic. */
@@ -722,8 +726,18 @@ final class CubicWorldState implements AutoCloseable {
     /** Commits completed worker terrain during a bounded mid-tick slice. */
     void advanceReadyTasks(long budgetNanos) {
         long deadline = System.nanoTime() + Math.max(0L, budgetNanos);
-        for (CubeHolder holder : taskScheduler.readyForCommit(256)) {
-            if (System.nanoTime() >= deadline) break;
+        List<CubeHolder> ready = taskScheduler.readyForCommit(256);
+        for (int index = 0; index < ready.size(); index++) {
+            if (System.nanoTime() >= deadline) {
+                // readyForCommit removes the whole batch from its queue. Put
+                // the untouched tail back or these cubes can wait forever for
+                // a state change that will never occur.
+                for (int pending = index; pending < ready.size(); pending++) {
+                    taskScheduler.requeue(ready.get(pending));
+                }
+                break;
+            }
+            CubeHolder holder = ready.get(index);
             try {
                 boolean progressed = tryAdvance(holder, taskScheduler.priority(holder.pos()));
                 if (!progressed) taskScheduler.requeue(holder);
