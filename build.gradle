@@ -43,6 +43,19 @@ dependencies {
 
     modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
 
+    // OpenCL is optional at runtime.  The binding is bundled so enabling
+    // HigherWorld's GPU setting does not require a second mod; the OpenCL
+    // implementation itself still comes from the graphics/compute driver.
+    def lwjglVersion = "3.3.3"
+    include implementation(platform("org.lwjgl:lwjgl-bom:${lwjglVersion}"))
+    include implementation("org.lwjgl:lwjgl:${lwjglVersion}")
+    include implementation("org.lwjgl:lwjgl-opencl")
+    include runtimeOnly("org.lwjgl:lwjgl::natives-windows")
+    include runtimeOnly("org.lwjgl:lwjgl::natives-windows-arm64")
+    include runtimeOnly("org.lwjgl:lwjgl::natives-linux")
+    include runtimeOnly("org.lwjgl:lwjgl::natives-macos")
+    include runtimeOnly("org.lwjgl:lwjgl::natives-macos-arm64")
+
     testImplementation platform("org.junit:junit-bom:5.11.4")
     testImplementation "org.junit.jupiter:junit-jupiter"
 }
