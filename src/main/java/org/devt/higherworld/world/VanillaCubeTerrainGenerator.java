@@ -218,7 +218,7 @@ final class VanillaCubeTerrainGenerator {
                 template, shape, template.noiseRouter());
         NoiseChunkGenerator generator = new NoiseChunkGenerator(
                 biomeSource, RegistryEntry.of(settings));
-        InfiniteNoiseSettings.makeSparseGeneratorDry(generator);
+        InfiniteNoiseSettings.useUnboundedAquifers(generator);
         return generator;
     }
 

@@ -21,6 +21,12 @@ HigherWorld 是面向 Minecraft 1.21.11 / Fabric 的稀疏立方区块运行层�
   在 worker 上执行，Minecraft 状态按阶段在服务器线程的每 tick 预算内提交。
 - 原版 BlockPos 网络字段在超出 12 位 Y 时使用转义编码，因此客户端和服务端都必须安装本模组。
 - 原版 `.mca` 继续负责原版高度带内的数据与实体兼容；外部方块由 `.hwr` 文件负责。
+- 自定义世界的纯噪声采样支持可选 OpenCL GPU 加速；GPU 只计算不可变采样网格，
+  方块写入、洞穴、结构和光照仍沿用现有安全路径。首次启动会生成
+  `config/higherworld.properties`，将 `higherworld.gpu.enabled` 改为 `true` 并重启服务器即可启用；
+  没有兼容设备或内核失败时默认自动回退 CPU。可选项还包括
+  `higherworld.gpu.device_index`、`higherworld.gpu.allow_cpu_devices` 和
+  `higherworld.gpu.fallback_on_error`。
 
 cube 文件位于：
 

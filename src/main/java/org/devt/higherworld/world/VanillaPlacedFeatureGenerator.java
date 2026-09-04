@@ -53,6 +53,10 @@ final class VanillaPlacedFeatureGenerator {
     private static final int VANILLA_BOTTOM_Y = -64;
     private static final int VANILLA_HEIGHT = 384;
     private static final int REPEATED_BAND_HEIGHT = 64;
+    /** Large dripstone searches up to 30 blocks across a band boundary. */
+    private static final int FEATURE_VERTICAL_HALO = 32;
+    private static final int FEATURE_SOURCE_BAND_RADIUS = 1;
+    private static final int FEATURE_TERRAIN_BAND_RADIUS = 2;
     private static final int FEATURE_ORIGIN_RADIUS = 1;
     private static final List<GenerationStep.Feature> SAFE_UNDERGROUND_STEPS = List.of(
             GenerationStep.Feature.RAW_GENERATION,
@@ -81,27 +85,57 @@ final class VanillaPlacedFeatureGenerator {
         CACHES.remove(world);
     }
 
+    private static int sectionsPerBand() {
+        return REPEATED_BAND_HEIGHT / CubePos.SIZE;
+    }
+
+    private static long depthIndex(ServerWorld world, CubePos pos) {
+        return (long) world.getBottomSectionCoord() - 1L - pos.y();
+    }
+
+    private static long repeatedBand(ServerWorld world, CubePos pos) {
+        return Math.floorDiv(depthIndex(world, pos), sectionsPerBand());
+    }
+
+    private static int highestSection(
+            ServerWorld world, long repeatedBand, int sectionsPerBand) {
+        long section = (long) world.getBottomSectionCoord() - 1L
+                - repeatedBand * sectionsPerBand;
+        return Math.toIntExact(section);
+    }
+
+    private static int bandOffsetY(
+            ServerWorld world, long repeatedBand, int sectionsPerBand) {
+        int highestSection = highestSection(world, repeatedBand, sectionsPerBand);
+        int lowestSection = highestSection - sectionsPerBand + 1;
+        return lowestSection * CubePos.SIZE - VANILLA_BOTTOM_Y;
+    }
+
     /**
-     * Returns the terrain-only read set needed before a 64-high feature batch
-     * can run.  This is intentionally separate from the FEATURES dependency
-     * radius: the lifecycle still exposes the normal 3 x 3 x 3 feature halo,
-     * while the batched implementation additionally needs all four vertical
-     * slices that it reads as one immutable band.
+     * Returns the terrain-only read set needed before a feature batch and its
+     * vertical spill halo can run. This is intentionally separate from the
+     * FEATURES dependency radius: batches read neighbouring source bands but
+     * only mutate the cube whose FEATURES stage is being committed.
      */
     static List<CubePos> terrainBatchPositions(ServerWorld world, CubePos pos) {
-        int depthIndex = world.getBottomSectionCoord() - 1 - pos.y();
-        int sectionsPerBand = REPEATED_BAND_HEIGHT / CubePos.SIZE;
-        int repeatedBand = Math.floorDiv(depthIndex, sectionsPerBand);
-        int highestSection = world.getBottomSectionCoord() - 1
-                - repeatedBand * sectionsPerBand;
-        int lowestSection = highestSection - sectionsPerBand + 1;
-        List<CubePos> result = new ArrayList<>(36);
-        for (int sectionY = lowestSection; sectionY <= highestSection; sectionY++) {
-            for (int chunkZ = pos.z() - FEATURE_ORIGIN_RADIUS;
-                    chunkZ <= pos.z() + FEATURE_ORIGIN_RADIUS; chunkZ++) {
-                for (int chunkX = pos.x() - FEATURE_ORIGIN_RADIUS;
-                        chunkX <= pos.x() + FEATURE_ORIGIN_RADIUS; chunkX++) {
-                    result.add(new CubePos(chunkX, sectionY, chunkZ));
+        long repeatedBand = repeatedBand(world, pos);
+        int sectionsPerBand = sectionsPerBand();
+        List<CubePos> result = new ArrayList<>(180);
+        for (long sourceBand = repeatedBand - FEATURE_TERRAIN_BAND_RADIUS;
+                sourceBand <= repeatedBand + FEATURE_TERRAIN_BAND_RADIUS; sourceBand++) {
+            int highestSection = highestSection(world, sourceBand, sectionsPerBand);
+            int lowestSection = highestSection - sectionsPerBand + 1;
+            for (int sectionY = lowestSection; sectionY <= highestSection; sectionY++) {
+                // The vanilla band is already owned by Minecraft's normal
+                // chunk pipeline.  It is still a valid feature source, but it
+                // must not be requested as a sparse terrain dependency.
+                if (sectionY >= world.getBottomSectionCoord()) continue;
+                for (int chunkZ = pos.z() - FEATURE_ORIGIN_RADIUS;
+                        chunkZ <= pos.z() + FEATURE_ORIGIN_RADIUS; chunkZ++) {
+                    for (int chunkX = pos.x() - FEATURE_ORIGIN_RADIUS;
+                            chunkX <= pos.x() + FEATURE_ORIGIN_RADIUS; chunkX++) {
+                        result.add(new CubePos(chunkX, sectionY, chunkZ));
+                    }
                 }
             }
         }
@@ -170,6 +204,10 @@ final class VanillaPlacedFeatureGenerator {
                     ? written : world.getBlockState(translate(virtualPos, offsetY));
         }
 
+        private boolean acceptsY(int y) {
+            return y >= virtualBand.getMinY() && y <= virtualBand.getMaxY();
+        }
+
         private void write(BlockPos virtualPos, BlockState state) {
             writes.put(virtualPos.toImmutable(), state);
         }
@@ -189,6 +227,40 @@ final class VanillaPlacedFeatureGenerator {
                 }
             });
             return new FeatureBatchSnapshot(result, entities);
+        }
+    }
+
+    /**
+     * OreFeature writes straight into the section returned by
+     * ChunkSectionCache, bypassing StructureWorldAccess#setBlockState. Keep
+     * that scratch section connected to the batch write set so those writes
+     * survive until the target cube is committed.
+     */
+    private static final class TrackingChunkSection extends net.minecraft.world.chunk.ChunkSection {
+        private final FeatureBatchWriter writer;
+        private final int baseX;
+        private final int baseY;
+        private final int baseZ;
+
+        private TrackingChunkSection(
+                net.minecraft.world.chunk.ChunkSection source,
+                FeatureBatchWriter writer, int baseX, int baseY, int baseZ) {
+            super(source.getBlockStateContainer(), source.getBiomeContainer());
+            this.writer = writer;
+            this.baseX = baseX;
+            this.baseY = baseY;
+            this.baseZ = baseZ;
+        }
+
+        @Override
+        public BlockState setBlockState(
+                int localX, int localY, int localZ, BlockState state, boolean lock) {
+            BlockState previous = super.setBlockState(localX, localY, localZ, state, lock);
+            if (!previous.equals(state)) {
+                writer.write(new BlockPos(
+                        baseX + localX, baseY + localY, baseZ + localZ), state);
+            }
+            return previous;
         }
     }
 
@@ -243,10 +315,10 @@ final class VanillaPlacedFeatureGenerator {
             generateBatched(world, cube, steps);
             return;
         }
-        int depthIndex = world.getBottomSectionCoord() - 1 - cube.pos().y();
-        int sectionsPerBand = REPEATED_BAND_HEIGHT / CubePos.SIZE;
+        long depthIndex = depthIndex(world, cube.pos());
+        int sectionsPerBand = sectionsPerBand();
         int virtualSectionIndex = sectionsPerBand - 1
-                - Math.floorMod(depthIndex, sectionsPerBand);
+                - (int) Math.floorMod(depthIndex, sectionsPerBand);
         int virtualMinY = VANILLA_BOTTOM_Y
                 + virtualSectionIndex * CubePos.SIZE;
         int offsetY = cube.pos().minBlockY() - virtualMinY;
@@ -293,38 +365,41 @@ final class VanillaPlacedFeatureGenerator {
     }
 
     /**
-     * Executes each source-chunk feature origin once for the whole repeated
-     * 64-high band. The worker-like result is an immutable list of virtual
-     * writes; the server thread clips and applies only the current 16-high
-     * cube slice. Structure starts are intentionally not part of this cache.
+     * Executes each source-chunk feature origin once for a repeated band plus
+     * the neighbouring source bands. The immutable result is translated and
+     * clipped only when applied to the current cube. Structure starts are
+     * intentionally not part of this cache.
      */
     private static void generateBatched(
             ServerWorld world, LoadedCube cube, List<GenerationStep.Feature> steps) {
-        int depthIndex = world.getBottomSectionCoord() - 1 - cube.pos().y();
-        int sectionsPerBand = REPEATED_BAND_HEIGHT / CubePos.SIZE;
-        int virtualSectionIndex = sectionsPerBand - 1
-                - Math.floorMod(depthIndex, sectionsPerBand);
-        int virtualMinY = VANILLA_BOTTOM_Y + virtualSectionIndex * CubePos.SIZE;
-        int offsetY = cube.pos().minBlockY() - virtualMinY;
-        long repeatedBand = Math.floorDiv(depthIndex, sectionsPerBand);
+        long repeatedBand = repeatedBand(world, cube.pos());
+        int sectionsPerBand = sectionsPerBand();
         ChunkGenerator generator = world.getChunkManager().getChunkGenerator();
         Registry<PlacedFeature> registry = world.getRegistryManager()
                 .getOrThrow(RegistryKeys.PLACED_FEATURE);
-        long bandSeed = world.getSeed() ^ repeatedBand * 0xD1B54A32D192ED03L;
         int stepsMask = stepsMask(steps);
         FeatureCache cache = CACHES.computeIfAbsent(world, ignored -> new FeatureCache());
 
-        // All four physical cubes in a repeated band share this offset.  Each
-        // source origin is therefore safe to cache by (x,z,repeatedBand).
-        for (int chunkZ = cube.pos().z() - FEATURE_ORIGIN_RADIUS;
-                chunkZ <= cube.pos().z() + FEATURE_ORIGIN_RADIUS; chunkZ++) {
-            for (int chunkX = cube.pos().x() - FEATURE_ORIGIN_RADIUS;
-                    chunkX <= cube.pos().x() + FEATURE_ORIGIN_RADIUS; chunkX++) {
-                FeatureBatchKey key = new FeatureBatchKey(
-                        chunkX, chunkZ, repeatedBand, stepsMask);
-                FeatureBatchSnapshot batch = cache.batch(key, () -> generateBatch(
-                        world, generator, registry, cache, key, steps, bandSeed, offsetY));
-                applyBatch(world, cube, batch, virtualMinY, offsetY);
+        // A placed feature may cross a 64-block repeat boundary.  Replay the
+        // adjacent source bands as read-only batches and apply only the blocks
+        // whose translated coordinates belong to this cube.  This is what
+        // keeps a dripstone column (or an ore vein) from being sliced at the
+        // old vanilla floor.
+        for (long sourceBand = repeatedBand - FEATURE_SOURCE_BAND_RADIUS;
+                sourceBand <= repeatedBand + FEATURE_SOURCE_BAND_RADIUS; sourceBand++) {
+            long bandSeed = world.getSeed() ^ sourceBand * 0xD1B54A32D192ED03L;
+            int sourceOffsetY = bandOffsetY(world, sourceBand, sectionsPerBand);
+            for (int chunkZ = cube.pos().z() - FEATURE_ORIGIN_RADIUS;
+                    chunkZ <= cube.pos().z() + FEATURE_ORIGIN_RADIUS; chunkZ++) {
+                for (int chunkX = cube.pos().x() - FEATURE_ORIGIN_RADIUS;
+                        chunkX <= cube.pos().x() + FEATURE_ORIGIN_RADIUS; chunkX++) {
+                    FeatureBatchKey key = new FeatureBatchKey(
+                            chunkX, chunkZ, sourceBand, stepsMask);
+                    FeatureBatchSnapshot batch = cache.batch(key, () -> generateBatch(
+                            world, generator, registry, cache, key, steps,
+                            bandSeed, sourceOffsetY));
+                    applyBatch(world, cube, batch, sourceOffsetY);
+                }
             }
         }
     }
@@ -334,10 +409,12 @@ final class VanillaPlacedFeatureGenerator {
             FeatureCache cache, FeatureBatchKey key, List<GenerationStep.Feature> steps,
             long bandSeed, int offsetY) {
         FeatureBatchWriter writer = new FeatureBatchWriter(
-                new BlockBox(key.chunkX() * CubePos.SIZE, VANILLA_BOTTOM_Y,
+                new BlockBox(key.chunkX() * CubePos.SIZE,
+                        VANILLA_BOTTOM_Y - FEATURE_VERTICAL_HALO,
                         key.chunkZ() * CubePos.SIZE,
                         key.chunkX() * CubePos.SIZE + CubePos.SIZE - 1,
-                        VANILLA_BOTTOM_Y + REPEATED_BAND_HEIGHT - 1,
+                        VANILLA_BOTTOM_Y + REPEATED_BAND_HEIGHT
+                                + FEATURE_VERTICAL_HALO - 1,
                         key.chunkZ() * CubePos.SIZE + CubePos.SIZE - 1),
                 offsetY);
         StructureWorldAccess access = translatedAccess(
@@ -365,7 +442,7 @@ final class VanillaPlacedFeatureGenerator {
 
     private static void applyBatch(
             ServerWorld world, LoadedCube cube, FeatureBatchSnapshot batch,
-            int virtualMinY, int offsetY) {
+            int offsetY) {
         int minX = cube.pos().minBlockX();
         int minY = cube.pos().minBlockY();
         int minZ = cube.pos().minBlockZ();
@@ -374,9 +451,6 @@ final class VanillaPlacedFeatureGenerator {
         int maxZ = minZ + CubePos.SIZE - 1;
         for (FeatureWrite write : batch.writes()) {
             BlockPos virtual = write.pos();
-            if (virtual.getY() < virtualMinY || virtual.getY() >= virtualMinY + CubePos.SIZE) {
-                continue;
-            }
             BlockPos actual = translate(virtual, offsetY);
             if (actual.getX() < minX || actual.getX() > maxX
                     || actual.getY() < minY || actual.getY() > maxY
@@ -401,9 +475,6 @@ final class VanillaPlacedFeatureGenerator {
         }
         for (FeatureBlockEntity featureBlockEntity : batch.blockEntities()) {
             BlockPos virtual = featureBlockEntity.pos();
-            if (virtual.getY() < virtualMinY || virtual.getY() >= virtualMinY + CubePos.SIZE) {
-                continue;
-            }
             BlockPos actual = translate(virtual, offsetY);
             if (actual.getX() < minX || actual.getX() > maxX
                     || actual.getY() < minY || actual.getY() > maxY
@@ -572,6 +643,25 @@ final class VanillaPlacedFeatureGenerator {
                             boundaryMode, clippedBlockStates, batchWriter, pos.getX(), pos.getZ()),
                     pos.getZ());
         }
+        if (batchWriter != null && "getSectionIndex".equals(name)
+                && arguments != null && arguments.length == 1
+                && arguments[0] instanceof Integer y) {
+            // OreFeature reaches ChunkSection directly through
+            // ChunkSectionCache.  Map that lookup into the temporary
+            // [virtualMinY, virtualMaxY] section array instead of letting the
+            // real world's -64-based section index discard deep positions.
+            return Math.floorDiv(y - batchWriter.virtualBand.getMinY(), CubePos.SIZE);
+        }
+        if (batchWriter != null && "getBottomSectionCoord".equals(name)) {
+            return Math.floorDiv(batchWriter.virtualBand.getMinY(), CubePos.SIZE);
+        }
+        if (batchWriter != null && "getTopSectionCoord".equals(name)) {
+            return Math.floorDiv(batchWriter.virtualBand.getMaxY() + 1, CubePos.SIZE);
+        }
+        if (batchWriter != null && "countVerticalSections".equals(name)) {
+            return (batchWriter.virtualBand.getMaxY()
+                    - batchWriter.virtualBand.getMinY() + 1) / CubePos.SIZE;
+        }
         BlockPos virtualPos = firstPos(arguments);
         if ("setBlockState".equals(name) && virtualPos != null
                 && arguments.length >= 2 && arguments[1] instanceof BlockState state) {
@@ -580,9 +670,16 @@ final class VanillaPlacedFeatureGenerator {
             }
             if (batchWriter != null) {
                 BlockPos stablePos = virtualPos.toImmutable();
+                if (!batchWriter.acceptsY(stablePos.getY())) {
+                    // A feature can scan farther than the bounded halo.  It
+                    // must not escape into an unbounded map, but returning
+                    // false still gives vanilla feature code its normal
+                    // "nothing was placed" result.
+                    return false;
+                }
                 BlockState previous = batchWriter.read(world, stablePos);
                 batchWriter.write(stablePos, state);
-                updateFeatureChunk(featureChunks, stablePos, state);
+                updateFeatureChunk(featureChunks, stablePos, state, batchWriter);
                 if (state.hasBlockEntity() && state.getBlock() instanceof BlockEntityProvider provider) {
                     BlockEntity blockEntity = provider.createBlockEntity(stablePos, state);
                     if (blockEntity != null) batchWriter.blockEntities.put(stablePos, blockEntity);
@@ -722,10 +819,12 @@ final class VanillaPlacedFeatureGenerator {
         if (("removeBlock".equals(name) || "breakBlock".equals(name)) && virtualPos != null) {
             if (batchWriter != null) {
                 BlockPos stablePos = virtualPos.toImmutable();
+                if (!batchWriter.acceptsY(stablePos.getY())) return false;
                 BlockState previous = batchWriter.read(world, stablePos);
                 batchWriter.write(stablePos, Blocks.AIR.getDefaultState());
                 batchWriter.blockEntities.remove(stablePos);
-                updateFeatureChunk(featureChunks, stablePos, Blocks.AIR.getDefaultState());
+                updateFeatureChunk(
+                        featureChunks, stablePos, Blocks.AIR.getDefaultState(), batchWriter);
                 return !previous.isAir();
             }
             if (!virtualCube.contains(virtualPos)) {
@@ -755,10 +854,13 @@ final class VanillaPlacedFeatureGenerator {
         }
         if (("isValidForSetBlock".equals(name) || "isInBuildLimit".equals(name)
                 || "isInLoadLimit".equals(name)) && virtualPos != null) {
-            // The feature may be centred in an adjacent 16-block section while
-            // still intersecting this target cube. Limit only by the virtual
-            // world's height; setBlockState remains clipped to the target cube.
-            return isInVanillaHeight(virtualPos);
+            // The proxy has a finite virtual height for placement modifiers,
+            // but a translated batch also has a vertical halo.  Using the
+            // vanilla height here was the actual -64 cut: OreFeature and
+            // dripstone refuse to write the portion below that coordinate.
+            return batchWriter != null
+                    ? batchWriter.acceptsY(virtualPos.getY())
+                    : isInVanillaHeight(virtualPos);
         }
         if ("markBlockForPostProcessing".equals(name) || "markForPostProcessing".equals(name)) {
             // ProtoChunk post-processing lists do not exist for sparse cubes.
@@ -767,13 +869,19 @@ final class VanillaPlacedFeatureGenerator {
             return null;
         }
         if ("getBottomY".equals(name)) {
-            return VANILLA_BOTTOM_Y;
+            return batchWriter != null
+                    ? batchWriter.virtualBand.getMinY() : VANILLA_BOTTOM_Y;
         }
         if ("getHeight".equals(name)) {
-            return VANILLA_HEIGHT;
+            return batchWriter != null
+                    ? batchWriter.virtualBand.getMaxY()
+                            - batchWriter.virtualBand.getMinY() + 1
+                    : VANILLA_HEIGHT;
         }
         if ("getTopYInclusive".equals(name)) {
-            return VANILLA_BOTTOM_Y + VANILLA_HEIGHT - 1;
+            return batchWriter != null
+                    ? batchWriter.virtualBand.getMaxY()
+                    : VANILLA_BOTTOM_Y + VANILLA_HEIGHT - 1;
         }
         if ("getBottomSectionCoord".equals(name)) {
             return Math.floorDiv(VANILLA_BOTTOM_Y, CubePos.SIZE);
@@ -786,11 +894,15 @@ final class VanillaPlacedFeatureGenerator {
         }
         if ("isInHeightLimit".equals(name) && arguments != null && arguments.length == 1) {
             int y = arguments[0] instanceof BlockPos pos ? pos.getY() : (int) arguments[0];
-            return y >= VANILLA_BOTTOM_Y && y < VANILLA_BOTTOM_Y + VANILLA_HEIGHT;
+            return batchWriter != null
+                    ? batchWriter.acceptsY(y)
+                    : isInVanillaHeight(y);
         }
         if ("isOutOfHeightLimit".equals(name) && arguments != null && arguments.length == 1) {
             int y = arguments[0] instanceof BlockPos pos ? pos.getY() : (int) arguments[0];
-            return y < VANILLA_BOTTOM_Y || y >= VANILLA_BOTTOM_Y + VANILLA_HEIGHT;
+            return batchWriter != null
+                    ? !batchWriter.acceptsY(y)
+                    : !isInVanillaHeight(y);
         }
         if (("scheduleBlockTick".equals(name) || "scheduleFluidTick".equals(name)
                 || "scheduleTick".equals(name)) && virtualPos != null) {
@@ -831,19 +943,25 @@ final class VanillaPlacedFeatureGenerator {
             Map<BlockPos, BlockState> clippedBlockStates,
             FeatureBatchWriter batchWriter,
             int chunkX, int chunkZ) {
-        HeightLimitView height = HeightLimitView.create(VANILLA_BOTTOM_Y, VANILLA_HEIGHT);
+        HeightLimitView height = batchWriter == null
+                ? HeightLimitView.create(VANILLA_BOTTOM_Y, VANILLA_HEIGHT)
+                : HeightLimitView.create(
+                        batchWriter.virtualBand.getMinY(),
+                        batchWriter.virtualBand.getMaxY()
+                                - batchWriter.virtualBand.getMinY() + 1);
         ProtoChunk chunk = new ProtoChunk(
                 new ChunkPos(chunkX, chunkZ), UpgradeData.NO_UPGRADE_DATA,
                 height, world.getPalettesFactory(), null);
         if (batchWriter != null) {
-            int firstSection = Math.floorDiv(batchWriter.virtualBand.getMinY() - VANILLA_BOTTOM_Y,
-                    CubePos.SIZE);
-            int lastSection = Math.floorDiv(batchWriter.virtualBand.getMaxY() - VANILLA_BOTTOM_Y,
-                    CubePos.SIZE);
+            // Give OreFeature a real section for every coordinate in the
+            // virtual halo.  The old fixed vanilla-height ProtoChunk returned
+            // null for y < -64 and silently dropped the ore vein.
+            int firstSection = 0;
+            int lastSection = chunk.getSectionArray().length - 1;
             BlockPos.Mutable mutable = new BlockPos.Mutable();
             for (int sectionIndex = firstSection; sectionIndex <= lastSection; sectionIndex++) {
                 net.minecraft.world.chunk.ChunkSection section = chunk.getSectionArray()[sectionIndex];
-                int sectionMinY = VANILLA_BOTTOM_Y + sectionIndex * CubePos.SIZE;
+                int sectionMinY = height.getBottomY() + sectionIndex * CubePos.SIZE;
                 for (int localY = 0; localY < CubePos.SIZE; localY++) {
                     for (int localZ = 0; localZ < CubePos.SIZE; localZ++) {
                         for (int localX = 0; localX < CubePos.SIZE; localX++) {
@@ -854,6 +972,9 @@ final class VanillaPlacedFeatureGenerator {
                         }
                     }
                 }
+                chunk.getSectionArray()[sectionIndex] = new TrackingChunkSection(
+                        section, batchWriter,
+                        chunkX * CubePos.SIZE, sectionMinY, chunkZ * CubePos.SIZE);
             }
         } else if (chunkX == cube.pos().x() && chunkZ == cube.pos().z()) {
             int sectionIndex = Math.floorDiv(virtualMinY - VANILLA_BOTTOM_Y, CubePos.SIZE);
@@ -879,17 +1000,35 @@ final class VanillaPlacedFeatureGenerator {
 
     private static void updateFeatureChunk(
             Map<Long, Chunk> featureChunks, BlockPos pos, BlockState state) {
+        updateFeatureChunk(featureChunks, pos, state, null);
+    }
+
+    private static void updateFeatureChunk(
+            Map<Long, Chunk> featureChunks, BlockPos pos, BlockState state,
+            FeatureBatchWriter batchWriter) {
         int chunkX = Math.floorDiv(pos.getX(), CubePos.SIZE);
         int chunkZ = Math.floorDiv(pos.getZ(), CubePos.SIZE);
         long key = ((long) chunkX << 32) ^ (chunkZ & 0xFFFFFFFFL);
         Chunk chunk = featureChunks.get(key);
-        if (chunk == null || !isInVanillaHeight(pos)) return;
-        int sectionIndex = Math.floorDiv(pos.getY() - VANILLA_BOTTOM_Y, CubePos.SIZE);
+        if (chunk == null) return;
+        int sectionIndex;
+        int localY;
+        if (batchWriter != null) {
+            if (!batchWriter.acceptsY(pos.getY())) return;
+            sectionIndex = Math.floorDiv(
+                    pos.getY() - batchWriter.virtualBand.getMinY(), CubePos.SIZE);
+            localY = Math.floorMod(
+                    pos.getY() - batchWriter.virtualBand.getMinY(), CubePos.SIZE);
+        } else {
+            if (!isInVanillaHeight(pos)) return;
+            sectionIndex = Math.floorDiv(pos.getY() - VANILLA_BOTTOM_Y, CubePos.SIZE);
+            localY = Math.floorMod(pos.getY() - VANILLA_BOTTOM_Y, CubePos.SIZE);
+        }
         if (sectionIndex < 0 || sectionIndex >= chunk.getSectionArray().length) return;
         chunk.getSectionArray()[sectionIndex].setBlockState(
                 Math.floorMod(pos.getX(), CubePos.SIZE),
-                Math.floorMod(pos.getY() - VANILLA_BOTTOM_Y, CubePos.SIZE),
-                Math.floorMod(pos.getZ(), CubePos.SIZE), state);
+                localY,
+                Math.floorMod(pos.getZ(), CubePos.SIZE), state, false);
     }
 
     private static BlockState featureBlockState(
@@ -935,7 +1074,11 @@ final class VanillaPlacedFeatureGenerator {
             FeatureBatchWriter batchWriter,
             int blockX, int blockZ) {
         BlockPos.Mutable mutable = new BlockPos.Mutable();
-        for (int y = virtualCube.getMaxY(); y >= virtualCube.getMinY(); y--) {
+        int minY = batchWriter == null
+                ? virtualCube.getMinY() : VANILLA_BOTTOM_Y;
+        int maxY = batchWriter == null
+                ? virtualCube.getMaxY() : VANILLA_BOTTOM_Y + REPEATED_BAND_HEIGHT - 1;
+        for (int y = maxY; y >= minY; y--) {
             mutable.set(blockX, y, blockZ);
             BlockState state = batchWriter == null
                     ? featureBlockState(world, cube, virtualCube, offsetY,
@@ -945,12 +1088,15 @@ final class VanillaPlacedFeatureGenerator {
                 return y + 1;
             }
         }
-        return virtualCube.getMinY();
+        return minY;
+    }
+
+    private static boolean isInVanillaHeight(int y) {
+        return y >= VANILLA_BOTTOM_Y && y < VANILLA_BOTTOM_Y + VANILLA_HEIGHT;
     }
 
     private static boolean isInVanillaHeight(BlockPos pos) {
-        return pos.getY() >= VANILLA_BOTTOM_Y
-                && pos.getY() < VANILLA_BOTTOM_Y + VANILLA_HEIGHT;
+        return isInVanillaHeight(pos.getY());
     }
 
     private record FeatureCall(GenerationStep.Feature step, int index, PlacedFeature feature) {

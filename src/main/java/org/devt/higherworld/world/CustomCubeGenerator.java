@@ -4,6 +4,7 @@ import net.minecraft.block.Blocks;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.util.math.BlockPos;
 
+import org.devt.higherworld.gpu.GpuTerrainAccelerator;
 import org.devt.higherworld.storage.CubePos;
 
 /** Complete server-side generation pipeline for the CUSTOM_OVERWORLD preset. */
@@ -27,7 +28,7 @@ final class CustomCubeGenerator {
         finishGeneration(world, cube, settings, structureSettings, generateStructures);
     }
 
-    /** CPU-only phase. It is safe to run on a generation worker. */
+    /** Terrain preparation phase; it is safe to run on a generation worker. */
     static TerrainSnapshot prepareTerrain(long seed, CubePos pos, CustomWorldSettings settings) {
         int stepX = settings.noiseSampleSizeX();
         int stepY = settings.noiseSampleSizeY();
@@ -36,14 +37,16 @@ final class CustomCubeGenerator {
         int cellsY = CubePos.SIZE / stepY;
         int cellsZ = CubePos.SIZE / stepZ;
         double[] samples = new double[(cellsX + 1) * (cellsY + 1) * (cellsZ + 1)];
-        for (int gridY = 0; gridY <= cellsY; gridY++) {
-            for (int gridZ = 0; gridZ <= cellsZ; gridZ++) {
-                for (int gridX = 0; gridX <= cellsX; gridX++) {
-                    int x = pos.minBlockX() + gridX * stepX;
-                    int y = pos.minBlockY() + gridY * stepY;
-                    int z = pos.minBlockZ() + gridZ * stepZ;
-                    samples[index(gridX, gridY, gridZ, cellsX, cellsZ)] =
-                            terrainDensity(seed, settings, x, y, z);
+        if (!GpuTerrainAccelerator.trySample(seed, pos, settings, samples)) {
+            for (int gridY = 0; gridY <= cellsY; gridY++) {
+                for (int gridZ = 0; gridZ <= cellsZ; gridZ++) {
+                    for (int gridX = 0; gridX <= cellsX; gridX++) {
+                        int x = pos.minBlockX() + gridX * stepX;
+                        int y = pos.minBlockY() + gridY * stepY;
+                        int z = pos.minBlockZ() + gridZ * stepZ;
+                        samples[index(gridX, gridY, gridZ, cellsX, cellsZ)] =
+                                terrainDensity(seed, settings, x, y, z);
+                    }
                 }
             }
         }

@@ -9,6 +9,9 @@ import net.minecraft.registry.RegistryKeys;
 import net.minecraft.util.Identifier;
 import net.minecraft.world.dimension.DimensionType;
 import net.minecraft.world.gen.WorldPreset;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
+import org.devt.higherworld.gpu.GpuAccelerationConfig;
+import org.devt.higherworld.gpu.GpuTerrainAccelerator;
 import org.devt.higherworld.world.CubeBlockUpdatePayload;
 import org.devt.higherworld.world.CubeDataPayload;
 import org.devt.higherworld.world.CubeLightUpdatePayload;
@@ -30,6 +33,7 @@ public class Higherworld implements ModInitializer {
 
     @Override
     public void onInitialize() {
+        GpuAccelerationConfig.initialize();
         PayloadTypeRegistry.playS2C().register(CubeDataPayload.ID, CubeDataPayload.CODEC);
         PayloadTypeRegistry.playS2C().register(CubeLightUpdatePayload.ID, CubeLightUpdatePayload.CODEC);
         PayloadTypeRegistry.playS2C().register(CubeUnloadPayload.ID, CubeUnloadPayload.CODEC);
@@ -37,6 +41,8 @@ public class Higherworld implements ModInitializer {
 
         ServerWorldEvents.LOAD.register(CubicWorldManager::open);
         ServerWorldEvents.UNLOAD.register(CubicWorldManager::close);
+        ServerLifecycleEvents.SERVER_STARTING.register(server -> GpuTerrainAccelerator.start());
+        ServerLifecycleEvents.SERVER_STOPPING.register(server -> GpuTerrainAccelerator.stop());
         ServerTickEvents.START_WORLD_TICK.register(CubeWatchManager::midTick);
         ServerTickEvents.END_WORLD_TICK.register(CubeWatchManager::tick);
 
