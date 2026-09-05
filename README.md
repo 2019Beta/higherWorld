@@ -9,8 +9,8 @@ HigherWorld 是面向 Minecraft 1.21.11 / Fabric 的稀疏立方区块运行层�
 - cube 坐标使用三个 32 位整数，不把 Y 压回二维区块键，也不分配整根高度数组。
 - 每个 region 包含 `16 x 16 x 16` 个 cube 槽位。
 - region 是带 CRC32 校验的追加日志；进程在记录中途退出时，之前的数据仍可读取。
-- cube 记录保存 block/biome palette、生成器版本、方块实体 NBT 和稀疏光照；旧 HWC2/HWC3
-  记录可向后兼容读取并在加载时补算光照，
+- cube 记录保存 block/biome palette、生成器版本、方块实体 NBT 和稀疏光照；旧 HWC2-HWC5
+  记录可向后兼容读取，HWC6 还会记录光照是否已经完成，使可持久化的 PAYLOAD 在重载时仍会补算光照，
   脏 cube 会定期、离开视距及关服时保存。
 - 服务端按玩家位置维护三维 cube 视距，客户端接收加载、卸载和方块更新包。
 - 客户端渲染节数组改成以相机为中心的三维环，原版高度之外也能重建网格。
@@ -21,12 +21,14 @@ HigherWorld 是面向 Minecraft 1.21.11 / Fabric 的稀疏立方区块运行层�
   在 worker 上执行，Minecraft 状态按阶段在服务器线程的每 tick 预算内提交。
 - 原版 BlockPos 网络字段在超出 12 位 Y 时使用转义编码，因此客户端和服务端都必须安装本模组。
 - 原版 `.mca` 继续负责原版高度带内的数据与实体兼容；外部方块由 `.hwr` 文件负责。
-- 自定义世界的纯噪声采样支持可选 OpenCL GPU 加速；GPU 只计算不可变采样网格，
-  方块写入、洞穴、结构和光照仍沿用现有安全路径。首次启动会生成
+- 自定义世界的纯噪声采样支持可选 OpenCL GPU 加速；自定义噪声在 GPU 上完成采样和体素分类，
+  无限向下/非标准密度函数路径可复用 GPU 栅格体素化阶段。原版高度以下的完整 64 格批次会
+  复用密度采样并按 16 格 section 批量在 GPU 上栅格化；GPU 不可用时走同一套 CPU 稀疏栅格，
+  原版高度带仍保留原版精确生成。方块写入、洞穴、结构和光照仍沿用现有安全路径。首次启动会生成
   `config/higherworld.properties`，将 `higherworld.gpu.enabled` 改为 `true` 并重启服务器即可启用；
-  没有兼容设备或内核失败时默认自动回退 CPU。可选项还包括
-  `higherworld.gpu.device_index`、`higherworld.gpu.allow_cpu_devices` 和
-  `higherworld.gpu.fallback_on_error`。
+  没有兼容设备或内核失败时默认自动回退 CPU。可选项还包括 `higherworld.gpu.device_index`、
+  `higherworld.gpu.allow_cpu_devices` 和 `higherworld.gpu.fallback_on_error`。自定义稀疏 cube 会按最多
+  16 个请求批量提交，GPU 端按 X/Z 列缓存深度、基准高度和波动项，减少重复噪声采样和 JNI/队列往返。
 
 cube 文件位于：
 

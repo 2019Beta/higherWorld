@@ -24,6 +24,7 @@ public final class CubeRecordCodec {
     private static final int MAGIC_V3 = 0x48574333; // HWC3, includes generator version
     private static final int MAGIC_V4 = 0x48574334; // HWC4, includes sparse cube light
     private static final int MAGIC_V5 = 0x48574335; // HWC5, includes cube scheduled ticks
+    private static final int MAGIC_V6 = 0x48574336; // HWC6, records whether light is valid
     private static final int MAX_SECTION_BYTES = 2 * 1024 * 1024;
     private static final int MAX_BLOCK_ENTITIES = 4096;
     private static final int MAX_SCHEDULED_TICKS = 8192;
@@ -32,10 +33,20 @@ public final class CubeRecordCodec {
     }
 
     static byte[] encode(LoadedCube cube, World world) throws IOException {
+        return encode(cube, world, true);
+    }
+
+    /**
+     * Encodes a cube while explicitly recording whether its light snapshot is
+     * valid.  PAYLOAD cubes may be persisted before the deferred light pass;
+     * writing their dark working volume as valid light would make the next
+     * load skip the initial light solve permanently.
+     */
+    static byte[] encode(LoadedCube cube, World world, boolean includeLight) throws IOException {
         byte[] sectionPayload = ChunkSectionCodec.encode(cube.section());
         ByteArrayOutputStream bytes = new ByteArrayOutputStream(sectionPayload.length + 128);
         try (DataOutputStream output = new DataOutputStream(bytes)) {
-            output.writeInt(MAGIC_V5);
+            output.writeInt(MAGIC_V6);
             output.writeInt(cube.generationVersion());
             output.writeInt(sectionPayload.length);
             output.write(sectionPayload);
@@ -43,7 +54,8 @@ public final class CubeRecordCodec {
             for (BlockEntity blockEntity : cube.blockEntities()) {
                 NbtIo.writeCompound(blockEntity.createNbtWithIdentifyingData(world.getRegistryManager()), output);
             }
-            CubeLightData.write(output, cube.light().snapshot());
+            output.writeBoolean(includeLight);
+            CubeLightData.write(output, includeLight ? cube.light().snapshot() : CubeLightData.Snapshot.dark());
             CubeScheduledTickQueue queue = world instanceof net.minecraft.server.world.ServerWorld serverWorld
                     ? CubeScheduledTickQueue.forWorld(serverWorld) : null;
             List<CubeScheduledTick> ticks = queue == null ? List.of() : queue.snapshot(cube.pos());
@@ -60,14 +72,15 @@ public final class CubeRecordCodec {
 
     public static DecodedCube decode(byte[] payload, ChunkSection section, World world) throws IOException {
         int magic = payload.length < Integer.BYTES ? 0 : readMagic(payload);
-        if (magic != MAGIC_V2 && magic != MAGIC_V3 && magic != MAGIC_V4 && magic != MAGIC_V5) {
+        if (magic != MAGIC_V2 && magic != MAGIC_V3 && magic != MAGIC_V4
+                && magic != MAGIC_V5 && magic != MAGIC_V6) {
             ChunkSectionCodec.decodeInto(payload, section);
             return new DecodedCube(List.of(), CubeLightData.Snapshot.dark(), false, List.of(), false);
         }
 
         try (DataInputStream input = new DataInputStream(new ByteArrayInputStream(payload))) {
             input.readInt();
-            if (magic == MAGIC_V3 || magic == MAGIC_V4 || magic == MAGIC_V5) {
+            if (magic == MAGIC_V3 || magic == MAGIC_V4 || magic == MAGIC_V5 || magic == MAGIC_V6) {
                 input.readInt();
             }
             int sectionLength = input.readInt();
@@ -113,11 +126,18 @@ public final class CubeRecordCodec {
             }
             CubeLightData.Snapshot light = CubeLightData.Snapshot.dark();
             boolean hasLight = magic == MAGIC_V4 || magic == MAGIC_V5;
-            if (hasLight) {
+            if (magic == MAGIC_V6) {
+                boolean encodedLight = input.readBoolean();
+                CubeLightData.Snapshot encodedSnapshot = CubeLightData.read(input);
+                if (encodedLight) {
+                    hasLight = true;
+                    light = encodedSnapshot;
+                }
+            } else if (hasLight) {
                 light = CubeLightData.read(input);
             }
             List<CubeScheduledTick> scheduledTicks = List.of();
-            if (magic == MAGIC_V5) {
+            if (magic == MAGIC_V5 || magic == MAGIC_V6) {
                 int tickCount = input.readInt();
                 if (tickCount < 0 || tickCount > MAX_SCHEDULED_TICKS) {
                     throw new IOException("Invalid scheduled tick count: " + tickCount);
@@ -140,7 +160,7 @@ public final class CubeRecordCodec {
     static int generationVersion(byte[] payload) {
         int magic = payload.length < Integer.BYTES ? 0 : readMagic(payload);
         if (payload.length < Integer.BYTES * 2
-                || (magic != MAGIC_V3 && magic != MAGIC_V4 && magic != MAGIC_V5)) {
+                || (magic != MAGIC_V3 && magic != MAGIC_V4 && magic != MAGIC_V5 && magic != MAGIC_V6)) {
             return 0;
         }
         return (payload[4] & 0xFF) << 24 | (payload[5] & 0xFF) << 16

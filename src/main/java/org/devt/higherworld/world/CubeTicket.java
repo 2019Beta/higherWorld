@@ -28,4 +28,22 @@ public record CubeTicket(
                 new CubeDependencyRadius(horizontalRadius, verticalRadius, horizontalRadius),
                 CubeStatus.FULL, 0);
     }
+
+    /**
+     * The player's simulation demand must not reuse the streaming-view key.
+     * Streaming roots are retained separately at PAYLOAD, while this smaller
+     * ticket promotes only the server simulation distance to FULL.
+     */
+    public static CubeTicket playerSimulation(
+            Object owner, CubePos center, int horizontalRadius, int verticalRadius) {
+        return new CubeTicket(playerSimulationKey(owner), CubeTicketType.PLAYER, center,
+                new CubeDependencyRadius(horizontalRadius, verticalRadius, horizontalRadius),
+                CubeStatus.FULL, 0);
+    }
+
+    public static Object playerSimulationKey(Object owner) {
+        return new PlayerSimulationKey(owner);
+    }
+
+    private record PlayerSimulationKey(Object owner) {}
 }

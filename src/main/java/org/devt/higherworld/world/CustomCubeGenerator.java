@@ -1,5 +1,6 @@
 package org.devt.higherworld.world;
 
+import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.util.math.BlockPos;
@@ -17,6 +18,10 @@ final class CustomCubeGenerator {
     private static final long HIGH_SALT = 0x484947485F4E4FL;
     private static final long BASE_HEIGHT_SALT = 0x424153455F4844L;
     private static final long VOLATILITY_SALT = 0x564F4C4154494CL;
+    private static final BlockState AIR = Blocks.AIR.getDefaultState();
+    private static final BlockState DEEPSLATE = Blocks.DEEPSLATE.getDefaultState();
+    private static final ThreadLocal<CpuScratch> CPU_SCRATCH =
+            ThreadLocal.withInitial(CpuScratch::new);
 
     private CustomCubeGenerator() {
     }
@@ -30,49 +35,118 @@ final class CustomCubeGenerator {
 
     /** Terrain preparation phase; it is safe to run on a generation worker. */
     static TerrainSnapshot prepareTerrain(long seed, CubePos pos, CustomWorldSettings settings) {
+        boolean[] solid = new boolean[TerrainInterpolation.VOXEL_COUNT];
+        if (GpuTerrainAccelerator.trySampleAndRasterizeCustom(seed, pos, settings, solid)) {
+            return new TerrainSnapshot(solid);
+        }
+        fillCpuTerrain(seed, pos, settings, solid);
+        return new TerrainSnapshot(solid);
+    }
+
+    /** CPU-only path used when a GPU batch falls back after device probing. */
+    static TerrainSnapshot prepareTerrainCpu(long seed, CubePos pos, CustomWorldSettings settings) {
+        boolean[] solid = new boolean[TerrainInterpolation.VOXEL_COUNT];
+        fillCpuTerrain(seed, pos, settings, solid);
+        return new TerrainSnapshot(solid);
+    }
+
+    private static void fillCpuTerrain(
+            long seed, CubePos pos, CustomWorldSettings settings, boolean[] solid) {
         int stepX = settings.noiseSampleSizeX();
         int stepY = settings.noiseSampleSizeY();
         int stepZ = settings.noiseSampleSizeZ();
         int cellsX = CubePos.SIZE / stepX;
         int cellsY = CubePos.SIZE / stepY;
         int cellsZ = CubePos.SIZE / stepZ;
-        double[] samples = new double[(cellsX + 1) * (cellsY + 1) * (cellsZ + 1)];
-        if (!GpuTerrainAccelerator.trySample(seed, pos, settings, samples)) {
-            for (int gridY = 0; gridY <= cellsY; gridY++) {
-                for (int gridZ = 0; gridZ <= cellsZ; gridZ++) {
-                    for (int gridX = 0; gridX <= cellsX; gridX++) {
-                        int x = pos.minBlockX() + gridX * stepX;
-                        int y = pos.minBlockY() + gridY * stepY;
-                        int z = pos.minBlockZ() + gridZ * stepZ;
-                        samples[index(gridX, gridY, gridZ, cellsX, cellsZ)] =
-                                terrainDensity(seed, settings, x, y, z);
+        CpuScratch scratch = CPU_SCRATCH.get();
+        double[] samples = scratch.samples(
+                (cellsX + 1) * (cellsY + 1) * (cellsZ + 1));
+
+        // Base height, depth noise, and the unmodified volatility are all
+        // functions of X/Z only.  Computing them once per column removes the
+        // same expensive octave-gradient calls from every vertical sample.
+        int surfaceWidth = cellsX + 1;
+        int surfaceDepth = cellsZ + 1;
+        double[] surface = scratch.surface(surfaceWidth * surfaceDepth * 3);
+        double scaleBase = Math.pow(2.0, -Math.min(1022, Math.max(0, settings.biomeSize())));
+        double scaleRiver = Math.pow(2.0, -Math.min(1022, Math.max(0, settings.riverSize())));
+        for (int gridZ = 0; gridZ <= cellsZ; gridZ++) {
+            for (int gridX = 0; gridX <= cellsX; gridX++) {
+                int x = pos.minBlockX() + gridX * stepX;
+                int z = pos.minBlockZ() + gridZ * stepZ;
+                int surfaceIndex = (gridZ * surfaceWidth + gridX) * 3;
+                surface[surfaceIndex] = CustomNoise.depthNoise(
+                        seed ^ TERRAIN_SALT, x, z, settings);
+                surface[surfaceIndex + 1] = CustomNoise.baseHeight(
+                        seed ^ BASE_HEIGHT_SALT, x, z, scaleBase);
+                surface[surfaceIndex + 2] = CustomNoise.volatilityBase(
+                        seed ^ VOLATILITY_SALT, x, z, scaleRiver);
+            }
+        }
+
+        for (int gridY = 0; gridY <= cellsY; gridY++) {
+            for (int gridZ = 0; gridZ <= cellsZ; gridZ++) {
+                for (int gridX = 0; gridX <= cellsX; gridX++) {
+                    int x = pos.minBlockX() + gridX * stepX;
+                    int y = pos.minBlockY() + gridY * stepY;
+                    int z = pos.minBlockZ() + gridZ * stepZ;
+                    int surfaceIndex = (gridZ * surfaceWidth + gridX) * 3;
+                    double selector = CustomNoise.octaveGradient(
+                            seed ^ SELECTOR_SALT, x, y, z,
+                            settings.selectorNoiseFrequencyX(),
+                            settings.selectorNoiseFrequencyY(),
+                            settings.selectorNoiseFrequencyZ(),
+                            settings.selectorNoiseOctaves());
+                    selector = CustomNoise.clamp(
+                            selector * settings.selectorNoiseFactor()
+                                    + settings.selectorNoiseOffset(), 0.0, 1.0);
+                    double low = CustomNoise.octaveGradient(
+                            seed ^ LOW_SALT, x, y, z,
+                            settings.lowNoiseFrequencyX(), settings.lowNoiseFrequencyY(),
+                            settings.lowNoiseFrequencyZ(), settings.lowNoiseOctaves())
+                            * settings.lowNoiseFactor() + settings.lowNoiseOffset();
+                    double high = CustomNoise.octaveGradient(
+                            seed ^ HIGH_SALT, x, y, z,
+                            settings.highNoiseFrequencyX(), settings.highNoiseFrequencyY(),
+                            settings.highNoiseFrequencyZ(), settings.highNoiseOctaves())
+                            * settings.highNoiseFactor() + settings.highNoiseOffset();
+                    double terrainNoise = low + (high - low) * selector + surface[surfaceIndex];
+                    double height = surface[surfaceIndex + 1] * settings.heightFactor()
+                            + settings.heightOffset();
+                    double volatilityBase = surface[surfaceIndex + 2];
+                    if (height > y) {
+                        volatilityBase *= settings.specialHeightVariationFactorBelowAverageY();
                     }
+                    double volatility = volatilityBase * settings.heightVariationFactor()
+                            + settings.heightVariationOffset();
+                    samples[index(gridX, gridY, gridZ, cellsX, cellsZ)] =
+                            terrainNoise * volatility + height - y * Math.signum(volatility);
                 }
             }
         }
-        boolean[] solid = new boolean[CubePos.SIZE * CubePos.SIZE * CubePos.SIZE];
-        for (int localY = 0; localY < CubePos.SIZE; localY++) {
-            for (int localZ = 0; localZ < CubePos.SIZE; localZ++) {
-                for (int localX = 0; localX < CubePos.SIZE; localX++) {
-                    double density = interpolate(samples, localX, localY, localZ,
-                            stepX, stepY, stepZ, cellsX, cellsY, cellsZ);
-                    solid[blockIndex(localX, localY, localZ)] = density > 0.0;
-                }
-            }
-        }
-        return new TerrainSnapshot(solid);
+
+        TerrainInterpolation.fillSolid(
+                samples, stepX, stepY, stepZ, cellsX, cellsY, cellsZ, solid);
     }
 
     /** Main-thread commit of the immutable worker result. */
     static void applyTerrain(LoadedCube cube, TerrainSnapshot snapshot) {
-        boolean[] solid = snapshot.solid();
+        boolean[] solid = snapshot.rawSolid();
+        // Missing sparse cubes start as air.  Write only solid voxels in that
+        // common case; preserve the old clearing behavior if a caller applies
+        // a snapshot to a pre-populated section (for example during a repair).
+        boolean clearAir = !cube.section().isEmpty();
+
         for (int localY = 0; localY < CubePos.SIZE; localY++) {
             for (int localZ = 0; localZ < CubePos.SIZE; localZ++) {
                 for (int localX = 0; localX < CubePos.SIZE; localX++) {
-                    cube.setGeneratedBlockState(localX, localY, localZ,
-                            solid[blockIndex(localX, localY, localZ)]
-                                    ? Blocks.DEEPSLATE.getDefaultState()
-                                    : Blocks.AIR.getDefaultState());
+                    if (solid[blockIndex(localX, localY, localZ)]) {
+                        cube.setGeneratedBlockState(localX, localY, localZ,
+                                DEEPSLATE);
+                    } else if (clearAir) {
+                        cube.setGeneratedBlockState(localX, localY, localZ,
+                                AIR);
+                    }
                 }
             }
         }
@@ -188,6 +262,22 @@ final class CustomCubeGenerator {
         return first + (second - first) * amount;
     }
 
+    /** Reuses the tiny numeric grids on each generation worker. */
+    private static final class CpuScratch {
+        private double[] samples = new double[0];
+        private double[] surface = new double[0];
+
+        private double[] samples(int size) {
+            if (samples.length < size) samples = new double[size];
+            return samples;
+        }
+
+        private double[] surface(int size) {
+            if (surface.length < size) surface = new double[size];
+            return surface;
+        }
+    }
+
     record TerrainSnapshot(boolean[] solid) implements CubeTerrainSnapshot {
         TerrainSnapshot {
             if (solid.length != CubePos.SIZE * CubePos.SIZE * CubePos.SIZE) {
@@ -199,6 +289,11 @@ final class CustomCubeGenerator {
         @Override
         public boolean[] solid() {
             return solid.clone();
+        }
+
+        /** Avoids a second 4096-entry clone on the server-thread commit path. */
+        boolean[] rawSolid() {
+            return solid;
         }
 
         @Override

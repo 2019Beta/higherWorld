@@ -87,6 +87,25 @@ class CubeTaskSchedulerLifecycleTest {
     }
 
     @Test
+    void simulationTicketPromotesRootWithoutUpgradingItsRecursiveHalo() throws Exception {
+        CubePos center = new CubePos(12, -20, -7);
+        try (CubeStorage storage = new CubeStorage(directory);
+                CubeIoScheduler io = new CubeIoScheduler(storage);
+                CubeTaskScheduler scheduler = new CubeTaskScheduler(io)) {
+            scheduler.replaceTicket(CubeTicket.playerSimulation("player", center, 1, 0));
+
+            CubeHolder root = scheduler.request(center, CubeStatus.PAYLOAD, 0);
+
+            assertEquals(CubeStatus.FULL, root.target());
+            // The adjacent cube is reached as a LIGHT prerequisite.  It must
+            // stop at FEATURES; upgrading it to FULL would recursively build
+            // the whole lighting graph for every streaming root in range.
+            assertEquals(CubeStatus.FEATURES,
+                    scheduler.holder(new CubePos(center.x() + 1, center.y(), center.z())).target());
+        }
+    }
+
+    @Test
     void payloadFirstRequestDefersTheOuterLightingDependencyHalo() throws Exception {
         CubePos center = new CubePos(12, -20, -7);
         try (CubeStorage storage = new CubeStorage(directory);

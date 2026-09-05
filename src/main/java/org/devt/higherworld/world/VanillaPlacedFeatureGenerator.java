@@ -73,9 +73,14 @@ final class VanillaPlacedFeatureGenerator {
             GenerationStep.Feature.UNDERGROUND_DECORATION,
             GenerationStep.Feature.FLUID_SPRINGS,
             GenerationStep.Feature.VEGETAL_DECORATION);
-    private static final int MAX_FEATURE_BATCHES = 512;
-    private static final int MAX_FEATURE_PLANS = 1_024;
-    private static final int MAX_BIOME_QUERIES = 1_024;
+    // Feature batches are keyed by source chunk and repeated 64-high band.
+    // 512 entries covered less than one 33x33 horizontal view and made a
+    // vertical scan replay the same vanilla features continuously.  Keep a
+    // bounded LRU window large enough for the nearby source bands without
+    // allowing an unbounded deep-world cache.
+    private static final int MAX_FEATURE_BATCHES = 2_048;
+    private static final int MAX_FEATURE_PLANS = 4_096;
+    private static final int MAX_BIOME_QUERIES = 4_096;
     private static final Map<ServerWorld, FeatureCache> CACHES = new ConcurrentHashMap<>();
 
     private VanillaPlacedFeatureGenerator() {
@@ -144,11 +149,11 @@ final class VanillaPlacedFeatureGenerator {
 
     private static final class FeatureCache {
         private final LinkedHashMap<FeatureBatchKey, FeatureBatchSnapshot> batches =
-                new LinkedHashMap<>(32, 0.75f, true);
+                new LinkedHashMap<>(256, 0.75f, true);
         private final LinkedHashMap<FeaturePlanKey, List<FeatureCall>> plans =
-                new LinkedHashMap<>(64, 0.75f, true);
+                new LinkedHashMap<>(256, 0.75f, true);
         private final LinkedHashMap<BiomeQueryKey, List<RegistryEntry<Biome>>> biomes =
-                new LinkedHashMap<>(64, 0.75f, true);
+                new LinkedHashMap<>(256, 0.75f, true);
 
         private synchronized FeatureBatchSnapshot batch(
                 FeatureBatchKey key, Supplier<FeatureBatchSnapshot> factory) {
@@ -213,20 +218,28 @@ final class VanillaPlacedFeatureGenerator {
         }
 
         private FeatureBatchSnapshot snapshot(ServerWorld world) {
-            List<FeatureWrite> result = new ArrayList<>(writes.size());
-            writes.forEach((pos, state) -> result.add(new FeatureWrite(pos, state)));
-            List<FeatureBlockEntity> entities = new ArrayList<>(blockEntities.size());
+            Map<CubePos, List<FeatureWrite>> writesByCube = new HashMap<>();
+            writes.forEach((pos, state) -> {
+                FeatureWrite write = new FeatureWrite(pos, state);
+                writesByCube.computeIfAbsent(
+                        CubePos.fromBlock(pos.getX(), pos.getY(), pos.getZ()),
+                        ignored -> new ArrayList<>()).add(write);
+            });
+            Map<CubePos, List<FeatureBlockEntity>> entitiesByCube = new HashMap<>();
             blockEntities.forEach((pos, blockEntity) -> {
                 try {
-                    entities.add(new FeatureBlockEntity(
+                    FeatureBlockEntity entity = new FeatureBlockEntity(
                             pos, blockEntity.createNbtWithIdentifyingData(
-                                    world.getRegistryManager())));
+                                    world.getRegistryManager()));
+                    entitiesByCube.computeIfAbsent(
+                            CubePos.fromBlock(pos.getX(), pos.getY(), pos.getZ()),
+                            ignored -> new ArrayList<>()).add(entity);
                 } catch (RuntimeException ignored) {
                     // The state write is still valid; applyBatch will create
                     // the provider's default block entity as a safe fallback.
                 }
             });
-            return new FeatureBatchSnapshot(result, entities);
+            return new FeatureBatchSnapshot(writesByCube, entitiesByCube);
         }
     }
 
@@ -292,10 +305,26 @@ final class VanillaPlacedFeatureGenerator {
     }
 
     private record FeatureBatchSnapshot(
-            List<FeatureWrite> writes, List<FeatureBlockEntity> blockEntities) {
+            Map<CubePos, List<FeatureWrite>> writesByCube,
+            Map<CubePos, List<FeatureBlockEntity>> blockEntitiesByCube) {
         private FeatureBatchSnapshot {
-            writes = List.copyOf(writes);
-            blockEntities = List.copyOf(blockEntities);
+            writesByCube = freezePartitions(writesByCube);
+            blockEntitiesByCube = freezePartitions(blockEntitiesByCube);
+        }
+
+        private static <T> Map<CubePos, List<T>> freezePartitions(
+                Map<CubePos, List<T>> partitions) {
+            Map<CubePos, List<T>> frozen = new HashMap<>(partitions.size());
+            partitions.forEach((pos, values) -> frozen.put(pos, List.copyOf(values)));
+            return Map.copyOf(frozen);
+        }
+
+        private List<FeatureWrite> writesFor(CubePos virtualCube) {
+            return writesByCube.getOrDefault(virtualCube, List.of());
+        }
+
+        private List<FeatureBlockEntity> blockEntitiesFor(CubePos virtualCube) {
+            return blockEntitiesByCube.getOrDefault(virtualCube, List.of());
         }
     }
 
@@ -449,7 +478,11 @@ final class VanillaPlacedFeatureGenerator {
         int maxX = minX + CubePos.SIZE - 1;
         int maxY = minY + CubePos.SIZE - 1;
         int maxZ = minZ + CubePos.SIZE - 1;
-        for (FeatureWrite write : batch.writes()) {
+        CubePos virtualTarget = new CubePos(
+                cube.pos().x(),
+                Math.floorDiv(cube.pos().minBlockY() - offsetY, CubePos.SIZE),
+                cube.pos().z());
+        for (FeatureWrite write : batch.writesFor(virtualTarget)) {
             BlockPos virtual = write.pos();
             BlockPos actual = translate(virtual, offsetY);
             if (actual.getX() < minX || actual.getX() > maxX
@@ -473,7 +506,7 @@ final class VanillaPlacedFeatureGenerator {
                 }
             }
         }
-        for (FeatureBlockEntity featureBlockEntity : batch.blockEntities()) {
+        for (FeatureBlockEntity featureBlockEntity : batch.blockEntitiesFor(virtualTarget)) {
             BlockPos virtual = featureBlockEntity.pos();
             BlockPos actual = translate(virtual, offsetY);
             if (actual.getX() < minX || actual.getX() > maxX

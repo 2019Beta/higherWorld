@@ -1,4 +1,8 @@
 {
+  "debug.higherworld.terrain_generator": "地形生成：%s",
+  "debug.higherworld.terrain_generator.opencl": "OpenCL/GPU（%s）",
+  "debug.higherworld.terrain_generator.cpu": "CPU（%s）",
+  "debug.higherworld.terrain_generator.unknown": "未知（等待服务器状态）",
   "generator.higherworld.infinite_downward": "无限向下",
   "generator.higherworld.custom": "自定义世界",
   "screen.higherworld.custom.title": "自定义世界",

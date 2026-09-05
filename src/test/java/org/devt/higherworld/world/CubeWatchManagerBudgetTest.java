@@ -14,7 +14,7 @@ class CubeWatchManagerBudgetTest {
         budget.recordCommit(12_000_000L);
 
         assertEquals(6_000_000L, budget.debtNanos());
-        assertEquals(0, budget.cubeAllowance());
+        assertTrue(budget.cubeAllowance() > 0);
         assertEquals(0L, budget.claimCommitNanos());
         assertEquals(0L, budget.debtNanos());
         assertTrue(budget.claimCommitNanos() > 0L);
@@ -27,5 +27,14 @@ class CubeWatchManagerBudgetTest {
         budget.recordCommit(2_000_000_000L);
 
         assertEquals(300_000_000L, budget.debtNanos());
+    }
+
+    @Test
+    void readyPayloadSendingIsNotReducedToDebtTrickle() {
+        CubeWatchManager.AdaptiveBudget budget = new CubeWatchManager.AdaptiveBudget();
+
+        budget.recordCommit(12_000_000L);
+
+        assertTrue(budget.sendAllowance() > budget.cubeAllowance());
     }
 }

@@ -8,38 +8,31 @@ import org.devt.higherworld.world.CubeBlockUpdatePayload;
 import org.devt.higherworld.world.CubeDataPayload;
 import org.devt.higherworld.world.CubeLightUpdatePayload;
 import org.devt.higherworld.world.CubeUnloadPayload;
+import org.devt.higherworld.world.TerrainGeneratorStatusPayload;
 
 public class HigherworldClient implements ClientModInitializer {
 
     @Override
     public void onInitializeClient() {
-        ClientTickEvents.END_CLIENT_TICK.register(client -> ClientCubeCache.tickLighting());
-        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> client.execute(ClientCubeCache::clear));
+        ClientTickEvents.END_CLIENT_TICK.register(client -> ClientCubeCache.tick());
+        ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> client.execute(() -> {
+            ClientCubeCache.clear();
+            TerrainGeneratorDebugHud.clear();
+        }));
         ClientPlayNetworking.registerGlobalReceiver(CubeDataPayload.ID, (payload, context) -> {
-            // Custom payload receivers may run on the network thread.  Decode,
-            // publish light and invalidate render chunks on the client thread so
-            // the sparse cache has the same single-writer guarantee as the server.
-            context.client().execute(() -> {
-                if (context.client().world != null) {
-                    ClientCubeCache.put(context.client().world, payload.pos(), payload.revision(), payload.data());
-                }
-            });
+            // Custom payload receivers may run on the network thread.  Queue
+            // the immutable payload; the client-tick drain keeps one writer
+            // while allowing render invalidations to coalesce across packets.
+            ClientCubeCache.enqueueCubeData(
+                    context.client(), payload.pos(), payload.revision(), payload.data());
         });
         ClientPlayNetworking.registerGlobalReceiver(CubeLightUpdatePayload.ID, (payload, context) -> {
-            context.client().execute(() -> {
-                if (context.client().world != null) {
-                    ClientCubeCache.updateLight(
-                            context.client().world, payload.pos(), payload.revision(), payload.data());
-                }
-            });
+            ClientCubeCache.enqueueLight(
+                    context.client(), payload.pos(), payload.revision(), payload.data());
         });
         ClientPlayNetworking.registerGlobalReceiver(CubeUnloadPayload.ID, (payload, context) -> {
-            context.client().execute(() -> {
-                if (context.client().world != null) {
-                    ClientCubeCache.unload(
-                            context.client().world, payload.pos(), payload.revision());
-                }
-            });
+            ClientCubeCache.enqueueUnload(
+                    context.client(), payload.pos(), payload.revision());
         });
         ClientPlayNetworking.registerGlobalReceiver(CubeBlockUpdatePayload.ID, (payload, context) -> {
             context.client().execute(() -> {
@@ -56,5 +49,8 @@ public class HigherworldClient implements ClientModInitializer {
                 }
             });
         });
+        ClientPlayNetworking.registerGlobalReceiver(
+                TerrainGeneratorStatusPayload.ID, (payload, context) ->
+                        context.client().execute(() -> TerrainGeneratorDebugHud.update(payload)));
     }
 }
