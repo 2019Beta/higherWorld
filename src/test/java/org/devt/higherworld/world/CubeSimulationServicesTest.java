@@ -61,7 +61,7 @@ class CubeSimulationServicesTest {
     }
 
     @Test
-    void fullCubeScanRebuildsEntriesAndRetainsTicketOccupancy() {
+    void fullCubeScanRebuildsEntriesAndRetainsTicketOccupancy() throws Exception {
         CubePos cube = new CubePos(1, -2, 3);
         CubeSimulationServices services = new CubeSimulationServices(
                 directory.resolve("scan.bin"), alwaysFullAccess());
@@ -88,7 +88,7 @@ class CubeSimulationServicesTest {
     }
 
     @Test
-    void candidatesAndEntityTicketsHonorFullSimulationWindow() {
+    void candidatesAndEntityTicketsHonorFullSimulationWindow() throws Exception {
         CubePos cube = new CubePos(2, 1, -3);
         Map<CubePos, CubeStatus> statuses = new HashMap<>();
         statuses.put(cube, CubeStatus.FULL);
