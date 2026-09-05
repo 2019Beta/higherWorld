@@ -170,8 +170,8 @@ final class VanillaCubeTerrainGenerator {
     }
 
     /**
-     * Rasterizes independent deep-only vanilla batches in a small number of
-     * batched OpenCL launches.
+     * Rasterizes independent deep-only vanilla batches in one batched OpenCL
+     * launch for each 64-high density batch.
      * The density function is still sampled by Minecraft on the host because
      * arbitrary modded NoiseRouter graphs cannot safely be compiled here; the
      * expensive 16384-voxel interpolation/sign pass is shared with the GPU
@@ -227,31 +227,29 @@ final class VanillaCubeTerrainGenerator {
                 Arrays.fill(states[index], air);
             }
 
-            int sectionCellsY = CubePos.SIZE / firstGrid.stepY();
-            // The OpenCL raster kernel writes one 16^3 mask.  Keep the host
-            // density sampling at 64-high batch granularity, then feed its four
-            // section slices through one batch dispatch each.
-            for (int section = 0; section < SECTIONS_PER_BATCH; section++) {
-                double[][] sectionSamples = new double[grids.length][];
-                for (int index = 0; index < grids.length; index++) {
-                    sectionSamples[index] = sliceDensityGrid(grids[index], section, sectionCellsY);
-                }
-                boolean[][] solid = new boolean[grids.length][CubePos.SIZE * CubePos.SIZE * CubePos.SIZE];
-                boolean dispatched = GpuTerrainAccelerator.tryRasterizeDensityBatch(
-                        sectionSamples, firstGrid.stepX(), firstGrid.stepY(), firstGrid.stepZ(),
-                        firstGrid.cellsX(), sectionCellsY, firstGrid.cellsZ(),
-                        GpuTerrainAccelerator.InterpolationMode.LINEAR, solid);
-                if (!dispatched) return null;
-                for (int index = 0; index < solid.length; index++) {
-                    for (int voxel = 0; voxel < solid[index].length; voxel++) {
-                        if (solid[index][voxel]) {
-                            int localX = voxel & 15;
-                            int remainder = voxel >> 4;
-                            int localZ = remainder & 15;
-                            int localY = remainder >> 4;
-                            states[index][batchIndex(
-                                    localX, section * CubePos.SIZE + localY, localZ)] = defaultBlock;
-                        }
+            // Keep the complete 64-high density grid in one device buffer. The
+            // batch raster kernel derives its output height from cellsY*stepY,
+            // so this replaces four blocking write/kernel/readback roundtrips
+            // with one while preserving the section-local interpolation math.
+            double[][] batchSamples = new double[grids.length][];
+            for (int index = 0; index < grids.length; index++) {
+                batchSamples[index] = grids[index].samples();
+            }
+            boolean[][] solid = new boolean[
+                    grids.length][CubePos.SIZE * BATCH_HEIGHT * CubePos.SIZE];
+            boolean dispatched = GpuTerrainAccelerator.tryRasterizeDensityBatch(
+                    batchSamples, firstGrid.stepX(), firstGrid.stepY(), firstGrid.stepZ(),
+                    firstGrid.cellsX(), firstGrid.cellsY(), firstGrid.cellsZ(),
+                    GpuTerrainAccelerator.InterpolationMode.LINEAR, solid);
+            if (!dispatched) return null;
+            for (int index = 0; index < solid.length; index++) {
+                for (int voxel = 0; voxel < solid[index].length; voxel++) {
+                    if (solid[index][voxel]) {
+                        int localX = voxel & 15;
+                        int remainder = voxel >> 4;
+                        int localZ = remainder & 15;
+                        int localY = remainder >> 4;
+                        states[index][batchIndex(localX, localY, localZ)] = defaultBlock;
                     }
                 }
             }

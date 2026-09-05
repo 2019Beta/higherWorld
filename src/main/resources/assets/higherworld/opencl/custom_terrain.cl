@@ -313,9 +313,14 @@ __kernel void higherworld_rasterize_solid_batch(
         int interpolationMode,
         __global uchar *solid) {
     int index = (int)get_global_id(0);
-    int batch = index >> 12;
+    // The same kernel handles a normal 16-high custom cube and the 64-high
+    // vanilla batch.  Derive the output height from the density grid so the
+    // latter does not need four separate launches/readbacks.
+    int outputHeight = cellsY * stepY;
+    int voxelsPerBatch = 16 * outputHeight * 16;
+    int batch = index / voxelsPerBatch;
     if (batch >= batchCount) return;
-    int localIndex = index & 4095;
+    int localIndex = index - batch * voxelsPerBatch;
     int x = localIndex & 15;
     int remainder = localIndex >> 4;
     int z = remainder & 15;

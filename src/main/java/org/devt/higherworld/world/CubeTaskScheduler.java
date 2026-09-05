@@ -56,9 +56,13 @@ final class CubeTaskScheduler implements AutoCloseable {
     private final Map<CubePos, List<CubePos>> featureTerrainDependencies = new HashMap<>();
     /** Owners whose wider feature terrain read set has already become ready. */
     private final Set<CubePos> featureTerrainReady = new HashSet<>();
+    /** Counts feature terrain graph starts for the package-level regression hook. */
+    private long featureTerrainRequestCount;
     private final AtomicLong sequence = new AtomicLong();
     private final PriorityBlockingQueue<ReadyEntry> readyQueue =
             new PriorityBlockingQueue<>(256, CubeTaskScheduler::compareReadyEntries);
+    /** At most one live ready entry per holder; stale physical entries are skipped. */
+    private final ConcurrentMap<CubeHolder, ReadyEntry> queuedReady = new ConcurrentHashMap<>();
     private volatile long priorityEpoch;
 
     CubeTaskScheduler(CubeIoScheduler io) {
@@ -154,6 +158,7 @@ final class CubeTaskScheduler implements AutoCloseable {
         CubeHolder holder = holders.remove(pos);
         if (holder != null) {
             requestPriorities.remove(pos);
+            removeQueuedReady(holder);
             holder.cancel();
         }
     }
@@ -176,10 +181,28 @@ final class CubeTaskScheduler implements AutoCloseable {
     }
 
     private void holderChanged(CubeHolder holder) {
-        if (holder.target() == CubeStatus.EMPTY || holder.failed()) return;
-        readyQueue.offer(new ReadyEntry(
-                holder, holder.changeVersion(), priority(holder.pos()),
-                holder.status().ordinal(), priorityEpoch));
+        synchronized (holder) {
+            if (holder.target() == CubeStatus.EMPTY
+                    || holder.failed()
+                    || holder.status().isAtLeast(holder.target())) {
+                removeQueuedReady(holder);
+                return;
+            }
+            ReadyEntry entry = new ReadyEntry(
+                    holder, holder.changeVersion(), priority(holder.pos()),
+                    holder.status().ordinal(), priorityEpoch);
+            ReadyEntry previous = queuedReady.get(holder);
+            // Equal snapshots already have a physical queue entry. Check this
+            // before replacing the map value: replacing it with an equal but
+            // different record would make the old entry fail the identity
+            // check, while the new record would never be offered.
+            if (entry.equals(previous)) return;
+            // Keep replacement entries lazy. Removing from a global
+            // PriorityBlockingQueue is O(n); the poller discards superseded
+            // records by identity instead.
+            queuedReady.put(holder, entry);
+            readyQueue.offer(entry);
+        }
     }
 
     /** Requeues a holder whose next stage still needs a bounded commit slice. */
@@ -200,6 +223,16 @@ final class CubeTaskScheduler implements AutoCloseable {
     /** Package-private inspection hook used by lifecycle tests. */
     int holderCount() {
         return holders.size();
+    }
+
+    /** Package-private hook for verifying the feature dependency poll path. */
+    CubeHolder featureTerrainDependencyForTest(CubePos dependency, int priority) {
+        return featureTerrainDependency(dependency, priority);
+    }
+
+    /** Package-private hook for verifying graph requests stay one-shot. */
+    long featureTerrainRequestCountForTest() {
+        return featureTerrainRequestCount;
     }
 
     CubeHolder adoptLoaded(LoadedCube cube) {
@@ -277,8 +310,11 @@ final class CubeTaskScheduler implements AutoCloseable {
                 holder.pos(), ignored -> VanillaPlacedFeatureGenerator.terrainBatchPositions(
                         world, holder.pos()));
         for (CubePos dependency : dependencies) {
-            CubeHolder dependencyHolder = requestDependency(
-                    dependency, CubeStatus.TERRAIN, priority + 1);
+            // The first pass materializes this wider read set. Once a holder
+            // exists, polling only needs its lifecycle state; recursively
+            // rebuilding the same request graph on every blocked FEATURES
+            // commit accounted for a large share of server-thread samples.
+            CubeHolder dependencyHolder = featureTerrainDependency(dependency, priority + 1);
             if (dependencyHolder.failed()
                     || !dependencyHolder.status().isAtLeast(CubeStatus.TERRAIN)) {
                 ready = false;
@@ -286,6 +322,17 @@ final class CubeTaskScheduler implements AutoCloseable {
         }
         if (ready) featureTerrainReady.add(holder.pos());
         return ready;
+    }
+
+    private CubeHolder featureTerrainDependency(CubePos dependency, int priority) {
+        CubeHolder dependencyHolder = holders.get(dependency);
+        if (dependencyHolder == null
+                || (!dependencyHolder.failed()
+                        && dependencyHolder.target().ordinal() < CubeStatus.TERRAIN.ordinal())) {
+            featureTerrainRequestCount++;
+            dependencyHolder = requestDependency(dependency, CubeStatus.TERRAIN, priority);
+        }
+        return dependencyHolder;
     }
 
     void awaitNeighbourDependencies(CubeHolder holder, CubeStatus stage, int priority) {
@@ -414,6 +461,15 @@ final class CubeTaskScheduler implements AutoCloseable {
             ReadyEntry entry = readyQueue.poll();
             if (entry == null) break;
             CubeHolder holder = entry.holder();
+            // The queue is intentionally lazy: a state update can supersede an
+            // entry while its old object is still physically present. Only the
+            // entry that still owns the holder's map slot may inspect or
+            // requeue it. Identity is checked under the same lock used by
+            // holderChanged(), so an old entry cannot consume a new wake-up.
+            synchronized (holder) {
+                if (queuedReady.get(holder) != entry) continue;
+                queuedReady.remove(holder);
+            }
             if (entry.changeVersion() != holder.changeVersion()
                     || entry.priorityEpoch() != priorityEpoch
                     || entry.priority() != priority(holder.pos())
@@ -433,8 +489,17 @@ final class CubeTaskScheduler implements AutoCloseable {
             }
             if (selected.add(holder)) result.add(holder);
         }
-        blocked.forEach(readyQueue::offer);
+        // Requeue the current snapshot after the scan. State changes racing
+        // this loop may already have installed a newer entry, in which case
+        // the marker prevents a duplicate.
+        blocked.forEach(entry -> holderChanged(entry.holder()));
         return result;
+    }
+
+    private void removeQueuedReady(CubeHolder holder) {
+        synchronized (holder) {
+            queuedReady.remove(holder);
+        }
     }
 
     private boolean isReadyCandidate(CubeHolder holder) {
@@ -511,6 +576,7 @@ final class CubeTaskScheduler implements AutoCloseable {
             CubeStatus target = required.get(pos);
             if (target == null) {
                 requestPriorities.remove(pos);
+                removeQueuedReady(holder);
                 holder.cancel();
                 holders.remove(pos, holder);
             } else if (target.ordinal() < holder.target().ordinal()) {
@@ -577,7 +643,9 @@ final class CubeTaskScheduler implements AutoCloseable {
         prefetchPositions = Set.of();
         featureTerrainDependencies.clear();
         featureTerrainReady.clear();
+        featureTerrainRequestCount = 0L;
         readyQueue.clear();
+        queuedReady.clear();
     }
 
     private record ReadyEntry(

@@ -202,6 +202,65 @@ class CubeTaskSchedulerLifecycleTest {
     }
 
     @Test
+    void repeatedRequeueKeepsOneReadyEntryPerHolder() throws Exception {
+        CubePos pos = new CubePos(0, -20, 0);
+        try (CubeStorage storage = new CubeStorage(directory);
+                CubeIoScheduler io = new CubeIoScheduler(storage);
+                CubeTaskScheduler scheduler = new CubeTaskScheduler(io)) {
+            CubeHolder holder = scheduler.holder(pos);
+            holder.request(CubeStatus.TERRAIN);
+            holder.advance(CubeStatus.IO_READY);
+
+            for (int index = 0; index < 32; index++) scheduler.requeue(holder);
+
+            assertSame(holder, scheduler.readyForCommit(1).get(0));
+            assertTrue(scheduler.readyForCommit(32).isEmpty());
+        }
+    }
+
+    @Test
+    void cancellingAndRestartingAHolderSkipsItsOldReadySnapshots() throws Exception {
+        CubePos pos = new CubePos(2, -20, -3);
+        try (CubeStorage storage = new CubeStorage(directory);
+                CubeIoScheduler io = new CubeIoScheduler(storage);
+                CubeTaskScheduler scheduler = new CubeTaskScheduler(io)) {
+            CubeHolder holder = scheduler.holder(pos);
+            holder.request(CubeStatus.TERRAIN);
+            holder.advance(CubeStatus.IO_READY);
+
+            holder.cancel();
+            holder.request(CubeStatus.TERRAIN);
+            holder.advance(CubeStatus.IO_READY);
+
+            // The cancelled lifecycle left physical queue records behind. A
+            // restart must still be woken by its current identity-owned entry.
+            assertSame(holder, scheduler.readyForCommit(1).get(0));
+        }
+    }
+
+    @Test
+    void featureTerrainPollingDoesNotReRequestAnExistingTerrainHolder() throws Exception {
+        CubePos dependency = new CubePos(4, -20, 7);
+        try (CubeStorage storage = new CubeStorage(directory);
+                CubeIoScheduler io = new CubeIoScheduler(storage);
+                CubeTaskScheduler scheduler = new CubeTaskScheduler(io)) {
+            CubeHolder holder = scheduler.requestDependency(dependency, CubeStatus.TERRAIN, 50);
+            assertEquals(50, scheduler.priority(dependency));
+
+            // A blocked FEATURES owner can inspect this same terrain holder on
+            // every commit slice. The hot path must not repeat requestGraph or
+            // lower the request priority on each poll.
+            for (int index = 0; index < 2_048; index++) {
+                assertSame(holder, scheduler.featureTerrainDependencyForTest(dependency, 1));
+            }
+
+            assertEquals(0L, scheduler.featureTerrainRequestCountForTest());
+            assertEquals(50, scheduler.priority(dependency));
+            assertEquals(1, scheduler.holderCount());
+        }
+    }
+
+    @Test
     void releasingUnticketedHolderCancelsItsLifecycle() throws Exception {
         CubePos pos = new CubePos(1, -30, 4);
         try (CubeStorage storage = new CubeStorage(directory);

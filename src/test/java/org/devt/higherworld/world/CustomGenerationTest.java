@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
+import java.util.Arrays;
 import java.util.Random;
 import org.junit.jupiter.api.Test;
 import org.devt.higherworld.storage.CubePos;
@@ -113,6 +114,74 @@ class CustomGenerationTest {
                             cellsX, cellsY, cellsZ) > 0.0;
                     assertEquals(expected, optimized[(y * CubePos.SIZE + z) * CubePos.SIZE + x],
                             "voxel=" + x + "/" + y + "/" + z);
+                }
+            }
+        }
+    }
+
+    @Test
+    void tallNegativeHeightRasterLayoutMatchesPointwiseReference() {
+        int[] steps = {1, 2, 4, 8, 16};
+        int minimumY = -320;
+        int seaLevel = -64;
+        for (int stepX : steps) {
+            for (int stepY : steps) {
+                for (int stepZ : steps) {
+                    int cellsX = CubePos.SIZE / stepX;
+                    int cellsY = 64 / stepY;
+                    int cellsZ = CubePos.SIZE / stepZ;
+                    double[] samples = new double[
+                            (cellsX + 1) * (cellsY + 1) * (cellsZ + 1)];
+                    for (int gridY = 0; gridY <= cellsY; gridY++) {
+                        for (int gridZ = 0; gridZ <= cellsZ; gridZ++) {
+                            for (int gridX = 0; gridX <= cellsX; gridX++) {
+                                int x = gridX * stepX;
+                                int y = minimumY + gridY * stepY;
+                                int z = gridZ * stepZ;
+                                samples[(gridY * (cellsZ + 1) + gridZ) * (cellsX + 1) + gridX] =
+                                        (y - seaLevel) / 32.0
+                                                + Math.sin(x * 0.17 + z * 0.11)
+                                                - Math.cos((x - z) * 0.07);
+                            }
+                        }
+                    }
+
+                    boolean[] actual = new boolean[CubePos.SIZE * 64 * CubePos.SIZE];
+                    for (int section = 0; section < 4; section++) {
+                        int sectionCellsY = CubePos.SIZE / stepY;
+                        int rowLength = (cellsX + 1) * (cellsZ + 1);
+                        double[] sectionSamples = new double[rowLength * (sectionCellsY + 1)];
+                        int sourceOffset = section * sectionCellsY * rowLength;
+                        for (int row = 0; row <= sectionCellsY; row++) {
+                            System.arraycopy(samples, sourceOffset + row * rowLength,
+                                    sectionSamples, row * rowLength, rowLength);
+                        }
+                        boolean[] sectionSolid = new boolean[CubePos.SIZE * CubePos.SIZE * CubePos.SIZE];
+                        TerrainInterpolation.fillSolid(
+                                sectionSamples, stepX, stepY, stepZ,
+                                cellsX, sectionCellsY, cellsZ, sectionSolid);
+                        for (int localY = 0; localY < CubePos.SIZE; localY++) {
+                            int targetOffset = (section * CubePos.SIZE + localY)
+                                    * CubePos.SIZE * CubePos.SIZE;
+                            int sourceSectionOffset = localY * CubePos.SIZE * CubePos.SIZE;
+                            System.arraycopy(sectionSolid, sourceSectionOffset,
+                                    actual, targetOffset, CubePos.SIZE * CubePos.SIZE);
+                        }
+                    }
+
+                    boolean[] expected = new boolean[actual.length];
+                    for (int y = 0; y < 64; y++) {
+                        for (int z = 0; z < CubePos.SIZE; z++) {
+                            for (int x = 0; x < CubePos.SIZE; x++) {
+                                expected[(y * CubePos.SIZE + z) * CubePos.SIZE + x] =
+                                        CustomCubeGenerator.interpolate(
+                                                samples, x, y, z, stepX, stepY, stepZ,
+                                                cellsX, cellsY, cellsZ) > 0.0;
+                            }
+                        }
+                    }
+                    assertTrue(Arrays.equals(expected, actual),
+                            "spacing=" + stepX + "/" + stepY + "/" + stepZ);
                 }
             }
         }

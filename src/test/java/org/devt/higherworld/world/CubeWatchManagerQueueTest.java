@@ -1,7 +1,9 @@
 package org.devt.higherworld.world;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import org.devt.higherworld.storage.CubePos;
 import org.junit.jupiter.api.Test;
@@ -79,5 +81,25 @@ class CubeWatchManagerQueueTest {
         state.setCenterForTest(new CubePos(0, 0, 0));
 
         assertSame(xFirst, state.pollPendingStart());
+    }
+
+    @Test
+    void finishingStaleWatchDoesNotRemoveReplacementFromActiveRoots() {
+        CubePos pos = new CubePos(0, -1, 0);
+        CubeWatchManager.WatchState state = new CubeWatchManager.WatchState();
+        CubeWatchManager.Watch oldWatch = state.addForTest(pos, 0);
+        oldWatch.phase = CubeWatchManager.WatchPhase.IN_FLIGHT;
+        oldWatch.version++;
+        state.setCenterForTest(new CubePos(0, 0, 0));
+
+        CubeWatchManager.Watch replacement = state.addForTest(pos, 0);
+        replacement.phase = CubeWatchManager.WatchPhase.IN_FLIGHT;
+        replacement.version++;
+        state.rebuildQueues();
+
+        assertFalse(state.finish(oldWatch));
+        assertTrue(state.activeUnsentForTest(pos));
+        assertTrue(state.finish(replacement));
+        assertFalse(state.activeUnsentForTest(pos));
     }
 }

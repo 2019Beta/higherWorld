@@ -36,12 +36,17 @@ final class OpenClTerrainAccelerator implements AutoCloseable {
     private static final int PARAMETER_COUNT = 30;
     private static final int MAX_SAMPLE_COUNT = 17 * 17 * 17;
     private static final int VOXEL_COUNT = CubePos.SIZE * CubePos.SIZE * CubePos.SIZE;
+    /** Deep vanilla work is submitted as four adjacent 16-block sections. */
+    private static final int MAX_BATCH_HEIGHT = CubePos.SIZE * 4;
     /** Matches the small 2x2/4x4 chunk batches used by C2ME's OpenCL path. */
     private static final int MAX_BATCH_CUBES = 16;
-    private static final int MAX_BATCH_SAMPLE_COUNT = MAX_SAMPLE_COUNT * MAX_BATCH_CUBES;
+    private static final int MAX_BATCH_SAMPLE_COUNT =
+            (CubePos.SIZE + 1) * (MAX_BATCH_HEIGHT + 1) * (CubePos.SIZE + 1)
+                    * MAX_BATCH_CUBES;
     private static final int MAX_SURFACE_VALUE_COUNT = 3 * 17 * 17;
     private static final int MAX_BATCH_SURFACE_VALUE_COUNT = MAX_SURFACE_VALUE_COUNT * MAX_BATCH_CUBES;
-    private static final int MAX_BATCH_VOXEL_COUNT = VOXEL_COUNT * MAX_BATCH_CUBES;
+    private static final int MAX_BATCH_VOXEL_COUNT =
+            VOXEL_COUNT * (MAX_BATCH_HEIGHT / CubePos.SIZE) * MAX_BATCH_CUBES;
     private static final String[] OPENCL_LIBRARY_CANDIDATES = {
             "/usr/lib/x86_64-linux-gnu/libOpenCL.so.1",
             "/usr/lib64/libOpenCL.so.1",
@@ -358,22 +363,31 @@ final class OpenClTerrainAccelerator implements AutoCloseable {
         if (solid == null || solid.length != samples.length) {
             throw new IllegalArgumentException("Solid mask batch length does not match density batch");
         }
-        int sampleCount = sampleCount(stepX, stepY, stepZ, cellsX, cellsY, cellsZ);
+        int outputHeight = Math.multiplyExact(cellsY, stepY);
+        int sampleCount = sampleCount(
+                stepX, stepY, stepZ, cellsX, cellsY, cellsZ, outputHeight);
         long totalSamples = (long) sampleCount * samples.length;
         if (totalSamples > MAX_BATCH_SAMPLE_COUNT) {
             throw new IllegalArgumentException("Density batch exceeds the OpenCL sample buffer");
+        }
+        long totalVoxels = (long) samples.length * CubePos.SIZE * outputHeight * CubePos.SIZE;
+        if (outputHeight <= 0 || outputHeight > MAX_BATCH_HEIGHT
+                || outputHeight % CubePos.SIZE != 0
+                || totalVoxels > MAX_BATCH_VOXEL_COUNT) {
+            throw new IllegalArgumentException("Density batch output height is outside the OpenCL buffer");
         }
         for (int index = 0; index < samples.length; index++) {
             if (samples[index] == null || samples[index].length != sampleCount) {
                 throw new IllegalArgumentException(
                         "Unexpected density grid length at batch index " + index);
             }
-            if (solid[index] == null || solid[index].length != VOXEL_COUNT) {
+            long expectedSolidCount = (long) CubePos.SIZE * outputHeight * CubePos.SIZE;
+            if (solid[index] == null || solid[index].length != expectedSolidCount) {
                 throw new IllegalArgumentException(
                         "Unexpected solid mask length at batch index " + index);
             }
         }
-        if (samples.length == 1) {
+        if (samples.length == 1 && outputHeight == CubePos.SIZE) {
             rasterize(samples[0], stepX, stepY, stepZ, cellsX, cellsY, cellsZ,
                     interpolationMode, solid[0]);
             return;
@@ -393,18 +407,18 @@ final class OpenClTerrainAccelerator implements AutoCloseable {
                         samples.length, sampleCount,
                         stepX, stepY, stepZ, cellsX, cellsY, cellsZ, interpolationMode);
                 PointerBuffer globalSize = stack.mallocPointer(1)
-                        .put(0, (long) samples.length * VOXEL_COUNT);
+                        .put(0, totalVoxels);
                 check(CL12.clEnqueueNDRangeKernel(
                         queue, rasterBatchKernel, 1, null, globalSize, null, null, null));
 
-                int solidCount = samples.length * VOXEL_COUNT;
+                int solidCount = Math.toIntExact(totalVoxels);
                 hostBatchSolid.clear();
                 hostBatchSolid.limit(solidCount);
                 check(CL12.clEnqueueReadBuffer(
                         queue, batchSolidBuffer, true, 0, hostBatchSolid, null, null));
                 hostBatchSolid.rewind();
                 for (boolean[] output : solid) {
-                    for (int voxel = 0; voxel < VOXEL_COUNT; voxel++) {
+                    for (int voxel = 0; voxel < output.length; voxel++) {
                         output[voxel] = hostBatchSolid.get() != 0;
                     }
                 }
@@ -426,13 +440,19 @@ final class OpenClTerrainAccelerator implements AutoCloseable {
     private static int sampleCount(
             int stepX, int stepY, int stepZ,
             int cellsX, int cellsY, int cellsZ) {
+        return sampleCount(stepX, stepY, stepZ, cellsX, cellsY, cellsZ, CubePos.SIZE);
+    }
+
+    private static int sampleCount(
+            int stepX, int stepY, int stepZ,
+            int cellsX, int cellsY, int cellsZ, int outputHeight) {
         if (stepX <= 0 || stepY <= 0 || stepZ <= 0
                 || cellsX <= 0 || cellsY <= 0 || cellsZ <= 0
                 || CubePos.SIZE % stepX != 0
                 || CubePos.SIZE % stepY != 0
                 || CubePos.SIZE % stepZ != 0
                 || cellsX * stepX != CubePos.SIZE
-                || cellsY * stepY != CubePos.SIZE
+                || cellsY * stepY != outputHeight
                 || cellsZ * stepZ != CubePos.SIZE) {
             throw new IllegalArgumentException("Density grid must exactly cover one 16^3 cube");
         }

@@ -23,7 +23,7 @@ HigherWorld 是面向 Minecraft 1.21.11 / Fabric 的稀疏立方区块运行层�
 - 原版 `.mca` 继续负责原版高度带内的数据与实体兼容；外部方块由 `.hwr` 文件负责。
 - 自定义世界的纯噪声采样支持可选 OpenCL GPU 加速；自定义噪声在 GPU 上完成采样和体素分类，
   无限向下/非标准密度函数路径可复用 GPU 栅格体素化阶段。原版高度以下的完整 64 格批次会
-  复用密度采样并按 16 格 section 批量在 GPU 上栅格化；GPU 不可用时走同一套 CPU 稀疏栅格，
+  复用密度采样并在 GPU 上一次完成栅格化和回读；GPU 不可用时走同一套 CPU 稀疏栅格，
   原版高度带仍保留原版精确生成。方块写入、洞穴、结构和光照仍沿用现有安全路径。首次启动会生成
   `config/higherworld.properties`，将 `higherworld.gpu.enabled` 改为 `true` 并重启服务器即可启用；
   没有兼容设备或内核失败时默认自动回退 CPU。可选项还包括 `higherworld.gpu.device_index`、

@@ -17,6 +17,8 @@ public final class GpuTerrainAccelerator {
     private static final Object LOCK = new Object();
     private static final AtomicBoolean INITIALIZATION_ATTEMPTED = new AtomicBoolean();
     private static final int VOXEL_COUNT = CubePos.SIZE * CubePos.SIZE * CubePos.SIZE;
+    /** Vanilla terrain batches cover four adjacent cube sections vertically. */
+    private static final int MAX_BATCH_HEIGHT = CubePos.SIZE * 4;
     private static final int MAX_CUSTOM_BATCH = 16;
     private static final int MAX_DENSITY_BATCH = 16;
 
@@ -181,7 +183,9 @@ public final class GpuTerrainAccelerator {
      * Rasterizes several host-sampled density grids in one OpenCL dispatch.
      * This keeps the vanilla deep path on the same batched device stage as
      * custom terrain while preserving a CPU fallback for unsupported graphs or
-     * devices.
+     * devices. The output height is derived from {@code cellsY * stepY}, so a
+     * 64-high vanilla batch remains one device roundtrip instead of four
+     * section-sized dispatches.
      */
     public static boolean tryRasterizeDensityBatch(
             double[][] samples, int stepX, int stepY, int stepZ,
@@ -283,9 +287,32 @@ public final class GpuTerrainAccelerator {
         if (solid == null || solid.length != samples.length) {
             throw new IllegalArgumentException("Solid mask batch length does not match density batch");
         }
+        if (interpolationMode == null) {
+            throw new IllegalArgumentException("Interpolation mode cannot be null");
+        }
+        validateStep(stepX, "X");
+        validateStep(stepY, "Y");
+        validateStep(stepZ, "Z");
+        long outputHeight = (long) cellsY * stepY;
+        if (cellsX <= 0 || cellsY <= 0 || cellsZ <= 0
+                || (long) cellsX * stepX != CubePos.SIZE
+                || (long) cellsZ * stepZ != CubePos.SIZE
+                || outputHeight <= 0 || outputHeight > MAX_BATCH_HEIGHT
+                || outputHeight % CubePos.SIZE != 0) {
+            throw new IllegalArgumentException("Density batch must cover a 16x16x16- or 16x64x16-grid");
+        }
+        int height = (int) outputHeight;
+        int sampleCount = (cellsX + 1) * (cellsY + 1) * (cellsZ + 1);
+        int solidCount = CubePos.SIZE * height * CubePos.SIZE;
         for (int index = 0; index < samples.length; index++) {
-            validateRasterRequest(samples[index], stepX, stepY, stepZ,
-                    cellsX, cellsY, cellsZ, interpolationMode, solid[index]);
+            if (samples[index] == null || samples[index].length != sampleCount) {
+                throw new IllegalArgumentException(
+                        "Unexpected density grid length at batch index " + index);
+            }
+            if (solid[index] == null || solid[index].length != solidCount) {
+                throw new IllegalArgumentException(
+                        "Unexpected solid mask length at batch index " + index);
+            }
         }
     }
 

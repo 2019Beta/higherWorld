@@ -245,8 +245,7 @@ public final class CubeWatchManager {
 
             long version = watch.version + 1L;
             long generation = state.generation;
-            watch.phase = WatchPhase.IN_FLIGHT;
-            watch.version = version;
+            state.markInFlight(watch, version);
             readAheadBudget.consume();
             try {
                 CompletableFuture<Void> ready = CubicWorldManager.prefetchCubePayload(
@@ -417,8 +416,7 @@ public final class CubeWatchManager {
         CubeBox previous = CubeBox.around(previousCenter, previousRadius);
         CubeBox current = CubeBox.around(center, horizontalRadius);
         forEachBoxDifference(previous, current, pos -> {
-            Watch watch = state.watches.remove(pos);
-            if (watch != null) watch.invalidate();
+            Watch watch = state.removeWatch(pos);
             if (state.sent.remove(pos) && ServerPlayNetworking.canSend(player, CubeUnloadPayload.ID)) {
                 ServerPlayNetworking.send(player, new CubeUnloadPayload(
                         pos, CubicWorldManager.cubeRevision(world, pos)));
@@ -649,6 +647,8 @@ public final class CubeWatchManager {
         long generation;
         private long sequence;
         private final Set<CubePos> sent = new HashSet<>();
+        /** Watch roots that already own a live payload request. */
+        private final Set<CubePos> activeUnsent = new HashSet<>();
         private final Map<CubePos, Watch> watches = new HashMap<>();
         private final PriorityQueue<QueueEntry> pendingStarts =
                 new PriorityQueue<>(NEAR_TO_FAR);
@@ -681,6 +681,10 @@ public final class CubeWatchManager {
             return retries.size();
         }
 
+        boolean activeUnsentForTest(CubePos pos) {
+            return activeUnsent.contains(pos);
+        }
+
         private Set<CubePos> activeUnsentPositions() {
             // Pending starts are only a priority queue: no holder has been
             // materialized for them yet.  Publishing all of those roots to
@@ -688,16 +692,7 @@ public final class CubeWatchManager {
             // dependency closure for the entire 3D view.  Retain only roots
             // that already own a live request, plus SEND retries whose holder
             // is still expected to produce a packet.
-            Set<CubePos> result = new HashSet<>();
-            for (Watch watch : watches.values()) {
-                if (watch.phase == WatchPhase.IN_FLIGHT
-                        || watch.phase == WatchPhase.READY_SEND
-                        || (watch.phase == WatchPhase.RETRY_WAIT
-                                && watch.retryTarget == RetryTarget.SEND)) {
-                    result.add(watch.pos);
-                }
-            }
-            return Set.copyOf(result);
+            return Set.copyOf(activeUnsent);
         }
 
         private Watch addWatch(CubePos pos, int rank) {
@@ -711,6 +706,7 @@ public final class CubeWatchManager {
             pendingStarts.clear();
             readySends.clear();
             retries.clear();
+            activeUnsent.clear();
             for (Watch watch : watches.values()) {
                 watch.rank = cubePriority(watch.pos, center);
                 switch (watch.phase) {
@@ -719,7 +715,17 @@ public final class CubeWatchManager {
                     case RETRY_WAIT -> enqueueRetry(watch);
                     case IN_FLIGHT, FINISHED -> { }
                 }
+                if (isActiveUnsent(watch)) activeUnsent.add(watch.pos);
             }
+        }
+
+        /** Moves a pending watch into the payload request phase. */
+        void markInFlight(Watch watch, long version) {
+            if (watches.get(watch.pos) != watch
+                    || watch.phase != WatchPhase.PENDING_START) return;
+            watch.phase = WatchPhase.IN_FLIGHT;
+            watch.version = version;
+            activeUnsent.add(watch.pos);
         }
 
         Watch pollPendingStart() {
@@ -771,9 +777,11 @@ public final class CubeWatchManager {
                 watch.version++;
                 if (entry.target() == RetryTarget.START) {
                     watch.phase = WatchPhase.PENDING_START;
+                    activeUnsent.remove(watch.pos);
                     enqueuePendingStart(watch);
                 } else {
                     watch.phase = WatchPhase.READY_SEND;
+                    activeUnsent.add(watch.pos);
                     enqueueReadySend(watch);
                 }
             }
@@ -783,6 +791,7 @@ public final class CubeWatchManager {
             if (watch.phase != WatchPhase.IN_FLIGHT || watches.get(watch.pos) != watch) return;
             watch.phase = WatchPhase.READY_SEND;
             watch.version++;
+            activeUnsent.add(watch.pos);
             enqueueReadySend(watch);
         }
 
@@ -793,19 +802,32 @@ public final class CubeWatchManager {
             watch.retryTarget = target;
             watch.dueTick = now + Math.max(1L, delayTicks);
             watch.version++;
+            if (target == RetryTarget.SEND) activeUnsent.add(watch.pos);
+            else activeUnsent.remove(watch.pos);
             enqueueRetry(watch);
         }
 
         boolean finish(Watch watch) {
             boolean removed = watches.remove(watch.pos, watch);
+            if (removed) activeUnsent.remove(watch.pos);
             watch.invalidate();
             return removed;
+        }
+
+        private Watch removeWatch(CubePos pos) {
+            Watch watch = watches.remove(pos);
+            if (watch != null) {
+                activeUnsent.remove(pos);
+                watch.invalidate();
+            }
+            return watch;
         }
 
         private void invalidate() {
             generation++;
             watches.values().forEach(Watch::invalidate);
             watches.clear();
+            activeUnsent.clear();
             pendingStarts.clear();
             readySends.clear();
             retries.clear();
@@ -827,6 +849,13 @@ public final class CubeWatchManager {
 
         private int currentRank(Watch watch) {
             return center == null ? watch.rank : cubePriority(watch.pos, center);
+        }
+
+        private static boolean isActiveUnsent(Watch watch) {
+            return watch.phase == WatchPhase.IN_FLIGHT
+                    || watch.phase == WatchPhase.READY_SEND
+                    || (watch.phase == WatchPhase.RETRY_WAIT
+                            && watch.retryTarget == RetryTarget.SEND);
         }
     }
 
