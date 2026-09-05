@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Set;
 import org.devt.higherworld.storage.CubeIoScheduler;
 import org.devt.higherworld.storage.CubePos;
@@ -160,7 +161,7 @@ class CubeTaskSchedulerLifecycleTest {
 
             CubeHolder blockedHighPriority = scheduler.holder(blockedHighPriorityPos);
             blockedHighPriority.request(CubeStatus.FULL);
-            blockedHighPriority.advance(CubeStatus.FEATURES);
+            blockedHighPriority.advance(CubeStatus.TERRAIN);
 
             CubeHolder lowPriorityTerrain = scheduler.holder(lowPriorityTerrainPos);
             lowPriorityTerrain.request(CubeStatus.TERRAIN);
@@ -219,6 +220,63 @@ class CubeTaskSchedulerLifecycleTest {
     }
 
     @Test
+    void staleReadySnapshotsAreCompactedAgainstLiveEntries() throws Exception {
+        CubePos pos = new CubePos(3, -20, -4);
+        try (CubeStorage storage = new CubeStorage(directory);
+                CubeIoScheduler io = new CubeIoScheduler(storage);
+                CubeTaskScheduler scheduler = new CubeTaskScheduler(io)) {
+            CubeHolder holder = scheduler.holder(pos);
+            for (int index = 0; index < 1_200; index++) {
+                holder.request(CubeStatus.TERRAIN);
+                holder.advance(CubeStatus.IO_READY);
+                holder.cancel();
+            }
+            holder.request(CubeStatus.TERRAIN);
+            holder.advance(CubeStatus.IO_READY);
+
+            assertTrue(scheduler.readyQueueSizeForTest()
+                    <= 4L * scheduler.queuedReadySizeForTest() + 1024L);
+            assertSame(holder, scheduler.readyForCommit(1).get(0));
+            assertEquals(0, scheduler.queuedReadySizeForTest());
+            assertTrue(scheduler.readyQueueSizeForTest() <= 1024);
+        }
+    }
+
+    @Test
+    void refreshingPriorityEpochDoesNotStarveLowPriorityReadyWork() throws Exception {
+        CubePos center = new CubePos(0, -20, 0);
+        CubePos lowPriorityPos = new CubePos(100, -20, 100);
+        try (CubeStorage storage = new CubeStorage(directory);
+                CubeIoScheduler io = new CubeIoScheduler(storage);
+                CubeTaskScheduler scheduler = new CubeTaskScheduler(io)) {
+            scheduler.replaceTicket(new CubeTicket(
+                    "epoch-high", CubeTicketType.COLLISION, center,
+                    new CubeDependencyRadius(8, 0, 8), CubeStatus.PAYLOAD, 0));
+            scheduler.replaceTicket(new CubeTicket(
+                    "epoch-low", CubeTicketType.FORCED, lowPriorityPos,
+                    CubeDependencyRadius.NONE, CubeStatus.TERRAIN, 100_000));
+
+            for (int x = -8; x < 8; x++) {
+                for (int z = -8; z < 8; z++) {
+                    CubeHolder blocked = scheduler.holder(new CubePos(x, -20, z));
+                    blocked.request(CubeStatus.PAYLOAD);
+                    blocked.advance(CubeStatus.TERRAIN);
+                }
+            }
+            CubeHolder lowPriority = scheduler.holder(lowPriorityPos);
+            lowPriority.request(CubeStatus.TERRAIN);
+            lowPriority.advance(CubeStatus.IO_READY);
+
+            // Target refresh changes the ordering metadata without changing
+            // any holder lifecycle state. The stale entries must be refreshed
+            // and scanned in the same bounded pass.
+            scheduler.retainPrefetches(Set.of());
+
+            assertSame(lowPriority, scheduler.readyForCommit(1).get(0));
+        }
+    }
+
+    @Test
     void cancellingAndRestartingAHolderSkipsItsOldReadySnapshots() throws Exception {
         CubePos pos = new CubePos(2, -20, -3);
         try (CubeStorage storage = new CubeStorage(directory);
@@ -257,6 +315,97 @@ class CubeTaskSchedulerLifecycleTest {
             assertEquals(0L, scheduler.featureTerrainRequestCountForTest());
             assertEquals(50, scheduler.priority(dependency));
             assertEquals(1, scheduler.holderCount());
+        }
+    }
+
+    @Test
+    void readyCommitSkipsBlockedFeatureHalosBeyondItsBatchLimit() throws Exception {
+        CubePos center = new CubePos(0, -20, 0);
+        CubePos haloPos = new CubePos(100, -20, 100);
+        try (CubeStorage storage = new CubeStorage(directory);
+                CubeIoScheduler io = new CubeIoScheduler(storage);
+                CubeTaskScheduler scheduler = new CubeTaskScheduler(io)) {
+            scheduler.replaceTicket(new CubeTicket(
+                    "feature-owners", CubeTicketType.COLLISION, center,
+                    new CubeDependencyRadius(8, 0, 8), CubeStatus.PAYLOAD, 0));
+            scheduler.replaceTicket(new CubeTicket(
+                    "feature-halo", CubeTicketType.COLLISION, haloPos,
+                    CubeDependencyRadius.NONE, CubeStatus.TERRAIN, 100_000));
+
+            CubeHolder halo = scheduler.holder(haloPos);
+            halo.advance(CubeStatus.IO_READY);
+            halo.request(CubeStatus.TERRAIN);
+
+            int ownerCount = 0;
+            for (int x = -8; x < 8; x++) {
+                for (int z = -8; z < 8; z++) {
+                    CubePos ownerPos = new CubePos(x, -20, z);
+                    CubeHolder owner = scheduler.holder(ownerPos);
+                    owner.advance(CubeStatus.TERRAIN);
+                    owner.request(CubeStatus.PAYLOAD);
+
+                    for (int offsetY = -1; offsetY <= 1; offsetY++) {
+                        for (int offsetZ = -1; offsetZ <= 1; offsetZ++) {
+                            for (int offsetX = -1; offsetX <= 1; offsetX++) {
+                                CubeHolder dependency = scheduler.holder(new CubePos(
+                                        x + offsetX, -20 + offsetY, z + offsetZ));
+                                dependency.advance(CubeStatus.TERRAIN);
+                                dependency.request(CubeStatus.TERRAIN);
+                            }
+                        }
+                    }
+                    // This simulates the wider list already registered by a
+                    // previous feature poll. The shared halo is still IO_READY.
+                    scheduler.registerFeatureTerrainDependenciesForTest(
+                            ownerPos, List.of(haloPos));
+                    ownerCount++;
+                }
+            }
+            assertEquals(256, ownerCount);
+
+            List<CubeHolder> ready = scheduler.readyForCommit(256);
+
+            // The old predicate returned all 256 owners and repeatedly
+            // requeued them from tryAdvance(), starving this low-priority halo.
+            assertEquals(1, ready.size());
+            assertSame(halo, ready.get(0));
+
+            halo.advance(CubeStatus.TERRAIN);
+
+            List<CubeHolder> nextReady = scheduler.readyForCommit(1);
+            assertEquals(1, nextReady.size());
+            assertTrue(nextReady.get(0) != halo);
+            assertEquals(CubeStatus.TERRAIN, nextReady.get(0).status());
+            assertEquals(CubeStatus.PAYLOAD, nextReady.get(0).target());
+        }
+    }
+
+    @Test
+    void newlyRegisteredFeatureHaloIsRequiredUntilItsOwnerRefreshes() throws Exception {
+        CubePos firstOwner = new CubePos(0, -20, 0);
+        CubePos secondOwner = new CubePos(2, -20, 0);
+        CubePos dependency = new CubePos(100, -20, 100);
+        try (CubeStorage storage = new CubeStorage(directory);
+                CubeIoScheduler io = new CubeIoScheduler(storage);
+                CubeTaskScheduler scheduler = new CubeTaskScheduler(io)) {
+            scheduler.replaceTicket(new CubeTicket(
+                    "feature-owner-one", CubeTicketType.COLLISION, firstOwner,
+                    CubeDependencyRadius.NONE, CubeStatus.FEATURES, 0));
+            scheduler.replaceTicket(new CubeTicket(
+                    "feature-owner-two", CubeTicketType.COLLISION, secondOwner,
+                    CubeDependencyRadius.NONE, CubeStatus.FEATURES, 0));
+            scheduler.registerFeatureTerrainDependenciesForTest(firstOwner, List.of(dependency));
+            scheduler.registerFeatureTerrainDependenciesForTest(secondOwner, List.of(dependency));
+
+            assertTrue(scheduler.isRequired(dependency));
+
+            scheduler.removeTicket("feature-owner-one");
+
+            assertTrue(scheduler.isRequired(dependency));
+
+            scheduler.removeTicket("feature-owner-two");
+
+            assertFalse(scheduler.isRequired(dependency));
         }
     }
 

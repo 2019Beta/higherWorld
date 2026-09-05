@@ -995,15 +995,26 @@ final class VanillaPlacedFeatureGenerator {
             for (int sectionIndex = firstSection; sectionIndex <= lastSection; sectionIndex++) {
                 net.minecraft.world.chunk.ChunkSection section = chunk.getSectionArray()[sectionIndex];
                 int sectionMinY = height.getBottomY() + sectionIndex * CubePos.SIZE;
-                for (int localY = 0; localY < CubePos.SIZE; localY++) {
-                    for (int localZ = 0; localZ < CubePos.SIZE; localZ++) {
-                        for (int localX = 0; localX < CubePos.SIZE; localX++) {
-                            mutable.set(chunkX * CubePos.SIZE + localX,
-                                    sectionMinY + localY, chunkZ * CubePos.SIZE + localZ);
-                            section.setBlockState(localX, localY, localZ,
-                                    batchWriter.read(world, mutable));
+                // The scratch section is private until it is published below.
+                // Hold its palette lock once and use the explicitly unsafe
+                // setter inside the single-threaded fill.  ChunkSection's
+                // boolean overload still updates block/fluid/random-tick
+                // counts; false only selects PalettedContainer.swapUnsafe()
+                // instead of taking the same lock for every voxel.
+                section.lock();
+                try {
+                    for (int localY = 0; localY < CubePos.SIZE; localY++) {
+                        for (int localZ = 0; localZ < CubePos.SIZE; localZ++) {
+                            for (int localX = 0; localX < CubePos.SIZE; localX++) {
+                                mutable.set(chunkX * CubePos.SIZE + localX,
+                                        sectionMinY + localY, chunkZ * CubePos.SIZE + localZ);
+                                section.setBlockState(localX, localY, localZ,
+                                        batchWriter.read(world, mutable), false);
+                            }
                         }
                     }
+                } finally {
+                    section.unlock();
                 }
                 chunk.getSectionArray()[sectionIndex] = new TrackingChunkSection(
                         section, batchWriter,

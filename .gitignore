@@ -4,6 +4,7 @@
 build/
 run/
 out/
+diagnostics/
 
 # Compiled class file
 *.class

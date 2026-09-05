@@ -725,10 +725,11 @@ final class CubicWorldState implements AutoCloseable {
 
     /** Commits completed worker terrain during a bounded mid-tick slice. */
     void advanceReadyTasks(long budgetNanos) {
+        if (budgetNanos <= 0L) return;
         long deadline = System.nanoTime() + Math.max(0L, budgetNanos);
         List<CubeHolder> ready = taskScheduler.readyForCommit(256);
         for (int index = 0; index < ready.size(); index++) {
-            if (System.nanoTime() >= deadline) {
+            if (commitBudgetExhausted(System.nanoTime(), deadline, index)) {
                 // readyForCommit removes the whole batch from its queue. Put
                 // the untouched tail back or these cubes can wait forever for
                 // a state change that will never occur.
@@ -746,6 +747,15 @@ final class CubicWorldState implements AutoCloseable {
                 Higherworld.LOGGER.error("Cannot finish asynchronous cube {}", holder.pos(), exception);
             }
         }
+    }
+
+    /**
+     * Keeps one bounded commit slice alive after an expensive ready-queue
+     * scan. The first returned holder is the scheduler's forward-progress
+     * guarantee; later holders respect the elapsed budget.
+     */
+    static boolean commitBudgetExhausted(long nowNanos, long deadlineNanos, int index) {
+        return index > 0 && nowNanos >= deadlineNanos;
     }
 
     void replaceTicket(CubeTicket ticket) {

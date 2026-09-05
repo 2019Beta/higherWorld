@@ -54,6 +54,13 @@ final class CubeTaskScheduler implements AutoCloseable {
      * poll and every retry regenerated the same deep dependency set.
      */
     private final Map<CubePos, List<CubePos>> featureTerrainDependencies = new HashMap<>();
+    /**
+     * Feature terrain reads registered between target refreshes.  The owner map
+     * is server-thread state, while this refcounted set is read by eviction and
+     * release paths that can observe the newly requested dependency immediately.
+     */
+    private final ConcurrentMap<CubePos, Integer> featureTerrainRequiredCounts =
+            new ConcurrentHashMap<>();
     /** Owners whose wider feature terrain read set has already become ready. */
     private final Set<CubePos> featureTerrainReady = new HashSet<>();
     /** Counts feature terrain graph starts for the package-level regression hook. */
@@ -145,7 +152,7 @@ final class CubeTaskScheduler implements AutoCloseable {
 
     /** Returns whether a cube is part of an active ticket's dependency closure. */
     boolean isRequired(CubePos pos) {
-        return requiredPositions.contains(pos);
+        return requiredPositions.contains(pos) || featureTerrainRequiredCounts.containsKey(pos);
     }
 
     /**
@@ -202,6 +209,7 @@ final class CubeTaskScheduler implements AutoCloseable {
             // records by identity instead.
             queuedReady.put(holder, entry);
             readyQueue.offer(entry);
+            compactReadyQueueIfNeeded();
         }
     }
 
@@ -225,6 +233,15 @@ final class CubeTaskScheduler implements AutoCloseable {
         return holders.size();
     }
 
+    /** Package-private inspection hooks used by lifecycle tests. */
+    int readyQueueSizeForTest() {
+        return readyQueue.size();
+    }
+
+    int queuedReadySizeForTest() {
+        return queuedReady.size();
+    }
+
     /** Package-private hook for verifying the feature dependency poll path. */
     CubeHolder featureTerrainDependencyForTest(CubePos dependency, int priority) {
         return featureTerrainDependency(dependency, priority);
@@ -233,6 +250,11 @@ final class CubeTaskScheduler implements AutoCloseable {
     /** Package-private hook for verifying graph requests stay one-shot. */
     long featureTerrainRequestCountForTest() {
         return featureTerrainRequestCount;
+    }
+
+    /** Package-private hook for registering a wide feature read in scheduler tests. */
+    void registerFeatureTerrainDependenciesForTest(CubePos owner, List<CubePos> dependencies) {
+        registerFeatureTerrainDependencies(owner, dependencies);
     }
 
     CubeHolder adoptLoaded(LoadedCube cube) {
@@ -306,9 +328,11 @@ final class CubeTaskScheduler implements AutoCloseable {
     boolean featureBatchTerrainReady(ServerWorld world, CubeHolder holder, int priority) {
         if (featureTerrainReady.contains(holder.pos())) return true;
         boolean ready = true;
-        List<CubePos> dependencies = featureTerrainDependencies.computeIfAbsent(
-                holder.pos(), ignored -> VanillaPlacedFeatureGenerator.terrainBatchPositions(
-                        world, holder.pos()));
+        List<CubePos> dependencies = featureTerrainDependencies.get(holder.pos());
+        if (dependencies == null) {
+            dependencies = VanillaPlacedFeatureGenerator.terrainBatchPositions(world, holder.pos());
+            registerFeatureTerrainDependencies(holder.pos(), dependencies);
+        }
         for (CubePos dependency : dependencies) {
             // The first pass materializes this wider read set. Once a holder
             // exists, polling only needs its lifecycle state; recursively
@@ -322,6 +346,23 @@ final class CubeTaskScheduler implements AutoCloseable {
         }
         if (ready) featureTerrainReady.add(holder.pos());
         return ready;
+    }
+
+    private void registerFeatureTerrainDependencies(
+            CubePos owner, List<CubePos> dependencies) {
+        List<CubePos> immutable = List.copyOf(dependencies);
+        List<CubePos> previous = featureTerrainDependencies.putIfAbsent(owner, immutable);
+        if (previous != null) return;
+        for (CubePos dependency : immutable) {
+            featureTerrainRequiredCounts.merge(dependency, 1, Integer::sum);
+        }
+    }
+
+    private void releaseFeatureTerrainDependencies(List<CubePos> dependencies) {
+        for (CubePos dependency : dependencies) {
+            featureTerrainRequiredCounts.computeIfPresent(
+                    dependency, (ignored, count) -> count > 1 ? count - 1 : null);
+        }
     }
 
     private CubeHolder featureTerrainDependency(CubePos dependency, int priority) {
@@ -455,7 +496,9 @@ final class CubeTaskScheduler implements AutoCloseable {
         // holder on every server-thread commit slice.
         ArrayList<CubeHolder> result = new ArrayList<>(limit);
         Set<CubeHolder> selected = new HashSet<>();
+        Set<CubeHolder> epochRefreshed = new HashSet<>();
         ArrayList<ReadyEntry> blocked = new ArrayList<>();
+        compactReadyQueueIfNeeded();
         int scanBudget = readyQueue.size();
         while (result.size() < limit && scanBudget-- > 0) {
             ReadyEntry entry = readyQueue.poll();
@@ -474,7 +517,14 @@ final class CubeTaskScheduler implements AutoCloseable {
                     || entry.priorityEpoch() != priorityEpoch
                     || entry.priority() != priority(holder.pos())
                     || entry.statusOrdinal() != holder.status().ordinal()) {
+                boolean staleEpoch = entry.priorityEpoch() != priorityEpoch;
                 holderChanged(holder);
+                // A refreshed epoch replaces the entry in-place lazily. The
+                // replacement needs one scan slot, otherwise a holder can
+                // consume two slots (stale snapshot plus current snapshot)
+                // during the same bounded pass. Identity deduplication keeps
+                // duplicate physical stale records from refunding repeatedly.
+                if (staleEpoch && epochRefreshed.add(holder)) scanBudget++;
                 continue;
             }
             if (!isReadyCandidate(holder)) continue;
@@ -494,6 +544,12 @@ final class CubeTaskScheduler implements AutoCloseable {
         // the marker prevents a duplicate.
         blocked.forEach(entry -> holderChanged(entry.holder()));
         return result;
+    }
+
+    private void compactReadyQueueIfNeeded() {
+        long live = queuedReady.size();
+        if (readyQueue.size() <= 4L * live + 1024L) return;
+        readyQueue.removeIf(entry -> queuedReady.get(entry.holder()) != entry);
     }
 
     private void removeQueuedReady(CubeHolder holder) {
@@ -552,7 +608,10 @@ final class CubeTaskScheduler implements AutoCloseable {
         featureTerrainDependencies.entrySet().removeIf(entry -> {
             CubeStatus target = required.get(entry.getKey());
             boolean remove = target == null || !target.isAtLeast(CubeStatus.FEATURES);
-            if (remove) featureTerrainReady.remove(entry.getKey());
+            if (remove) {
+                featureTerrainReady.remove(entry.getKey());
+                releaseFeatureTerrainDependencies(entry.getValue());
+            }
             return remove;
         });
         for (List<CubePos> dependencies : featureTerrainDependencies.values()) {
@@ -642,6 +701,7 @@ final class CubeTaskScheduler implements AutoCloseable {
         requiredPositions = Set.of();
         prefetchPositions = Set.of();
         featureTerrainDependencies.clear();
+        featureTerrainRequiredCounts.clear();
         featureTerrainReady.clear();
         featureTerrainRequestCount = 0L;
         readyQueue.clear();
@@ -683,6 +743,25 @@ final class CubeTaskScheduler implements AutoCloseable {
                     if (dependencyHolder == null
                             || dependencyHolder.failed()
                             || !dependencyHolder.status().isAtLeast(neighbour)) {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        // Vanilla placed features read a wider terrain halo than the normal
+        // 3x3x3 FEATURES graph.  Once the first feature poll has registered
+        // that halo, keep its owner out of the commit result until every read
+        // is ready.  A missing registration deliberately passes above: the
+        // feature poll then materializes the halo exactly once.
+        if (holder.status() == CubeStatus.TERRAIN) {
+            List<CubePos> featureDependencies = featureTerrainDependencies.get(holder.pos());
+            if (featureDependencies != null) {
+                for (CubePos dependency : featureDependencies) {
+                    CubeHolder dependencyHolder = holders.get(dependency);
+                    if (dependencyHolder == null
+                            || dependencyHolder.failed()
+                            || !dependencyHolder.status().isAtLeast(CubeStatus.TERRAIN)) {
                         return false;
                     }
                 }

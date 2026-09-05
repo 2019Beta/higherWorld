@@ -246,6 +246,10 @@ public final class CubeWatchManager {
             long version = watch.version + 1L;
             long generation = state.generation;
             state.markInFlight(watch, version);
+            // Publishing this root in the same tick keeps the scheduler's
+            // dependency closure in sync with activeUnsent before eviction or
+            // a feature terrain poll can observe the new request.
+            prefetchesChanged = true;
             readAheadBudget.consume();
             try {
                 CompletableFuture<Void> ready = CubicWorldManager.prefetchCubePayload(
