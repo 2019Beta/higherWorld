@@ -30,9 +30,14 @@ public final class CubeWatchManager {
     // monopolizing that thread; pure vanilla terrain sampling is dispatched by
     // CubeTaskScheduler. Share this budget across all players so additional
     // players cannot multiply synchronous cube work in a single tick.
-    private static final int CUBE_WORK_PER_WORLD_TICK = 4;
-    private static final int POLL_ATTEMPTS_PER_PLAYER_TICK = 32;
-    private static final int READ_AHEAD_PER_WORLD_TICK = 8;
+    // PAYLOAD streaming is deliberately cheaper than a FULL ticket, so it can
+    // use a larger pipeline without opening the lighting graph.  The previous
+    // 4/8 limits left thousands of deep cubes waiting behind a tiny read/send
+    // window even when IO and generation were already idle.
+    private static final int CUBE_WORK_PER_WORLD_TICK = 24;
+    private static final int MAX_CUBE_WORK_PER_WORLD_TICK = 64;
+    private static final int POLL_ATTEMPTS_PER_PLAYER_TICK = 128;
+    private static final int READ_AHEAD_PER_WORLD_TICK = 64;
     private static final long PREFETCH_RETRY_DELAY_TICKS = 2L;
     private static final long SEND_RETRY_DELAY_TICKS = 1L;
     private static final Map<UUID, WatchState> WATCHERS = new HashMap<>();
@@ -46,7 +51,11 @@ public final class CubeWatchManager {
         AdaptiveBudget adaptive = BUDGETS.computeIfAbsent(world, ignored -> new AdaptiveBudget());
         Set<UUID> present = new HashSet<>();
         boolean watcherTicketsChanged = false;
-        CubeWorkBudget workBudget = new CubeWorkBudget(adaptive.cubeAllowance());
+        // A slow server-thread commit must not throttle payloads that are
+        // already ready.  The send side still follows the EWMA, but its
+        // allowance is independent of commit debt (which only gates the next
+        // commit slice in midTick()).
+        CubeWorkBudget workBudget = new CubeWorkBudget(adaptive.sendAllowance());
         CubeWorkBudget readAheadBudget = new CubeWorkBudget(READ_AHEAD_PER_WORLD_TICK);
         List<ServerPlayerEntity> players = world.getPlayers();
         int playerCount = players.size();
@@ -61,22 +70,15 @@ public final class CubeWatchManager {
         while (watchers.hasNext()) {
             Map.Entry<UUID, WatchState> entry = watchers.next();
             if (!present.contains(entry.getKey()) && entry.getValue().world == world) {
-                CubicWorldManager.removeTicket(world, entry.getKey());
+                CubicWorldManager.removeTicket(
+                        world, CubeTicket.playerSimulationKey(entry.getKey()));
                 entry.getValue().invalidate();
                 watchers.remove();
                 watcherTicketsChanged = true;
             }
         }
 
-        if (watcherTicketsChanged) {
-            Set<CubePos> requestedReads = new HashSet<>();
-            for (WatchState state : WATCHERS.values()) {
-                if (state.world == world) {
-                    requestedReads.addAll(state.activeUnsentPositions());
-                }
-            }
-            CubicWorldManager.retainPrefetches(world, requestedReads);
-        }
+        if (watcherTicketsChanged) refreshPrefetches(world);
 
         // Cache eviction is maintenance, not simulation. Running the full cache
         // walk every server tick creates avoidable allocation and CPU pressure.
@@ -112,7 +114,8 @@ public final class CubeWatchManager {
     public static void removeWorld(ServerWorld world) {
         WATCHERS.entrySet().removeIf(entry -> {
             if (entry.getValue().world != world) return false;
-            CubicWorldManager.removeTicket(world, entry.getKey());
+            CubicWorldManager.removeTicket(
+                    world, CubeTicket.playerSimulationKey(entry.getKey()));
             entry.getValue().invalidate();
             return true;
         });
@@ -127,7 +130,7 @@ public final class CubeWatchManager {
         CubeBlockUpdatePayload payload = new CubeBlockUpdatePayload(
                 pos, state, CubicWorldManager.cubeRevision(world, cubePos));
         for (ServerPlayerEntity player : PlayerLookup.around(world, pos.toCenterPos(), 256.0)) {
-            if (watches(player, cubePos)
+            if (hasSent(player, cubePos)
                     && ServerPlayNetworking.canSend(player, CubeBlockUpdatePayload.ID)) {
                 ServerPlayNetworking.send(player, payload);
             }
@@ -185,7 +188,10 @@ public final class CubeWatchManager {
         for (CubePos pos : positions) {
             List<ServerPlayerEntity> recipients = new ArrayList<>();
             for (ServerPlayerEntity player : world.getPlayers()) {
-                if (watches(player, pos)
+                // A light snapshot cannot initialize a missing client cube.
+                // Sending it before the first payload only grows the client's
+                // pending-light map and causes a second render/light pass.
+                if (hasSent(player, pos)
                         && ServerPlayNetworking.canSend(player, CubeLightUpdatePayload.ID)) {
                     recipients.add(player);
                 }
@@ -208,11 +214,11 @@ public final class CubeWatchManager {
         CubePos center = CubePos.fromBlock(
                 player.getBlockX(), player.getBlockY(), player.getBlockZ());
         int horizontalRadius = player.getViewDistance();
-        boolean rebuilt = false;
+        boolean prefetchesChanged = false;
         if (state.world != world || !center.equals(state.center)
                 || state.horizontalRadius != horizontalRadius) {
             rebuildQueue(player, state, world, center, horizontalRadius);
-            rebuilt = true;
+            prefetchesChanged = true;
         }
 
         state.promoteDueRetries(world.getTime());
@@ -252,7 +258,7 @@ public final class CubeWatchManager {
                     || !isOutsideVanillaHeight(world, pos)
                     || state.sent.contains(pos)
                     || state.watches.get(pos) != watch) {
-                state.finish(watch);
+                prefetchesChanged |= state.finish(watch);
                 continue;
             }
             if (!ServerPlayNetworking.canSend(player, CubeDataPayload.ID)) {
@@ -281,9 +287,20 @@ public final class CubeWatchManager {
             // but remembering them prevents rechecking the overlapping 3D view
             // every time the player crosses a section boundary.
             state.sent.add(pos);
-            state.finish(watch);
+            prefetchesChanged |= state.finish(watch);
         }
-        return rebuilt;
+        return prefetchesChanged;
+    }
+
+    /** Re-publishes the watcher-owned read roots after a watch leaves the set. */
+    private static void refreshPrefetches(ServerWorld world) {
+        Set<CubePos> requestedReads = new HashSet<>();
+        for (WatchState state : WATCHERS.values()) {
+            if (state.world == world) {
+                requestedReads.addAll(state.activeUnsentPositions());
+            }
+        }
+        CubicWorldManager.retainPrefetches(world, requestedReads);
     }
 
     /**
@@ -325,7 +342,7 @@ public final class CubeWatchManager {
             // forever, so preserve the old error-as-empty behavior and retire
             // this watch until the player view is rebuilt.
             state.sent.add(watch.pos);
-            state.finish(watch);
+            if (state.finish(watch)) refreshPrefetches(world);
         }
     }
 
@@ -346,7 +363,8 @@ public final class CubeWatchManager {
         boolean sameWorld = state.world == world;
         if (state.world != null && state.world != world) {
             ServerWorld previousWorld = state.world;
-            CubicWorldManager.removeTicket(previousWorld, player.getUuid());
+            CubicWorldManager.removeTicket(
+                    previousWorld, CubeTicket.playerSimulationKey(player.getUuid()));
             unloadAll(player, state);
             retainWorldPrefetches(previousWorld, state);
         }
@@ -355,10 +373,14 @@ public final class CubeWatchManager {
         state.horizontalRadius = horizontalRadius;
         if (center.y() - VERTICAL_RADIUS < world.getBottomSectionCoord()
                 || center.y() + VERTICAL_RADIUS >= world.getTopSectionCoord()) {
+            int simulationDistance = Math.max(
+                    0, world.getServer().getPlayerManager().getSimulationDistance());
             CubicWorldManager.replaceTicket(world,
-                    CubeTicket.player(player.getUuid(), center, horizontalRadius, VERTICAL_RADIUS));
+                    CubeTicket.playerSimulation(
+                            player.getUuid(), center, simulationDistance, VERTICAL_RADIUS));
         } else {
-            CubicWorldManager.removeTicket(world, player.getUuid());
+            CubicWorldManager.removeTicket(
+                    world, CubeTicket.playerSimulationKey(player.getUuid()));
         }
 
         if (sameWorld && previousCenter != null) {
@@ -531,6 +553,12 @@ public final class CubeWatchManager {
         return withinView(pos, center, player.getViewDistance());
     }
 
+    private static boolean hasSent(ServerPlayerEntity player, CubePos pos) {
+        WatchState state = WATCHERS.get(player.getUuid());
+        return state != null && state.world == player.getEntityWorld()
+                && state.sent.contains(pos) && watches(player, pos);
+    }
+
     private static boolean isOutsideVanillaHeight(ServerWorld world, CubePos pos) {
         return pos.y() < world.getBottomSectionCoord() || pos.y() >= world.getTopSectionCoord();
     }
@@ -640,7 +668,22 @@ public final class CubeWatchManager {
         }
 
         private Set<CubePos> activeUnsentPositions() {
-            return Set.copyOf(watches.keySet());
+            // Pending starts are only a priority queue: no holder has been
+            // materialized for them yet.  Publishing all of those roots to
+            // CubeTaskScheduler made every send/retry rebuild the PAYLOAD
+            // dependency closure for the entire 3D view.  Retain only roots
+            // that already own a live request, plus SEND retries whose holder
+            // is still expected to produce a packet.
+            Set<CubePos> result = new HashSet<>();
+            for (Watch watch : watches.values()) {
+                if (watch.phase == WatchPhase.IN_FLIGHT
+                        || watch.phase == WatchPhase.READY_SEND
+                        || (watch.phase == WatchPhase.RETRY_WAIT
+                                && watch.retryTarget == RetryTarget.SEND)) {
+                    result.add(watch.pos);
+                }
+            }
+            return Set.copyOf(result);
         }
 
         private Watch addWatch(CubePos pos, int rank) {
@@ -739,9 +782,10 @@ public final class CubeWatchManager {
             enqueueRetry(watch);
         }
 
-        void finish(Watch watch) {
+        boolean finish(Watch watch) {
+            boolean removed = watches.remove(watch.pos, watch);
             watch.invalidate();
-            watches.remove(watch.pos, watch);
+            return removed;
         }
 
         private void invalidate() {
@@ -796,9 +840,22 @@ public final class CubeWatchManager {
         private long debtNanos;
 
         int cubeAllowance() {
-            if (debtNanos > 0L) return 0;
+            int allowance = averageAllowance();
+            // A slow commit should reduce future work, but a hard zero here
+            // starves the send side as well as the commit side.  Keep a small
+            // streaming trickle while debt is repaid so a large deep view can
+            // still make observable progress.
+            return debtNanos > 0L ? Math.max(1, allowance / 4) : allowance;
+        }
+
+        int sendAllowance() {
+            return averageAllowance();
+        }
+
+        private int averageAllowance() {
             double ratio = TARGET_NANOS / Math.max(250_000.0, averageNanos);
-            return Math.max(1, Math.min(32, (int) Math.round(CUBE_WORK_PER_WORLD_TICK * ratio)));
+            return Math.max(1, Math.min(MAX_CUBE_WORK_PER_WORLD_TICK,
+                    (int) Math.round(CUBE_WORK_PER_WORLD_TICK * ratio)));
         }
 
         long claimCommitNanos() {

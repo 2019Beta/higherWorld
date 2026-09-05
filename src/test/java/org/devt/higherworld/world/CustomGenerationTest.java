@@ -6,7 +6,9 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
+import java.util.Random;
 import org.junit.jupiter.api.Test;
+import org.devt.higherworld.storage.CubePos;
 
 /** Pure checks for the custom generation math; no Minecraft client bootstrap is required. */
 class CustomGenerationTest {
@@ -40,6 +42,80 @@ class CustomGenerationTest {
                 samples, 1, 1, 0, 2, 2, 2, 1, 1, 1), 1.0e-9);
         assertEquals(0.0, CustomCubeGenerator.interpolate(
                 samples, 0, 0, 0, 1, 1, 1, 1, 1, 1), 1.0e-9);
+    }
+
+    @Test
+    void optimizedRasterizerMatchesReferenceInterpolation() {
+        Random random = new Random(0x48494748574F524CL);
+        int[] steps = {1, 2, 4, 8, 16};
+        for (int stepX : steps) {
+            for (int stepY : steps) {
+                for (int stepZ : steps) {
+                    int cellsX = 16 / stepX;
+                    int cellsY = 16 / stepY;
+                    int cellsZ = 16 / stepZ;
+                    double[] samples = new double[
+                            (cellsX + 1) * (cellsY + 1) * (cellsZ + 1)];
+                    for (int index = 0; index < samples.length; index++) {
+                        samples[index] = random.nextDouble() * 2.0 - 1.0;
+                    }
+                    boolean[] optimized = new boolean[16 * 16 * 16];
+                    TerrainInterpolation.fillSolid(
+                            samples, stepX, stepY, stepZ,
+                            cellsX, cellsY, cellsZ, optimized);
+                    for (int y = 0; y < 16; y++) {
+                        for (int z = 0; z < 16; z++) {
+                            for (int x = 0; x < 16; x++) {
+                                boolean expected = CustomCubeGenerator.interpolate(
+                                        samples, x, y, z, stepX, stepY, stepZ,
+                                        cellsX, cellsY, cellsZ) > 0.0;
+                                int index = (y * 16 + z) * 16 + x;
+                                assertEquals(expected, optimized[index],
+                                        "spacing=" + stepX + "/" + stepY + "/" + stepZ
+                                                + " voxel=" + x + "/" + y + "/" + z);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    void optimizedCpuTerrainMatchesPointwiseReference() {
+        CustomWorldSettings settings = CustomWorldSettings.customDefaults();
+        CubePos pos = new CubePos(3, -6, -2);
+        boolean[] optimized = CustomCubeGenerator.prepareTerrainCpu(42L, pos, settings).solid();
+        int stepX = settings.noiseSampleSizeX();
+        int stepY = settings.noiseSampleSizeY();
+        int stepZ = settings.noiseSampleSizeZ();
+        int cellsX = CubePos.SIZE / stepX;
+        int cellsY = CubePos.SIZE / stepY;
+        int cellsZ = CubePos.SIZE / stepZ;
+        double[] samples = new double[(cellsX + 1) * (cellsY + 1) * (cellsZ + 1)];
+        for (int gridY = 0; gridY <= cellsY; gridY++) {
+            for (int gridZ = 0; gridZ <= cellsZ; gridZ++) {
+                for (int gridX = 0; gridX <= cellsX; gridX++) {
+                    samples[(gridY * (cellsZ + 1) + gridZ) * (cellsX + 1) + gridX] =
+                            CustomCubeGenerator.terrainDensity(
+                                    42L, settings,
+                                    pos.minBlockX() + gridX * stepX,
+                                    pos.minBlockY() + gridY * stepY,
+                                    pos.minBlockZ() + gridZ * stepZ);
+                }
+            }
+        }
+        for (int y = 0; y < CubePos.SIZE; y++) {
+            for (int z = 0; z < CubePos.SIZE; z++) {
+                for (int x = 0; x < CubePos.SIZE; x++) {
+                    boolean expected = CustomCubeGenerator.interpolate(
+                            samples, x, y, z, stepX, stepY, stepZ,
+                            cellsX, cellsY, cellsZ) > 0.0;
+                    assertEquals(expected, optimized[(y * CubePos.SIZE + z) * CubePos.SIZE + x],
+                            "voxel=" + x + "/" + y + "/" + z);
+                }
+            }
+        }
     }
 
     @Test

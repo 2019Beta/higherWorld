@@ -2,8 +2,9 @@ package org.devt.higherworld.client;
 
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.Collection;
-import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Set;
 
@@ -33,7 +34,12 @@ public final class ClientCubeCache {
      */
     private static final int LIGHT_STEPS_PER_TICK = 8_192;
     private static final long LIGHT_BUDGET_NANOS = 1_000_000L;
+    /** Packet decoding/publication is drained once per client tick, not once per packet. */
+    private static final int MAX_PENDING_UPDATES_PER_TICK = 512;
+    private static final long PENDING_UPDATE_BUDGET_NANOS = 4_000_000L;
     private static final ConcurrentMap<CubePos, CubeEntry> CUBES = new ConcurrentHashMap<>();
+    private static final ConcurrentLinkedQueue<PendingUpdate> PENDING_UPDATES =
+            new ConcurrentLinkedQueue<>();
     /**
      * A light packet can arrive in the same network tick as the first cube
      * payload. Retain the newest one until that payload installs the cube;
@@ -43,6 +49,8 @@ public final class ClientCubeCache {
     private static final ConcurrentMap<CubePos, PendingLight> PENDING_LIGHTS =
             new ConcurrentHashMap<>();
     private static final int MAX_PENDING_LIGHTS = 4_096;
+    /** Keep rendering responsive while a large payload burst is still draining. */
+    private static final int MAX_RENDER_INVALIDATIONS_PER_TICK = 192;
     /** Height of each loaded cube's 16 x 16 block columns, indexed by cube X/Z. */
     private static final ConcurrentMap<CubeColumnPos, Map<Integer, HeightIndex>> CUBE_HEIGHTS =
             new ConcurrentHashMap<>();
@@ -62,9 +70,34 @@ public final class ClientCubeCache {
      * one tick-local set so a burst of cube packets, block updates and light
      * publications rebuilds each affected section at most once.
      */
-    private static final Set<CubePos> PENDING_RENDER_CUBES = new HashSet<>();
+    private static final Set<CubePos> PENDING_RENDER_CUBES = new LinkedHashSet<>();
 
     private ClientCubeCache() {
+    }
+
+    /** Queues network work without scheduling a separate client task per cube. */
+    public static void enqueueCubeData(
+            MinecraftClient client, CubePos pos, long revision, byte[] payload) {
+        if (client != null && pos != null && payload != null) {
+            PENDING_UPDATES.offer(PendingUpdate.data(
+                    client, client.world, pos, revision, payload));
+        }
+    }
+
+    /** Queues an eventual light snapshot for the next bounded client drain. */
+    public static void enqueueLight(
+            MinecraftClient client, CubePos pos, long revision, byte[] payload) {
+        if (client != null && pos != null && payload != null) {
+            PENDING_UPDATES.offer(PendingUpdate.light(
+                    client, client.world, pos, revision, payload));
+        }
+    }
+
+    /** Queues an unload so packet bursts share one cache/render publication. */
+    public static void enqueueUnload(MinecraftClient client, CubePos pos, long revision) {
+        if (client != null && pos != null) {
+            PENDING_UPDATES.offer(PendingUpdate.unload(client, client.world, pos, revision));
+        }
     }
 
     public static void put(ClientWorld world, CubePos pos, byte[] payload) {
@@ -92,9 +125,6 @@ public final class ClientCubeCache {
             if (current != null && !CubeRevisionGate.snapshot(current.revision(), revision).accepted()) {
                 return;
             }
-            if (current != null) {
-                removeCubeHeightsLocked(pos);
-            }
             CUBES.put(pos, replacement);
             putCubeHeightsLocked(pos, replacement.heightIndex());
             PendingLight pending = PENDING_LIGHTS.remove(pos);
@@ -114,7 +144,9 @@ public final class ClientCubeCache {
         for (BlockEntity blockEntity : decoded.blockEntities()) {
             cubeBlockEntities.put(blockEntity.getPos().toImmutable(), blockEntity);
         }
-        LIGHT_ENGINE.queueCube(pos, !decoded.hasLight());
+        boolean initializeLight = !decoded.hasLight()
+                && !hasUniformLightFastPath(section, decoded.blockEntities());
+        LIGHT_ENGINE.queueCube(pos, initializeLight);
         queueRenderNeighborhood(pos);
     }
 
@@ -245,6 +277,7 @@ public final class ClientCubeCache {
 
     public static void clear() {
         synchronized (ClientCubeCache.class) {
+            PENDING_UPDATES.clear();
             CUBES.clear();
             PENDING_LIGHTS.clear();
             CUBE_HEIGHTS.clear();
@@ -254,6 +287,46 @@ public final class ClientCubeCache {
             PENDING_RENDER_CUBES.clear();
             owner = null;
         }
+    }
+
+    /** Drains cube network updates, then advances lighting and render batching. */
+    public static void tick() {
+        drainPendingUpdates();
+        propagateLighting();
+        // Keep the invalidation set alive while a packet burst spans multiple
+        // client ticks, but submit a bounded slice every tick.  Waiting for the
+        // network queue to become empty made the first visible deep terrain
+        // wait behind the entire view; the set still turns duplicate cube plus
+        // six-neighbour notifications into one submission per affected section.
+        flushRenderUpdates();
+    }
+
+    private static boolean drainPendingUpdates() {
+        MinecraftClient client = MinecraftClient.getInstance();
+        ClientWorld world = client.world;
+        if (world == null) {
+            PENDING_UPDATES.clear();
+            return false;
+        }
+
+        long deadline = System.nanoTime() + PENDING_UPDATE_BUDGET_NANOS;
+        int processed = 0;
+        while (processed < MAX_PENDING_UPDATES_PER_TICK
+                && (processed == 0 || System.nanoTime() < deadline)) {
+            PendingUpdate update = PENDING_UPDATES.poll();
+            if (update == null) break;
+            processed++;
+            // MinecraftClient is reused across connections, so client identity
+            // alone is not enough: a packet queued for the previous world must
+            // not be applied to the newly joined world during a fast reconnect.
+            if (update.client() != client || update.world() != world) continue;
+            switch (update.type()) {
+                case DATA -> put(world, update.pos(), update.revision(), update.payload());
+                case LIGHT -> updateLight(world, update.pos(), update.revision(), update.payload());
+                case UNLOAD -> unload(world, update.pos(), update.revision());
+            }
+        }
+        return !PENDING_UPDATES.isEmpty();
     }
 
     public static int loadedCubeCount() {
@@ -268,8 +341,13 @@ public final class ClientCubeCache {
      */
     public static void tickLighting() {
         if (owner == null) return;
-        LIGHT_ENGINE.propagate(LIGHT_STEPS_PER_TICK, LIGHT_BUDGET_NANOS);
+        propagateLighting();
         flushRenderUpdates();
+    }
+
+    private static void propagateLighting() {
+        if (owner == null) return;
+        LIGHT_ENGINE.propagate(LIGHT_STEPS_PER_TICK, LIGHT_BUDGET_NANOS);
     }
 
     public static ChunkSection getSection(ClientWorld world, int sectionX, int sectionY, int sectionZ) {
@@ -354,11 +432,15 @@ public final class ClientCubeCache {
         if (PENDING_RENDER_CUBES.isEmpty()) return;
         MinecraftClient client = MinecraftClient.getInstance();
         if (client.worldRenderer == null) return;
-        for (CubePos pos : PENDING_RENDER_CUBES) {
+        int scheduled = 0;
+        var iterator = PENDING_RENDER_CUBES.iterator();
+        while (iterator.hasNext() && scheduled < MAX_RENDER_INVALIDATIONS_PER_TICK) {
+            CubePos pos = iterator.next();
+            iterator.remove();
             client.worldRenderer.scheduleChunkRender(pos.x(), pos.y(), pos.z());
+            scheduled++;
         }
-        PENDING_RENDER_CUBES.clear();
-        client.worldRenderer.scheduleTerrainUpdate();
+        if (scheduled > 0) client.worldRenderer.scheduleTerrainUpdate();
     }
 
     private static void removeBlockEntities(CubePos pos) {
@@ -398,6 +480,7 @@ public final class ClientCubeCache {
     private static HeightIndex computeCubeHeights(CubePos pos, ChunkSection section) {
         int[] tops = new int[CubePos.SIZE * CubePos.SIZE];
         boolean[] present = new boolean[tops.length];
+        if (section.isEmpty()) return new HeightIndex(tops, present);
         int baseY = pos.minBlockY();
         for (int localZ = 0; localZ < CubePos.SIZE; localZ++) {
             for (int localX = 0; localX < CubePos.SIZE; localX++) {
@@ -416,46 +499,60 @@ public final class ClientCubeCache {
 
     private static void putCubeHeightsLocked(CubePos pos, HeightIndex heights) {
         CubeColumnPos column = new CubeColumnPos(pos.x(), pos.z());
-        CUBE_HEIGHTS.computeIfAbsent(column, ignored -> new java.util.HashMap<>())
-                .put(pos.y(), heights);
-        rebuildHighestBlocksLocked(pos, CUBE_HEIGHTS.get(column));
+        Map<Integer, HeightIndex> columnHeights = CUBE_HEIGHTS.computeIfAbsent(
+                column, ignored -> new java.util.HashMap<>());
+        HeightIndex previous = columnHeights.put(pos.y(), heights);
+        int baseX = pos.minBlockX();
+        int baseZ = pos.minBlockZ();
+        for (int index = 0; index < heights.tops().length; index++) {
+            BlockColumnPos blockColumn = new BlockColumnPos(baseX + (index & 15), baseZ + (index >> 4));
+            Integer highest = HIGHEST_BLOCKS.get(blockColumn);
+            if (heights.present()[index]
+                    && (highest == null || heights.tops()[index] >= highest)) {
+                HIGHEST_BLOCKS.put(blockColumn, heights.tops()[index]);
+            } else if (previous != null && previous.present()[index]
+                    && highest != null && previous.tops()[index] == highest) {
+                // Only rescan when the previous maximum was actually lowered.
+                rebuildHighestBlockLocked(blockColumn, index, columnHeights);
+            }
+        }
     }
 
     private static void removeCubeHeightsLocked(CubePos pos) {
         CubeColumnPos column = new CubeColumnPos(pos.x(), pos.z());
         Map<Integer, HeightIndex> heights = CUBE_HEIGHTS.get(column);
         if (heights == null) return;
-        heights.remove(pos.y());
+        HeightIndex removed = heights.remove(pos.y());
+        if (removed == null) return;
         if (heights.isEmpty()) {
             CUBE_HEIGHTS.remove(column, heights);
         }
-        rebuildHighestBlocksLocked(pos, heights);
-    }
-
-    private static void rebuildHighestBlocksLocked(CubePos pos, Map<Integer, HeightIndex> heights) {
         int baseX = pos.minBlockX();
         int baseZ = pos.minBlockZ();
-        for (int localZ = 0; localZ < CubePos.SIZE; localZ++) {
-            for (int localX = 0; localX < CubePos.SIZE; localX++) {
-                int index = localX | localZ << 4;
-                boolean found = false;
-                int highest = Integer.MIN_VALUE;
-                if (heights != null) {
-                    for (HeightIndex cube : heights.values()) {
-                        if (cube.present()[index]
-                                && (!found || cube.tops()[index] > highest)) {
-                            highest = cube.tops()[index];
-                            found = true;
-                        }
-                    }
-                }
-                BlockColumnPos column = new BlockColumnPos(baseX + localX, baseZ + localZ);
-                if (found) {
-                    HIGHEST_BLOCKS.put(column, highest);
-                } else {
-                    HIGHEST_BLOCKS.remove(column);
-                }
+        for (int index = 0; index < removed.tops().length; index++) {
+            if (!removed.present()[index]) continue;
+            BlockColumnPos blockColumn = new BlockColumnPos(baseX + (index & 15), baseZ + (index >> 4));
+            Integer highest = HIGHEST_BLOCKS.get(blockColumn);
+            if (highest != null && removed.tops()[index] == highest) {
+                rebuildHighestBlockLocked(blockColumn, index, heights);
             }
+        }
+    }
+
+    private static void rebuildHighestBlockLocked(
+            BlockColumnPos column, int index, Map<Integer, HeightIndex> heights) {
+        boolean found = false;
+        int highest = Integer.MIN_VALUE;
+        for (HeightIndex cube : heights.values()) {
+            if (cube.present()[index] && (!found || cube.tops()[index] > highest)) {
+                highest = cube.tops()[index];
+                found = true;
+            }
+        }
+        if (found) {
+            HIGHEST_BLOCKS.put(column, highest);
+        } else {
+            HIGHEST_BLOCKS.remove(column);
         }
     }
 
@@ -527,6 +624,59 @@ public final class ClientCubeCache {
     private record CubeColumnPos(int x, int z) {}
 
     private record BlockColumnPos(int x, int z) {}
+
+    private record PendingUpdate(
+            PendingUpdateType type, MinecraftClient client, ClientWorld world, CubePos pos,
+            long revision, byte[] payload) {
+        private static PendingUpdate data(
+                MinecraftClient client, ClientWorld world,
+                CubePos pos, long revision, byte[] payload) {
+            return new PendingUpdate(
+                    PendingUpdateType.DATA, client, world, pos, revision, payload);
+        }
+
+        private static PendingUpdate light(
+                MinecraftClient client, ClientWorld world,
+                CubePos pos, long revision, byte[] payload) {
+            return new PendingUpdate(
+                    PendingUpdateType.LIGHT, client, world, pos, revision, payload);
+        }
+
+        private static PendingUpdate unload(
+                MinecraftClient client, ClientWorld world, CubePos pos, long revision) {
+            return new PendingUpdate(
+                    PendingUpdateType.UNLOAD, client, world, pos, revision, null);
+        }
+    }
+
+    /**
+     * A uniform empty or opaque cube has no interior light discontinuity to
+     * discover. Boundary seeding is enough and avoids 4096 initial nodes for
+     * the deep solid/air runs that dominate a downward stream.
+     */
+    private static boolean hasUniformLightFastPath(
+            ChunkSection section, Collection<BlockEntity> blockEntities) {
+        if (!blockEntities.isEmpty()) return false;
+        BlockState reference = section.getBlockState(0, 0, 0);
+        if (!reference.isAir()
+                && (reference.getOpacity() < 15 || reference.getLuminance() != 0)) {
+            return false;
+        }
+        for (int localY = 0; localY < CubePos.SIZE; localY++) {
+            for (int localZ = 0; localZ < CubePos.SIZE; localZ++) {
+                for (int localX = 0; localX < CubePos.SIZE; localX++) {
+                    if (!section.getBlockState(localX, localY, localZ).equals(reference)) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    private enum PendingUpdateType {
+        DATA, LIGHT, UNLOAD
+    }
 
     private static final class ClientLightAccess implements SparseCubeLightEngine.Access {
         @Override

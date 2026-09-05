@@ -604,7 +604,7 @@ final class CubicWorldState implements AutoCloseable {
         // encoding every loaded cube and then waiting for fsync in one tick.
         for (LoadedCube cube : loadedCubes()) {
             LoadContext context = loadContexts.get(cube.pos());
-            if (cube.isDirty() && (context == null || context.full)) {
+            if (cube.isDirty() && (context == null || context.full || context.persistable)) {
                 save(cube, false, false);
                 return;
             }
@@ -819,6 +819,13 @@ final class CubicWorldState implements AutoCloseable {
     private LoadedCube ensureStage(
             CubePos pos, CubeStatus target, int priority, Optional<byte[]> knownPayload)
             throws IOException {
+        return ensureStage(pos, target, priority, knownPayload, true);
+    }
+
+    private LoadedCube ensureStage(
+            CubePos pos, CubeStatus target, int priority, Optional<byte[]> knownPayload,
+            boolean ticketRoot)
+            throws IOException {
         GenerationReadContext generation = generationReadContexts.get();
         if (generation != null) {
             LoadedCube readable = generation.readableCube(pos);
@@ -826,7 +833,9 @@ final class CubicWorldState implements AutoCloseable {
             throw new IllegalStateException(
                     "Cube stage requested during generation: " + target + " for " + pos);
         }
-        CubeHolder holder = taskScheduler.request(pos, target, priority);
+        CubeHolder holder = ticketRoot
+                ? taskScheduler.request(pos, target, priority)
+                : taskScheduler.requestDependency(pos, target, priority);
         Optional<byte[]> payload = knownPayload == null ? joinIo(pos, holder) : knownPayload;
         LoadContext context = context(holder, payload);
         if (target.isAtLeast(CubeStatus.TERRAIN) && !holder.status().isAtLeast(CubeStatus.TERRAIN)) {
@@ -835,7 +844,7 @@ final class CubicWorldState implements AutoCloseable {
         if (target.isAtLeast(CubeStatus.FEATURES) && !holder.status().isAtLeast(CubeStatus.FEATURES)) {
             CubeStatus.FEATURES.dependencyRadius().forEach(pos, dependency -> {
                 try {
-                    ensureStage(dependency, CubeStatus.TERRAIN, priority + 1, null);
+                    ensureStage(dependency, CubeStatus.TERRAIN, priority + 1, null, false);
                 } catch (IOException exception) {
                     throw new CompletionException(exception);
                 }
@@ -843,7 +852,7 @@ final class CubicWorldState implements AutoCloseable {
             if (context.payload == null && !customWorld && shouldGenerate(pos)) {
                 for (CubePos dependency : VanillaPlacedFeatureGenerator.terrainBatchPositions(
                         world, pos)) {
-                    ensureStage(dependency, CubeStatus.TERRAIN, priority + 1, null);
+                    ensureStage(dependency, CubeStatus.TERRAIN, priority + 1, null, false);
                 }
             }
             commitFeatures(holder, context);
@@ -855,7 +864,7 @@ final class CubicWorldState implements AutoCloseable {
         if (target.isAtLeast(CubeStatus.LIGHT) && !holder.status().isAtLeast(CubeStatus.LIGHT)) {
             CubeStatus.LIGHT.dependencyRadius().forEach(pos, dependency -> {
                 try {
-                    ensureStage(dependency, CubeStatus.FEATURES, priority + 1, null);
+                    ensureStage(dependency, CubeStatus.FEATURES, priority + 1, null, false);
                 } catch (IOException exception) {
                     throw new CompletionException(exception);
                 }
@@ -914,6 +923,11 @@ final class CubicWorldState implements AutoCloseable {
     private void markCubeFull(LoadContext context) {
         if (context.full) return;
         context.full = true;
+        // A PAYLOAD response may have been cached with HWC6/hasLight=false.
+        // FULL is a lifecycle transition rather than a block mutation, so it
+        // is not guaranteed to change LoadedCube.revision(); invalidate the
+        // serialization cache explicitly before a full response/save.
+        invalidatePayload(context.cube.pos());
         try {
             simulationServices.indexFullCube(context.cube);
         } catch (RuntimeException exception) {
@@ -981,7 +995,7 @@ final class CubicWorldState implements AutoCloseable {
                         context.cube.light().load(decoded.light());
                         context.hasSavedLight = true;
                     }
-                    // HWC5 stores absolute trigger times and a stable
+                    // HWC5/HWC6 stores absolute trigger times and a stable
                     // sub-tick order. Restore before any lifecycle stage can
                     // execute callbacks; deduplication keeps a live queue
                     // intact across an unload/reload race.
@@ -1066,6 +1080,12 @@ final class CubicWorldState implements AutoCloseable {
         context.committing = true;
         try (GenerationReadScope readScope = beginGenerationRead(context.cube)) {
             if (context.payload == null && shouldGenerate(holder.pos())) {
+                // A streamed PAYLOAD cube is intentionally not promoted to
+                // FULL, but it is still real generated world state.  Mark it
+                // persistable before the feature pass so eviction and close()
+                // cannot discard the expensive deep terrain just because the
+                // watcher stopped at PAYLOAD.
+                context.persistable = true;
                 try (CubeSpatialLock.Scope ignored = generationLocks.lock(
                         holder.pos(), CubeStatus.FEATURES.dependencyRadius())) {
                     if (customWorld) {
@@ -1225,18 +1245,21 @@ final class CubicWorldState implements AutoCloseable {
      */
     private byte[] encodePayload(LoadedCube cube) throws IOException {
         long revision = cube.revision();
+        LoadContext context = loadContexts.get(cube.pos());
+        boolean includeLight = context == null || context.full || context.hasSavedLight;
         synchronized (payloadCache) {
             EncodedPayload cached = payloadCache.get(cube.pos());
-            if (cached != null && cached.cube() == cube && cached.revision() == revision) {
+            if (cached != null && cached.cube() == cube && cached.revision() == revision
+                    && cached.lightIncluded() == includeLight) {
                 return cached.payload();
             }
         }
 
-        byte[] encoded = CubeRecordCodec.encode(cube, world);
+        byte[] encoded = CubeRecordCodec.encode(cube, world, includeLight);
         if (encoded.length > MAX_CACHED_PAYLOAD_BYTES) return encoded;
         synchronized (payloadCache) {
             EncodedPayload previous = payloadCache.put(
-                    cube.pos(), new EncodedPayload(cube, revision, encoded));
+                    cube.pos(), new EncodedPayload(cube, revision, includeLight, encoded));
             if (previous != null) cachedPayloadBytes -= previous.payload().length;
             cachedPayloadBytes += encoded.length;
             while (cachedPayloadBytes > MAX_CACHED_PAYLOAD_BYTES && !payloadCache.isEmpty()) {
@@ -1275,7 +1298,7 @@ final class CubicWorldState implements AutoCloseable {
 
     private void save(LoadedCube cube, boolean force, boolean wait) throws IOException {
         LoadContext context = loadContexts.get(cube.pos());
-        if (context != null && !context.full) return;
+        if (context != null && !context.full && !context.persistable) return;
         boolean wasDirty = cube.takeDirty();
         if (!force && !wasDirty) {
             return;
@@ -1359,7 +1382,8 @@ final class CubicWorldState implements AutoCloseable {
     private record BlockColumnPos(int x, int z) {
     }
 
-    private record EncodedPayload(LoadedCube cube, long revision, byte[] payload) {
+    private record EncodedPayload(
+            LoadedCube cube, long revision, boolean lightIncluded, byte[] payload) {
     }
 
     private static final class LoadContext {
@@ -1370,6 +1394,7 @@ final class CubicWorldState implements AutoCloseable {
         private boolean lightQueued;
         private boolean committing;
         private boolean full;
+        private boolean persistable;
 
         private LoadContext(LoadedCube cube, byte[] payload, long epoch) {
             this.cube = cube;

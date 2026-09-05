@@ -52,6 +52,22 @@ final class CustomNoise {
         return value * 0.2 * 17.0 / 64.0;
     }
 
+    /**
+     * Returns the 2-D base-height term used by the custom terrain equation.
+     * It is separated from {@link #octaveGradient(long, double, double,
+     * double, double, double, double, int)} so a vertical sample column can
+     * reuse it for every Y sample.
+     */
+    static double baseHeight(long seed, double x, double z, double scale) {
+        return octaveGradient2D(seed, x, z, scale, scale, 2);
+    }
+
+    /** Returns the 2-D volatility field before the height-dependent modifier. */
+    static double volatilityBase(long seed, double x, double z, double scale) {
+        return clamp(0.5 + 0.5 * octaveGradient2D(
+                seed, x, z, scale, scale, 2), 0.0, 1.0);
+    }
+
     static double clamp(double value, double min, double max) {
         return Math.max(min, Math.min(max, value));
     }

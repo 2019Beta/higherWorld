@@ -1,9 +1,10 @@
 #pragma OPENCL EXTENSION cl_khr_fp64 : enable
 #pragma OPENCL FP_CONTRACT OFF
 
-// This kernel mirrors org.devt.higherworld.world.CustomNoise and the pure
-// terrainDensity overload.  It evaluates the sparse sample grid only; Java
-// keeps the existing interpolation and cube materialization path.
+// The first kernel mirrors org.devt.higherworld.world.CustomNoise and the pure
+// terrainDensity overload. The second kernel is a generator-neutral density
+// rasterizer, so vanilla and modded density functions can share the same GPU
+// voxel stage without moving Minecraft objects across the JNI boundary.
 
 inline ulong higherworld_mix(ulong value) {
     value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9UL;
@@ -100,8 +101,26 @@ inline double higherworld_depth_noise(
     return value * 0.2 * 17.0 / 64.0;
 }
 
-inline double higherworld_terrain_density(
-        ulong seed, __global const double *p, double x, double y, double z) {
+inline double higherworld_base_height(
+        ulong seed, __global const double *p, double x, double z) {
+    return higherworld_octave_gradient(
+            seed ^ 0x424153455F4844UL, x, 0.0, z, p[23], 0.0, p[23], 2);
+}
+
+inline double higherworld_volatility_base(
+        ulong seed, __global const double *p, double x, double z) {
+    return clamp(0.5 + 0.5 * higherworld_octave_gradient(
+            seed ^ 0x564F4C4154494CUL, x, 0.0, z, p[24], 0.0, p[24], 2), 0.0, 1.0);
+}
+
+inline double higherworld_depth_surface(
+        ulong seed, __global const double *p, double x, double z) {
+    return higherworld_depth_noise(seed ^ 0x5445525241494EUL, x, z, p);
+}
+
+inline double higherworld_terrain_density_with_surface(
+        ulong seed, __global const double *p, double x, double y, double z,
+        double depthNoise, double base, double volatilityBase) {
     double selector = higherworld_octave_gradient(
             seed ^ 0x53454C454354UL, x, y, z, p[7], p[8], p[9], (int)p[10]);
     selector = clamp(selector * p[5] + p[6], 0.0, 1.0);
@@ -111,24 +130,49 @@ inline double higherworld_terrain_density(
     double high = higherworld_octave_gradient(
             seed ^ 0x484947485F4E4FUL, x, y, z,
             p[19], p[20], p[21], (int)p[22]) * p[17] + p[18];
-    double terrainNoise = low + (high - low) * selector
-            + higherworld_depth_noise(seed ^ 0x5445525241494EUL, x, z, p);
-
-    int biomeSize = max(0, min(1022, (int)p[23]));
-    int riverSize = max(0, min(1022, (int)p[24]));
-    double scaleBase = pow(2.0, -(double)biomeSize);
-    double scaleRiver = pow(2.0, -(double)riverSize);
-    double base = higherworld_octave_gradient(
-            seed ^ 0x424153455F4844UL, x, 0.0, z,
-            scaleBase, 0.0, scaleBase, 2);
-    double volatilityBase = clamp(0.5 + 0.5 * higherworld_octave_gradient(
-            seed ^ 0x564F4C4154494CUL, x, 0.0, z,
-            scaleRiver, 0.0, scaleRiver, 2), 0.0, 1.0);
+    double terrainNoise = low + (high - low) * selector + depthNoise;
     double height = base * p[28] + p[29];
     if (height > y) volatilityBase *= p[26];
     double volatility = volatilityBase * p[25] + p[27];
     double sign = volatility > 0.0 ? 1.0 : (volatility < 0.0 ? -1.0 : 0.0);
     return terrainNoise * volatility + height - y * sign;
+}
+
+inline double higherworld_terrain_density(
+        ulong seed, __global const double *p, double x, double y, double z) {
+    return higherworld_terrain_density_with_surface(
+            seed, p, x, y, z,
+            higherworld_depth_surface(seed, p, x, z),
+            higherworld_base_height(seed, p, x, z),
+            higherworld_volatility_base(seed, p, x, z));
+}
+
+// This kernel calculates the X/Z-only terms once per column for a whole batch.
+// The sample kernel below then reuses them for every Y sample, matching the CPU
+// path and avoiding three octave-gradient evaluations per vertical sample.
+__kernel void higherworld_custom_surface_batch(
+        __global const double *parameters,
+        long seed,
+        __global const int *origins,
+        int batchCount,
+        int surfaceCount,
+        int stepX, int stepZ,
+        int cellsX, int cellsZ,
+        __global double *output) {
+    int index = (int)get_global_id(0);
+    int batch = index / surfaceCount;
+    if (batch >= batchCount) return;
+    int localIndex = index - batch * surfaceCount;
+    int width = cellsX + 1;
+    int gridX = localIndex % width;
+    int gridZ = localIndex / width;
+    int origin = batch * 3;
+    double x = (double)(origins[origin] + gridX * stepX);
+    double z = (double)(origins[origin + 2] + gridZ * stepZ);
+    int outputIndex = index * 3;
+    output[outputIndex] = higherworld_depth_surface((ulong)seed, parameters, x, z);
+    output[outputIndex + 1] = higherworld_base_height((ulong)seed, parameters, x, z);
+    output[outputIndex + 2] = higherworld_volatility_base((ulong)seed, parameters, x, z);
 }
 
 __kernel void higherworld_custom_terrain(
@@ -150,4 +194,134 @@ __kernel void higherworld_custom_terrain(
             (double)(originX + gridX * stepX),
             (double)(originY + gridY * stepY),
             (double)(originZ + gridZ * stepZ));
+}
+
+// The scheduler submits several independent sparse cubes together.  Keeping
+// their origins in one small buffer lets the device amortize JNI calls,
+// command-queue synchronization, and the sample/raster readback over a
+// whole view slice instead of paying that cost once per cube.
+__kernel void higherworld_custom_terrain_batch(
+        __global const double *parameters,
+        long seed,
+        __global const int *origins,
+        int batchCount,
+        int sampleCount,
+        int surfaceCount,
+        int stepX, int stepY, int stepZ,
+        int cellsX, int cellsY, int cellsZ,
+        __global const double *surface,
+        __global double *output) {
+    int index = (int)get_global_id(0);
+    int batch = index / sampleCount;
+    if (batch >= batchCount) return;
+    int localIndex = index - batch * sampleCount;
+    int width = cellsX + 1;
+    int depth = cellsZ + 1;
+    int gridX = localIndex % width;
+    int remainder = localIndex / width;
+    int gridZ = remainder % depth;
+    int gridY = remainder / depth;
+    int origin = batch * 3;
+    int surfaceIndex = batch * surfaceCount * 3 + (gridZ * width + gridX) * 3;
+    output[index] = higherworld_terrain_density_with_surface(
+            (ulong)seed, parameters,
+            (double)(origins[origin] + gridX * stepX),
+            (double)(origins[origin + 1] + gridY * stepY),
+            (double)(origins[origin + 2] + gridZ * stepZ),
+            surface[surfaceIndex], surface[surfaceIndex + 1],
+            surface[surfaceIndex + 2]);
+}
+
+inline int higherworld_density_index(int x, int y, int z, int cellsX, int cellsZ) {
+    return (y * (cellsZ + 1) + z) * (cellsX + 1) + x;
+}
+
+inline double higherworld_vanilla_delta(int coordinate) {
+    // Matches the legacy interpolated noise weights used by the deep-world
+    // fallback. The linear path remains the default for custom settings.
+    switch (coordinate & 3) {
+        case 0: return 0.0;
+        case 1: return 0.15625;
+        case 2: return 0.5;
+        default: return 0.84375;
+    }
+}
+
+inline double higherworld_density_weight(int coordinate, int grid, int step, int mode) {
+    int localCoordinate = coordinate - grid * step;
+    return mode == 1 && step == 4
+            ? higherworld_vanilla_delta(localCoordinate)
+            : (double)localCoordinate / (double)step;
+}
+
+inline double higherworld_interpolated_density(
+        __global const double *samples,
+        int x, int y, int z,
+        int stepX, int stepY, int stepZ,
+        int cellsX, int cellsY, int cellsZ,
+        int mode) {
+    int gridX = min(cellsX - 1, x / stepX);
+    int gridY = min(cellsY - 1, y / stepY);
+    int gridZ = min(cellsZ - 1, z / stepZ);
+    double tx = higherworld_density_weight(x, gridX, stepX, mode);
+    double ty = higherworld_density_weight(y, gridY, stepY, mode);
+    double tz = higherworld_density_weight(z, gridZ, stepZ, mode);
+
+    int x00 = higherworld_density_index(gridX, gridY, gridZ, cellsX, cellsZ);
+    int x10 = higherworld_density_index(gridX, gridY + 1, gridZ, cellsX, cellsZ);
+    int x01 = higherworld_density_index(gridX, gridY, gridZ + 1, cellsX, cellsZ);
+    int x11 = higherworld_density_index(gridX, gridY + 1, gridZ + 1, cellsX, cellsZ);
+    double first = higherworld_lerp(
+            samples[x00], samples[x00 + 1], tx);
+    double second = higherworld_lerp(
+            samples[x10], samples[x10 + 1], tx);
+    double third = higherworld_lerp(
+            samples[x01], samples[x01 + 1], tx);
+    double fourth = higherworld_lerp(
+            samples[x11], samples[x11 + 1], tx);
+    return higherworld_lerp(
+            higherworld_lerp(first, second, ty),
+            higherworld_lerp(third, fourth, ty), tz);
+}
+
+// Converts a density grid into the compact 4096-voxel mask consumed by the
+// server-thread commit. Keeping this separate from the sampler lets vanilla,
+// custom, and modded density functions share the same GPU raster stage.
+__kernel void higherworld_rasterize_solid(
+        __global const double *samples,
+        int stepX, int stepY, int stepZ,
+        int cellsX, int cellsY, int cellsZ,
+        int interpolationMode,
+        __global uchar *solid) {
+    int index = (int)get_global_id(0);
+    int x = index & 15;
+    int remainder = index >> 4;
+    int z = remainder & 15;
+    int y = remainder >> 4;
+    double density = higherworld_interpolated_density(
+            samples, x, y, z, stepX, stepY, stepZ,
+            cellsX, cellsY, cellsZ, interpolationMode);
+    solid[index] = density > 0.0 ? (uchar)1 : (uchar)0;
+}
+
+__kernel void higherworld_rasterize_solid_batch(
+        __global const double *samples,
+        int batchCount,
+        int sampleCount,
+        int stepX, int stepY, int stepZ,
+        int cellsX, int cellsY, int cellsZ,
+        int interpolationMode,
+        __global uchar *solid) {
+    int index = (int)get_global_id(0);
+    int batch = index >> 12;
+    if (batch >= batchCount) return;
+    int localIndex = index & 4095;
+    int x = localIndex & 15;
+    int remainder = localIndex >> 4;
+    int z = remainder & 15;
+    int y = remainder >> 4;
+    double density = higherworld_interpolated_density(
+            samples + batch * sampleCount, x, y, z,
+            stepX, stepY, stepZ, cellsX, cellsY, cellsZ, interpolationMode);
+    solid[index] = density > 0.0 ? (uchar)1 : (uchar)0;
 }

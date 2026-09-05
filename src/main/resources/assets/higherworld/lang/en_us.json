@@ -1,4 +1,8 @@
 {
+  "debug.higherworld.terrain_generator": "Terrain generator: %s",
+  "debug.higherworld.terrain_generator.opencl": "OpenCL/GPU (%s)",
+  "debug.higherworld.terrain_generator.cpu": "CPU (%s)",
+  "debug.higherworld.terrain_generator.unknown": "unknown (waiting for server)",
   "generator.higherworld.infinite_downward": "Infinite Downward",
   "generator.higherworld.custom": "Custom World",
   "screen.higherworld.custom.title": "Custom World",

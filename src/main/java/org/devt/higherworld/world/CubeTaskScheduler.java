@@ -6,15 +6,18 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.PriorityBlockingQueue;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import net.minecraft.server.world.ServerWorld;
+import org.devt.higherworld.gpu.GpuTerrainAccelerator;
 import org.devt.higherworld.storage.CubeIoScheduler;
 import org.devt.higherworld.storage.CubePos;
 
@@ -39,6 +42,20 @@ final class CubeTaskScheduler implements AutoCloseable {
      */
     private volatile Set<CubePos> prefetchPositions = Set.of();
     private final ThreadPoolExecutor generationExecutor;
+    /** Collects independent custom cubes so OpenCL sees a useful work batch. */
+    private final CustomTerrainBatcher customTerrainBatcher = new CustomTerrainBatcher();
+    /** Collects deep vanilla cubes so the shared OpenCL raster stage is useful. */
+    private final VanillaTerrainBatcher vanillaTerrainBatcher = new VanillaTerrainBatcher();
+    /**
+     * Terrain-only reads requested by a vanilla placed-feature batch.  These
+     * reads are outside the normal 3x3x3 FEATURES graph, so keep them alive
+     * until their owning FEATURES/PAYLOAD/FULL node leaves the active closure.
+     * Without this retention, refreshTargets() cancelled them after the first
+     * poll and every retry regenerated the same deep dependency set.
+     */
+    private final Map<CubePos, List<CubePos>> featureTerrainDependencies = new HashMap<>();
+    /** Owners whose wider feature terrain read set has already become ready. */
+    private final Set<CubePos> featureTerrainReady = new HashSet<>();
     private final AtomicLong sequence = new AtomicLong();
     private final PriorityBlockingQueue<ReadyEntry> readyQueue =
             new PriorityBlockingQueue<>(256, CubeTaskScheduler::compareReadyEntries);
@@ -58,6 +75,22 @@ final class CubeTaskScheduler implements AutoCloseable {
     }
 
     CubeHolder request(CubePos pos, CubeStatus target, int priority) {
+        // Resolve a ticket only for the explicit/root request.  requestGraph()
+        // recursively walks the dependency DAG; applying the ticket target to
+        // every child would turn all PAYLOAD prefetches inside the simulation
+        // window into FULL requests and repeatedly expand the lighting graph.
+        CubeStatus ticketTarget = tickets.targetStatus(pos);
+        if (ticketTarget.ordinal() > target.ordinal()) target = ticketTarget;
+        return requestGraph(pos, target, priority, new HashSet<>());
+    }
+
+    /**
+     * Requests a prerequisite from an already selected root.  Ticket promotion
+     * belongs to root ownership; applying it to a FEATURES/LIGHT neighbour or
+     * a feature batch read would turn a cheap prerequisite into another FULL
+     * root and recreate the deep-view explosion this scheduler is avoiding.
+     */
+    CubeHolder requestDependency(CubePos pos, CubeStatus target, int priority) {
         return requestGraph(pos, target, priority, new HashSet<>());
     }
 
@@ -193,7 +226,7 @@ final class CubeTaskScheduler implements AutoCloseable {
         CubeStatus neighbour = stage.neighbourPrerequisite();
         if (neighbour != null) {
             stage.dependencyRadius().forEach(holder.pos(), dependency -> {
-                CubeHolder dependencyHolder = request(dependency, neighbour, priority + 1);
+                    CubeHolder dependencyHolder = requestDependency(dependency, neighbour, priority + 1);
                 dependencies.add(dependencyHolder.localStageFuture(neighbour));
             });
         }
@@ -219,7 +252,7 @@ final class CubeTaskScheduler implements AutoCloseable {
                     // for holders adopted by tests or other direct callers.
                     CubeHolder dependencyHolder = holders.get(dependency);
                     if (dependencyHolder == null) {
-                        dependencyHolder = request(dependency, neighbour, priority + 1);
+                        dependencyHolder = requestDependency(dependency, neighbour, priority + 1);
                     }
                     if (dependencyHolder.failed()
                             || !dependencyHolder.status().isAtLeast(neighbour)) {
@@ -238,15 +271,20 @@ final class CubeTaskScheduler implements AutoCloseable {
      * must never recursively start another feature pass.
      */
     boolean featureBatchTerrainReady(ServerWorld world, CubeHolder holder, int priority) {
+        if (featureTerrainReady.contains(holder.pos())) return true;
         boolean ready = true;
-        for (CubePos dependency : VanillaPlacedFeatureGenerator.terrainBatchPositions(
-                world, holder.pos())) {
-            CubeHolder dependencyHolder = request(dependency, CubeStatus.TERRAIN, priority + 1);
+        List<CubePos> dependencies = featureTerrainDependencies.computeIfAbsent(
+                holder.pos(), ignored -> VanillaPlacedFeatureGenerator.terrainBatchPositions(
+                        world, holder.pos()));
+        for (CubePos dependency : dependencies) {
+            CubeHolder dependencyHolder = requestDependency(
+                    dependency, CubeStatus.TERRAIN, priority + 1);
             if (dependencyHolder.failed()
                     || !dependencyHolder.status().isAtLeast(CubeStatus.TERRAIN)) {
                 ready = false;
             }
         }
+        if (ready) featureTerrainReady.add(holder.pos());
         return ready;
     }
 
@@ -276,27 +314,38 @@ final class CubeTaskScheduler implements AutoCloseable {
             CubeHolder holder, long seed, CustomWorldSettings settings, int priority) {
         return holder.startTerrain(() -> dependenciesFuture(holder, CubeStatus.TERRAIN, priority)
                 .thenCompose(ignored -> {
-                    CompletableFuture<CubeTerrainSnapshot> result = new CompletableFuture<>();
                     long epoch = holder.epoch();
-                    try {
-                        generationExecutor.execute(new GenerationTask(priority, sequence.getAndIncrement(), () -> {
-                            if (!holder.isCurrent(epoch) || !holder.target().isAtLeast(CubeStatus.TERRAIN)) {
-                                result.cancel(false);
-                                return;
-                            }
-                            try {
-                                result.complete(CustomCubeGenerator.prepareTerrain(seed, holder.pos(), settings));
-                            } catch (Throwable throwable) {
-                                result.completeExceptionally(throwable);
-                                holder.fail(epoch, throwable);
-                            }
-                        }));
-                    } catch (RuntimeException exception) {
-                        result.completeExceptionally(exception);
-                        holder.fail(epoch, exception);
+                    if (GpuTerrainAccelerator.isEnabled()) {
+                        return customTerrainBatcher.submit(
+                                holder, epoch, seed, settings, priority);
                     }
-                    return result;
+                    return submitCpuTerrain(holder, epoch, seed, settings, priority);
                 }));
+    }
+
+    private CompletableFuture<CubeTerrainSnapshot> submitCpuTerrain(
+            CubeHolder holder, long epoch, long seed,
+            CustomWorldSettings settings, int priority) {
+        CompletableFuture<CubeTerrainSnapshot> result = new CompletableFuture<>();
+        try {
+            generationExecutor.execute(new GenerationTask(priority, sequence.getAndIncrement(), () -> {
+                if (!holder.isCurrent(epoch) || !holder.target().isAtLeast(CubeStatus.TERRAIN)) {
+                    result.cancel(false);
+                    return;
+                }
+                try {
+                    result.complete(CustomCubeGenerator.prepareTerrainCpu(
+                            seed, holder.pos(), settings));
+                } catch (Throwable throwable) {
+                    result.completeExceptionally(throwable);
+                    holder.fail(epoch, throwable);
+                }
+            }));
+        } catch (RuntimeException exception) {
+            result.completeExceptionally(exception);
+            holder.fail(epoch, exception);
+        }
+        return result;
     }
 
     /**
@@ -313,29 +362,38 @@ final class CubeTaskScheduler implements AutoCloseable {
         if (request == null) return null;
         return holder.startTerrain(() -> dependenciesFuture(holder, CubeStatus.TERRAIN, priority)
                 .thenCompose(ignored -> {
-                    CompletableFuture<CubeTerrainSnapshot> result = new CompletableFuture<>();
                     long epoch = holder.epoch();
-                    try {
-                        generationExecutor.execute(new GenerationTask(
-                                priority, sequence.getAndIncrement(), () -> {
-                                    if (!holder.isCurrent(epoch)
-                                            || !holder.target().isAtLeast(CubeStatus.TERRAIN)) {
-                                        result.cancel(false);
-                                        return;
-                                    }
-                                    try {
-                                        result.complete(VanillaCubeTerrainGenerator.prepareTerrain(request));
-                                    } catch (Throwable throwable) {
-                                        result.completeExceptionally(throwable);
-                                        holder.fail(epoch, throwable);
-                                    }
-                                }));
-                    } catch (RuntimeException exception) {
-                        result.completeExceptionally(exception);
-                        holder.fail(epoch, exception);
+                    if (request.gpuEligible() && GpuTerrainAccelerator.isEnabled()) {
+                        return vanillaTerrainBatcher.submit(holder, epoch, request, priority);
                     }
-                    return result;
+                    return submitVanillaCpuTerrain(holder, epoch, request, priority);
                 }));
+    }
+
+    private CompletableFuture<CubeTerrainSnapshot> submitVanillaCpuTerrain(
+            CubeHolder holder, long epoch,
+            VanillaCubeTerrainGenerator.TerrainRequest request, int priority) {
+        CompletableFuture<CubeTerrainSnapshot> result = new CompletableFuture<>();
+        try {
+            generationExecutor.execute(new GenerationTask(
+                    priority, sequence.getAndIncrement(), () -> {
+                        if (!holder.isCurrent(epoch)
+                                || !holder.target().isAtLeast(CubeStatus.TERRAIN)) {
+                            result.cancel(false);
+                            return;
+                        }
+                        try {
+                            result.complete(VanillaCubeTerrainGenerator.prepareTerrain(request));
+                        } catch (Throwable throwable) {
+                            result.completeExceptionally(throwable);
+                            holder.fail(epoch, throwable);
+                        }
+                    }));
+        } catch (RuntimeException exception) {
+            result.completeExceptionally(exception);
+            holder.fail(epoch, exception);
+        }
+        return result;
     }
 
     /**
@@ -421,6 +479,23 @@ final class CubeTaskScheduler implements AutoCloseable {
             collectRequired(pos, CubeDependencyRadius.NONE, CubeStatus.PAYLOAD, required);
         }
 
+        // A placed-feature batch has a wider terrain read set than the normal
+        // FEATURES dependency radius.  Keep only entries whose owner is still
+        // demanded at or beyond FEATURES, then fold their terrain reads into
+        // the closure before publishing it.  This turns repeated feature
+        // polling into progress instead of an IO/generation cancellation loop.
+        featureTerrainDependencies.entrySet().removeIf(entry -> {
+            CubeStatus target = required.get(entry.getKey());
+            boolean remove = target == null || !target.isAtLeast(CubeStatus.FEATURES);
+            if (remove) featureTerrainReady.remove(entry.getKey());
+            return remove;
+        });
+        for (List<CubePos> dependencies : featureTerrainDependencies.values()) {
+            for (CubePos dependency : dependencies) {
+                required.merge(dependency, CubeStatus.TERRAIN, CubeTaskScheduler::maximum);
+            }
+        }
+
         // Publish the closure before lowering/cancelling holders.  The world
         // tick and eviction paths read this immutable snapshot concurrently
         // with asynchronous IO completion.
@@ -440,6 +515,11 @@ final class CubeTaskScheduler implements AutoCloseable {
                 holders.remove(pos, holder);
             } else if (target.ordinal() < holder.target().ordinal()) {
                 holder.lowerTarget(target);
+            } else if (target.ordinal() > holder.target().ordinal()) {
+                // A player can move its simulation window over cubes that were
+                // already streamed as PAYLOAD. Promote those existing holders
+                // and materialize their missing dependency stages lazily.
+                requestGraph(pos, target, priority(pos), new HashSet<>());
             }
         });
     }
@@ -487,12 +567,16 @@ final class CubeTaskScheduler implements AutoCloseable {
 
     @Override
     public void close() {
+        vanillaTerrainBatcher.close();
+        customTerrainBatcher.close();
         generationExecutor.shutdownNow();
         holders.values().forEach(CubeHolder::cancel);
         holders.clear();
         requestPriorities.clear();
         requiredPositions = Set.of();
         prefetchPositions = Set.of();
+        featureTerrainDependencies.clear();
+        featureTerrainReady.clear();
         readyQueue.clear();
     }
 
@@ -537,6 +621,351 @@ final class CubeTaskScheduler implements AutoCloseable {
             }
         }
         return true;
+    }
+
+    /**
+     * Batches the sparse, below-vanilla-height part of the normal
+     * NoiseChunkGenerator path.  Four vertical cubes share one 64-block
+     * density batch, and nearby horizontal batches are dispatched together so
+     * the OpenCL raster kernel is not invoked once per cube.
+     */
+    private final class VanillaTerrainBatcher implements AutoCloseable {
+        private static final int MAX_BATCH = 16;
+        private static final long COLLECTION_WINDOW_NANOS = 750_000L;
+
+        private final BlockingQueue<VanillaTerrainRequest> pending =
+                new LinkedBlockingQueue<>();
+        private final Object lifecycleLock = new Object();
+        private volatile boolean closed;
+        private Thread worker;
+
+        private CompletableFuture<CubeTerrainSnapshot> submit(
+                CubeHolder holder, long epoch,
+                VanillaCubeTerrainGenerator.TerrainRequest request, int priority) {
+            CompletableFuture<CubeTerrainSnapshot> result = new CompletableFuture<>();
+            VanillaTerrainRequest queued = new VanillaTerrainRequest(
+                    holder, epoch, request, priority, result);
+            synchronized (lifecycleLock) {
+                if (closed) {
+                    result.completeExceptionally(new IllegalStateException(
+                            "Vanilla terrain batcher is closed"));
+                    return result;
+                }
+                pending.offer(queued);
+                if (worker == null) {
+                    worker = new Thread(this::run, "higherworld-vanilla-terrain-batcher");
+                    worker.setDaemon(true);
+                    worker.start();
+                }
+                lifecycleLock.notifyAll();
+            }
+            return result;
+        }
+
+        private void run() {
+            while (!closed) {
+                VanillaTerrainRequest first;
+                try {
+                    first = pending.take();
+                } catch (InterruptedException interrupted) {
+                    if (closed) return;
+                    continue;
+                }
+                List<VanillaTerrainRequest> batch = new ArrayList<>(MAX_BATCH);
+                batch.add(first);
+                List<VanillaTerrainRequest> deferred = new ArrayList<>();
+                long deadline = System.nanoTime() + COLLECTION_WINDOW_NANOS;
+                while (batch.size() < MAX_BATCH) {
+                    VanillaTerrainRequest next = pending.poll();
+                    if (next == null) {
+                        long remaining = deadline - System.nanoTime();
+                        if (remaining <= 0L) break;
+                        try {
+                            next = pending.poll(remaining, TimeUnit.NANOSECONDS);
+                        } catch (InterruptedException interrupted) {
+                            if (closed) return;
+                            continue;
+                        }
+                        if (next == null) break;
+                    }
+                    if (compatible(first, next)) batch.add(next);
+                    else deferred.add(next);
+                }
+                deferred.forEach(pending::offer);
+                process(batch);
+            }
+            VanillaTerrainRequest request;
+            while ((request = pending.poll()) != null) {
+                request.result().cancel(false);
+            }
+        }
+
+        private boolean compatible(VanillaTerrainRequest first, VanillaTerrainRequest next) {
+            VanillaCubeTerrainGenerator.TerrainRequest firstRequest = first.request();
+            VanillaCubeTerrainGenerator.TerrainRequest nextRequest = next.request();
+            return firstRequest.seed() == nextRequest.seed()
+                    && firstRequest.settings() == nextRequest.settings()
+                    && firstRequest.noiseParameters() == nextRequest.noiseParameters()
+                    && firstRequest.biomeSource() == nextRequest.biomeSource()
+                    && firstRequest.palettesFactory() == nextRequest.palettesFactory()
+                    && firstRequest.structureAccessor() == nextRequest.structureAccessor()
+                    && firstRequest.asyncBatches() == nextRequest.asyncBatches();
+        }
+
+        private void process(List<VanillaTerrainRequest> requests) {
+            List<VanillaTerrainRequest> live = new ArrayList<>(requests.size());
+            for (VanillaTerrainRequest request : requests) {
+                if (request.holder().isCurrent(request.epoch())
+                        && request.holder().target().isAtLeast(CubeStatus.TERRAIN)
+                        && !request.result().isCancelled()) {
+                    live.add(request);
+                } else {
+                    request.result().cancel(false);
+                }
+            }
+            if (live.isEmpty()) return;
+
+            Map<CubePos, CubeTerrainSnapshot> generated;
+            try {
+                List<VanillaCubeTerrainGenerator.TerrainRequest> terrainRequests =
+                        live.stream().map(VanillaTerrainRequest::request).toList();
+                generated = VanillaCubeTerrainGenerator.prepareGpuTerrainBatch(terrainRequests);
+            } catch (Throwable throwable) {
+                // The GPU facade only throws when fallback_on_error=false (or
+                // when a lifecycle invariant is broken).  Match the custom
+                // batcher here: do not silently hide an explicitly requested
+                // hard failure behind a CPU result.
+                for (VanillaTerrainRequest request : live) fail(request, throwable);
+                return;
+            }
+            if (generated == null) {
+                for (VanillaTerrainRequest request : live) submitCpuFallback(request);
+                return;
+            }
+
+            for (VanillaTerrainRequest request : live) {
+                if (!request.holder().isCurrent(request.epoch())) {
+                    request.result().cancel(false);
+                    continue;
+                }
+                CubeTerrainSnapshot snapshot = generated.get(request.holder().pos());
+                if (snapshot == null) {
+                    submitCpuFallback(request);
+                } else {
+                    request.result().complete(snapshot);
+                }
+            }
+        }
+
+        private void submitCpuFallback(VanillaTerrainRequest request) {
+            submitVanillaCpuTerrain(
+                    request.holder(), request.epoch(), request.request(), request.priority())
+                    .whenComplete((snapshot, throwable) -> {
+                        if (throwable != null) {
+                            request.result().completeExceptionally(throwable);
+                        } else if (snapshot != null) {
+                            request.result().complete(snapshot);
+                        } else {
+                            request.result().cancel(false);
+                        }
+                    });
+        }
+
+        private void fail(VanillaTerrainRequest request, Throwable throwable) {
+            request.result().completeExceptionally(throwable);
+            request.holder().fail(request.epoch(), throwable);
+        }
+
+        @Override
+        public void close() {
+            synchronized (lifecycleLock) {
+                if (closed) return;
+                closed = true;
+                pending.forEach(request -> request.result().cancel(false));
+                pending.clear();
+                if (worker != null) worker.interrupt();
+                lifecycleLock.notifyAll();
+            }
+        }
+    }
+
+    /**
+     * A tiny collector for custom terrain requests. The normal scheduler keeps
+     * one lifecycle future per cube, but OpenCL is much faster when those
+     * independent futures are submitted as one sample and one raster dispatch.
+     * Requests are collected for at most a fraction of a tick, so a
+     * single-cube world does not wait behind a large batch.
+     */
+    private final class CustomTerrainBatcher implements AutoCloseable {
+        private static final int MAX_BATCH = 16;
+        private static final long COLLECTION_WINDOW_NANOS = 750_000L;
+
+        private final BlockingQueue<CustomTerrainRequest> pending =
+                new LinkedBlockingQueue<>();
+        private final Object lifecycleLock = new Object();
+        private volatile boolean closed;
+        private Thread worker;
+
+        private CompletableFuture<CubeTerrainSnapshot> submit(
+                CubeHolder holder, long epoch, long seed,
+                CustomWorldSettings settings, int priority) {
+            CompletableFuture<CubeTerrainSnapshot> result = new CompletableFuture<>();
+            CustomTerrainRequest request = new CustomTerrainRequest(
+                    holder, epoch, seed, settings, priority, result);
+            synchronized (lifecycleLock) {
+                if (closed) {
+                    result.completeExceptionally(new IllegalStateException(
+                            "Custom terrain batcher is closed"));
+                    return result;
+                }
+                pending.offer(request);
+                if (worker == null) {
+                    worker = new Thread(this::run, "higherworld-custom-terrain-batcher");
+                    worker.setDaemon(true);
+                    worker.start();
+                }
+                lifecycleLock.notifyAll();
+            }
+            return result;
+        }
+
+        private void run() {
+            while (!closed) {
+                CustomTerrainRequest first;
+                try {
+                    first = pending.take();
+                } catch (InterruptedException interrupted) {
+                    if (closed) return;
+                    continue;
+                }
+                List<CustomTerrainRequest> batch = new ArrayList<>(MAX_BATCH);
+                batch.add(first);
+                List<CustomTerrainRequest> deferred = new ArrayList<>();
+                long deadline = System.nanoTime() + COLLECTION_WINDOW_NANOS;
+                while (batch.size() < MAX_BATCH) {
+                    CustomTerrainRequest next = pending.poll();
+                    if (next == null) {
+                        long remaining = deadline - System.nanoTime();
+                        if (remaining <= 0L) break;
+                        try {
+                            next = pending.poll(remaining, TimeUnit.NANOSECONDS);
+                        } catch (InterruptedException interrupted) {
+                            if (closed) return;
+                            continue;
+                        }
+                        if (next == null) break;
+                    }
+                    if (compatible(first, next)) batch.add(next);
+                    else deferred.add(next);
+                }
+                deferred.forEach(pending::offer);
+                process(batch);
+            }
+            CustomTerrainRequest request;
+            while ((request = pending.poll()) != null) {
+                request.result().cancel(false);
+            }
+        }
+
+        private boolean compatible(CustomTerrainRequest first, CustomTerrainRequest next) {
+            // Settings are immutable and one scheduler belongs to one world;
+            // identity is cheaper than serializing or hashing the full preset.
+            return first.seed() == next.seed() && first.settings() == next.settings();
+        }
+
+        private void process(List<CustomTerrainRequest> requests) {
+            List<CustomTerrainRequest> live = new ArrayList<>(requests.size());
+            for (CustomTerrainRequest request : requests) {
+                if (request.holder().isCurrent(request.epoch())
+                        && request.holder().target().isAtLeast(CubeStatus.TERRAIN)
+                        && !request.result().isCancelled()) {
+                    live.add(request);
+                } else {
+                    request.result().cancel(false);
+                }
+            }
+            if (live.isEmpty()) return;
+
+            CubePos[] positions = new CubePos[live.size()];
+            boolean[][] solid = new boolean[live.size()][TerrainInterpolation.VOXEL_COUNT];
+            for (int index = 0; index < live.size(); index++) {
+                positions[index] = live.get(index).holder().pos();
+            }
+
+            boolean gpu;
+            try {
+                gpu = GpuTerrainAccelerator.trySampleAndRasterizeCustomBatch(
+                        live.get(0).seed(), positions, live.get(0).settings(), solid);
+            } catch (Throwable throwable) {
+                for (CustomTerrainRequest request : live) fail(request, throwable);
+                return;
+            }
+            if (gpu) {
+                for (int index = 0; index < live.size(); index++) {
+                    CustomTerrainRequest request = live.get(index);
+                    if (!request.holder().isCurrent(request.epoch())) {
+                        request.result().cancel(false);
+                    } else {
+                        request.result().complete(new CustomCubeGenerator.TerrainSnapshot(solid[index]));
+                    }
+                }
+                return;
+            }
+
+            // Device probing can fail after the requests have been collected.
+            // Return CPU work to the normal priority executor so the fallback
+            // retains the scheduler's parallelism.
+            for (CustomTerrainRequest request : live) submitCpuFallback(request);
+        }
+
+        private void submitCpuFallback(CustomTerrainRequest request) {
+            try {
+                generationExecutor.execute(new GenerationTask(
+                        request.priority(), sequence.getAndIncrement(), () -> {
+                            if (!request.holder().isCurrent(request.epoch())
+                                    || !request.holder().target().isAtLeast(CubeStatus.TERRAIN)) {
+                                request.result().cancel(false);
+                                return;
+                            }
+                            try {
+                                request.result().complete(CustomCubeGenerator.prepareTerrainCpu(
+                                        request.seed(), request.holder().pos(), request.settings()));
+                            } catch (Throwable throwable) {
+                                fail(request, throwable);
+                            }
+                        }));
+            } catch (RuntimeException exception) {
+                fail(request, exception);
+            }
+        }
+
+        private void fail(CustomTerrainRequest request, Throwable throwable) {
+            request.result().completeExceptionally(throwable);
+            request.holder().fail(request.epoch(), throwable);
+        }
+
+        @Override
+        public void close() {
+            synchronized (lifecycleLock) {
+                if (closed) return;
+                closed = true;
+                pending.forEach(request -> request.result().cancel(false));
+                pending.clear();
+                if (worker != null) worker.interrupt();
+                lifecycleLock.notifyAll();
+            }
+        }
+    }
+
+    private record CustomTerrainRequest(
+            CubeHolder holder, long epoch, long seed, CustomWorldSettings settings,
+            int priority, CompletableFuture<CubeTerrainSnapshot> result) {
+    }
+
+    private record VanillaTerrainRequest(
+            CubeHolder holder, long epoch,
+            VanillaCubeTerrainGenerator.TerrainRequest request,
+            int priority, CompletableFuture<CubeTerrainSnapshot> result) {
     }
 
     private record GenerationTask(int priority, long sequence, Runnable action)

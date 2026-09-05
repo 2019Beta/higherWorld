@@ -13,6 +13,7 @@ import net.minecraft.world.gen.chunk.ChunkGeneratorSettings;
 import net.minecraft.world.gen.densityfunction.DensityFunction;
 import net.minecraft.world.gen.densityfunction.DensityFunctionTypes;
 import net.minecraft.world.gen.noise.NoiseConfig;
+import org.devt.higherworld.gpu.GpuTerrainAccelerator;
 import org.devt.higherworld.storage.CubePos;
 
 /** Lazily extends Overworld terrain below the vanilla generation band. */
@@ -33,6 +34,8 @@ final class InfiniteDownwardGenerator {
     private static final Map<ServerWorld, DensityFunction> LEGACY_CAVE_DENSITIES = new ConcurrentHashMap<>();
     private static final Map<ServerWorld, DensityFunction> EXTENDED_OVERWORLD_DENSITIES =
             new ConcurrentHashMap<>();
+    private static final ThreadLocal<NoiseTerrainScratch> NOISE_TERRAIN_SCRATCH =
+            ThreadLocal.withInitial(NoiseTerrainScratch::new);
 
     private InfiniteDownwardGenerator() {
     }
@@ -151,8 +154,8 @@ final class InfiniteDownwardGenerator {
         int verticalCell = 8;
         int horizontalCells = CubePos.SIZE / horizontalCell;
         int verticalCells = CubePos.SIZE / verticalCell;
-        double[] samples = new double[
-                (horizontalCells + 1) * (verticalCells + 1) * (horizontalCells + 1)];
+        NoiseTerrainScratch scratch = NOISE_TERRAIN_SCRATCH.get();
+        double[] samples = scratch.samples;
         for (int gridY = 0; gridY <= verticalCells; gridY++) {
             for (int gridZ = 0; gridZ <= horizontalCells; gridZ++) {
                 for (int gridX = 0; gridX <= horizontalCells; gridX++) {
@@ -165,12 +168,22 @@ final class InfiniteDownwardGenerator {
             }
         }
 
+        boolean[] solid = scratch.solid;
+        boolean gpuRasterized = GpuTerrainAccelerator.tryRasterizeDensity(
+                samples, horizontalCell, verticalCell, horizontalCell,
+                horizontalCells, verticalCells, horizontalCells,
+                GpuTerrainAccelerator.InterpolationMode.LINEAR, solid);
+        if (!gpuRasterized) {
+            TerrainInterpolation.fillSolid(
+                    samples, horizontalCell, verticalCell, horizontalCell,
+                    horizontalCells, verticalCells, horizontalCells, solid);
+        }
+
         for (int localY = 0; localY < CubePos.SIZE; localY++) {
             for (int localZ = 0; localZ < CubePos.SIZE; localZ++) {
+                int output = (localY * CubePos.SIZE + localZ) * CubePos.SIZE;
                 for (int localX = 0; localX < CubePos.SIZE; localX++) {
-                    if (interpolateVanillaDensity(
-                            samples, localX, localY, localZ,
-                            horizontalCell, verticalCell, horizontalCells) > 0.0) {
+                    if (solid[output + localX]) {
                         cube.setGeneratedBlockState(localX, localY, localZ, DEEPSLATE);
                     }
                 }
@@ -180,13 +193,14 @@ final class InfiniteDownwardGenerator {
 
     private static double interpolateVanillaDensity(
             double[] samples, int x, int y, int z,
-            int horizontalCell, int verticalCell, int horizontalCells) {
-        int gridX = x / horizontalCell;
-        int gridY = y / verticalCell;
-        int gridZ = z / horizontalCell;
-        double tx = (double) (x % horizontalCell) / horizontalCell;
-        double ty = (double) (y % verticalCell) / verticalCell;
-        double tz = (double) (z % horizontalCell) / horizontalCell;
+            int horizontalCell, int verticalCell,
+            int horizontalCells, int verticalCells) {
+        int gridX = Math.min(horizontalCells - 1, x / horizontalCell);
+        int gridY = Math.min(verticalCells - 1, y / verticalCell);
+        int gridZ = Math.min(horizontalCells - 1, z / horizontalCell);
+        double tx = (double) (x - gridX * horizontalCell) / horizontalCell;
+        double ty = (double) (y - gridY * verticalCell) / verticalCell;
+        double tz = (double) (z - gridZ * horizontalCell) / horizontalCell;
         double x00 = lerp(
                 samples[vanillaSampleIndex(gridX, gridY, gridZ, horizontalCells)],
                 samples[vanillaSampleIndex(gridX + 1, gridY, gridZ, horizontalCells)], tx);
@@ -810,6 +824,13 @@ final class InfiniteDownwardGenerator {
 
     private static boolean isOpenTerrain(BlockState state) {
         return state.isAir() || !state.getFluidState().isEmpty();
+    }
+
+    /** Reuses the fixed 4x8 density grid and voxel mask on the fallback thread. */
+    private static final class NoiseTerrainScratch {
+        private final double[] samples = new double[
+                NOISE_GRID_SIZE * (CubePos.SIZE / 8 + 1) * NOISE_GRID_SIZE];
+        private final boolean[] solid = new boolean[CubePos.SIZE * CubePos.SIZE * CubePos.SIZE];
     }
 
     /** Replaces only the lower slide from vanilla overworld.json with a constant 1. */
