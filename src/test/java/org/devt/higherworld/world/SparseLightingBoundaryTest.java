@@ -58,7 +58,9 @@ class SparseLightingBoundaryTest {
         engine.queueCube(cube, true);
         assertTrue(engine.propagate(500_000).complete());
         assertEquals(0, access.block(1, 8, 8));
-        assertEquals(0, access.block(2, 8, 8));
+        // A single opaque cell does not seal the plane: light routes around it
+        // through the y/z neighbours (15 - 4 hops), as vanilla block light does.
+        assertEquals(11, access.block(2, 8, 8));
 
         access.opacity.put(barrier, 1);
         engine.queueBlock(barrier.x, barrier.y, barrier.z);

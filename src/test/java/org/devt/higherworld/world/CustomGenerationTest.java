@@ -8,11 +8,21 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import java.util.Arrays;
 import java.util.Random;
+import net.minecraft.Bootstrap;
+import net.minecraft.SharedConstants;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.devt.higherworld.storage.CubePos;
 
-/** Pure checks for the custom generation math; no Minecraft client bootstrap is required. */
+/** Pure checks for the custom generation math; registry bootstrap is
+ * required because {@link CustomCubeGenerator} holds static block constants. */
 class CustomGenerationTest {
+    @BeforeAll
+    static void bootstrapRegistries() {
+        SharedConstants.createGameVersion();
+        Bootstrap.initialize();
+    }
+
     @Test
     void workerTerrainSnapshotIsDeterministicAndContainsOneCube() {
         CustomWorldSettings settings = CustomWorldSettings.defaults();
@@ -39,7 +49,9 @@ class CustomGenerationTest {
     @Test
     void interpolationUsesConfiguredSampleSpacing() {
         double[] samples = {0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0};
-        assertEquals(5.0, CustomCubeGenerator.interpolate(
+        // (1, 1, 0) is the midpoint of the first cell on a step-2 grid: the
+        // trilinear result is the average of the z=0 face corners.
+        assertEquals(2.5, CustomCubeGenerator.interpolate(
                 samples, 1, 1, 0, 2, 2, 2, 1, 1, 1), 1.0e-9);
         assertEquals(0.0, CustomCubeGenerator.interpolate(
                 samples, 0, 0, 0, 1, 1, 1, 1, 1, 1), 1.0e-9);

@@ -12,13 +12,22 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 
+import net.minecraft.Bootstrap;
+import net.minecraft.SharedConstants;
 import net.minecraft.block.Blocks;
 import net.minecraft.util.math.BlockPos;
 import org.devt.higherworld.storage.CubePos;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 class CubeSimulationServicesTest {
+    @BeforeAll
+    static void bootstrapRegistries() {
+        SharedConstants.createGameVersion();
+        Bootstrap.initialize();
+    }
+
     @TempDir
     Path directory;
 
