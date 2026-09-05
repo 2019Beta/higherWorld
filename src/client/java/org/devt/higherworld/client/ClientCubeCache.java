@@ -10,6 +10,7 @@ import java.util.Set;
 
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
+import net.minecraft.block.BlockEntityProvider;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.world.ClientWorld;
 import net.minecraft.fluid.FluidState;
@@ -18,6 +19,8 @@ import net.minecraft.world.chunk.ChunkSection;
 import net.minecraft.world.Heightmap;
 import net.minecraft.world.LightType;
 import net.minecraft.block.entity.BlockEntity;
+import net.minecraft.block.entity.BlockEntityTicker;
+import org.devt.higherworld.world.CubeBlockEventPayload;
 import org.devt.higherworld.storage.CubePos;
 import org.devt.higherworld.world.CubeLightData;
 import org.devt.higherworld.world.CubeRecordCodec;
@@ -143,6 +146,10 @@ public final class ClientCubeCache {
                 BLOCK_ENTITIES.computeIfAbsent(pos, ignored -> new ConcurrentHashMap<>());
         for (BlockEntity blockEntity : decoded.blockEntities()) {
             cubeBlockEntities.put(blockEntity.getPos().toImmutable(), blockEntity);
+            // ClientWorld only retains renderers that opt into rendering
+            // outside the normal chunk bounds.  Register those renderers so
+            // large models (e.g. chests) are still discovered by WorldRenderer.
+            world.loadBlockEntity(blockEntity);
         }
         boolean initializeLight = !decoded.hasLight()
                 && !hasUniformLightFastPath(section, decoded.blockEntities());
@@ -239,6 +246,8 @@ public final class ClientCubeCache {
             BlockState previous = section.setBlockState(localX, localY, localZ, state);
             if (previous == state) return false;
 
+            reconcileBlockEntity(world, cubePos, pos, state);
+
             // Keep the server revision authoritative.  Local prediction changes
             // the section immediately, but must not make a later authoritative
             // packet look stale (or make a matching block update get rejected).
@@ -275,6 +284,17 @@ public final class ClientCubeCache {
         }
     }
 
+    /** Applies a chest/spawner-style synchronized block event in cube space. */
+    public static void applyBlockEvent(ClientWorld world, CubeBlockEventPayload payload) {
+        ensureOwner(world);
+        BlockPos pos = payload.blockPos();
+        CubePos cubePos = CubePos.fromBlock(pos.getX(), pos.getY(), pos.getZ());
+        if (!CUBES.containsKey(cubePos)) return;
+        if (!getBlockState(world, pos).isOf(payload.block())) return;
+        world.addSyncedBlockEvent(pos, payload.block(), payload.type(), payload.data());
+        queueRenderNeighborhood(cubePos);
+    }
+
     public static void clear() {
         synchronized (ClientCubeCache.class) {
             PENDING_UPDATES.clear();
@@ -282,7 +302,7 @@ public final class ClientCubeCache {
             PENDING_LIGHTS.clear();
             CUBE_HEIGHTS.clear();
             HIGHEST_BLOCKS.clear();
-            BLOCK_ENTITIES.clear();
+            removeAllBlockEntities();
             LIGHT_ENGINE.clear();
             PENDING_RENDER_CUBES.clear();
             owner = null;
@@ -292,6 +312,7 @@ public final class ClientCubeCache {
     /** Drains cube network updates, then advances lighting and render batching. */
     public static void tick() {
         drainPendingUpdates();
+        tickBlockEntities(MinecraftClient.getInstance().world);
         propagateLighting();
         // Keep the invalidation set alive while a packet burst spans multiple
         // client ticks, but submit a bounded slice every tick.  Waiting for the
@@ -327,6 +348,48 @@ public final class ClientCubeCache {
             }
         }
         return !PENDING_UPDATES.isEmpty();
+    }
+
+    /**
+     * Cubes are not represented by ClientWorld chunks, so their block
+     * entities never enter ClientWorld's native ticker list. Run the exact
+     * block-provided client ticker here to advance animations and stateful
+     * render data every client tick.
+     */
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private static void tickBlockEntities(ClientWorld world) {
+        if (world == null || owner != world || !world.getTickManager().shouldTick()) return;
+        for (Map.Entry<CubePos, ConcurrentMap<BlockPos, BlockEntity>> cubeEntry
+                : BLOCK_ENTITIES.entrySet()) {
+            CubePos cubePos = cubeEntry.getKey();
+            ConcurrentMap<BlockPos, BlockEntity> blockEntities = cubeEntry.getValue();
+            CubeEntry cube = CUBES.get(cubePos);
+            if (cube == null) {
+                removeBlockEntities(cubePos);
+                continue;
+            }
+            for (Map.Entry<BlockPos, BlockEntity> blockEntry : blockEntities.entrySet()) {
+                BlockPos pos = blockEntry.getKey();
+                BlockEntity blockEntity = blockEntry.getValue();
+                if (blockEntity.isRemoved()) {
+                    blockEntities.remove(pos, blockEntity);
+                    continue;
+                }
+                BlockState state = cube.section().getBlockState(
+                        local(pos.getX()), local(pos.getY()), local(pos.getZ()));
+                if (!state.hasBlockEntity() || !blockEntity.supports(state)) {
+                    if (blockEntities.remove(pos, blockEntity)) blockEntity.markRemoved();
+                    continue;
+                }
+                if (!state.equals(blockEntity.getCachedState())) blockEntity.setCachedState(state);
+                BlockEntityTicker ticker = state.getBlockEntityTicker(world, blockEntity.getType());
+                if (ticker != null) {
+                    ticker.tick(world, pos, state, blockEntity);
+                }
+                if (blockEntity.isRemoved()) blockEntities.remove(pos, blockEntity);
+            }
+            if (blockEntities.isEmpty()) BLOCK_ENTITIES.remove(cubePos, blockEntities);
+        }
     }
 
     public static int loadedCubeCount() {
@@ -396,7 +459,7 @@ public final class ClientCubeCache {
                     PENDING_LIGHTS.clear();
                     CUBE_HEIGHTS.clear();
                     HIGHEST_BLOCKS.clear();
-                    BLOCK_ENTITIES.clear();
+                    removeAllBlockEntities();
                     LIGHT_ENGINE.clear();
                     PENDING_RENDER_CUBES.clear();
                     owner = world;
@@ -444,7 +507,44 @@ public final class ClientCubeCache {
     }
 
     private static void removeBlockEntities(CubePos pos) {
-        BLOCK_ENTITIES.remove(pos);
+        ConcurrentMap<BlockPos, BlockEntity> blockEntities = BLOCK_ENTITIES.remove(pos);
+        if (blockEntities == null) return;
+        for (BlockEntity blockEntity : blockEntities.values()) {
+            blockEntity.markRemoved();
+        }
+    }
+
+    private static void removeAllBlockEntities() {
+        for (ConcurrentMap<BlockPos, BlockEntity> blockEntities : BLOCK_ENTITIES.values()) {
+            for (BlockEntity blockEntity : blockEntities.values()) {
+                blockEntity.markRemoved();
+            }
+        }
+        BLOCK_ENTITIES.clear();
+    }
+
+    private static void reconcileBlockEntity(
+            ClientWorld world, CubePos cubePos, BlockPos pos, BlockState state) {
+        ConcurrentMap<BlockPos, BlockEntity> blockEntities = BLOCK_ENTITIES.get(cubePos);
+        BlockEntity blockEntity = blockEntities == null ? null : blockEntities.get(pos);
+        if (blockEntity != null && (!state.hasBlockEntity() || !blockEntity.supports(state))) {
+            if (blockEntities.remove(pos, blockEntity)) blockEntity.markRemoved();
+            blockEntity = null;
+        }
+        if (blockEntity == null && state.hasBlockEntity()
+                && state.getBlock() instanceof BlockEntityProvider provider) {
+            blockEntity = provider.createBlockEntity(pos, state);
+            if (blockEntity != null) {
+                blockEntity.setWorld(world);
+                blockEntities = BLOCK_ENTITIES.computeIfAbsent(
+                        cubePos, ignored -> new ConcurrentHashMap<>());
+                blockEntities.put(pos.toImmutable(), blockEntity);
+                world.loadBlockEntity(blockEntity);
+            }
+        }
+        if (blockEntity != null && !state.equals(blockEntity.getCachedState())) {
+            blockEntity.setCachedState(state);
+        }
     }
 
     private static void queueLoadedNeighbours(CubePos pos) {
