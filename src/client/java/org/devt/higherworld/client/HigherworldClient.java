@@ -5,6 +5,7 @@ import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import org.devt.higherworld.world.CubeBlockUpdatePayload;
+import org.devt.higherworld.world.CubeBlockEventPayload;
 import org.devt.higherworld.world.CubeDataPayload;
 import org.devt.higherworld.world.CubeLightUpdatePayload;
 import org.devt.higherworld.world.CubeUnloadPayload;
@@ -46,6 +47,13 @@ public class HigherworldClient implements ClientModInitializer {
                     // server-side deleted block until the client rejoins.
                     context.client().world.handleBlockUpdate(
                             payload.blockPos(), payload.blockState(), 19);
+                }
+            });
+        });
+        ClientPlayNetworking.registerGlobalReceiver(CubeBlockEventPayload.ID, (payload, context) -> {
+            context.client().execute(() -> {
+                if (context.client().world != null) {
+                    ClientCubeCache.applyBlockEvent(context.client().world, payload);
                 }
             });
         });

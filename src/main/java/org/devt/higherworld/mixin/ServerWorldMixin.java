@@ -1,7 +1,9 @@
 package org.devt.higherworld.mixin;
 
+import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
 import net.minecraft.entity.Entity;
+import net.minecraft.entity.damage.DamageSource;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.util.ProgressListener;
 import net.minecraft.util.math.BlockPos;
@@ -54,6 +56,69 @@ abstract class ServerWorldMixin {
         ServerWorld world = (ServerWorld) (Object) this;
         if (CubicWorldManager.shouldManageEntity(world, entity)) {
             callbackInfo.setReturnValue(CubicWorldManager.addEntity(world, entity));
+        }
+    }
+
+    /**
+     * PlayerInteractEntityC2SPacket resolves its target through this lookup.
+     * Cubic entities deliberately stay out of the vanilla fixed-height entity
+     * manager, so use the sparse runtime as a fallback after vanilla lookup.
+     */
+    @Inject(method = "getEntityById", at = @At("RETURN"), cancellable = true)
+    private void higherworld$findCubeEntity(int id, CallbackInfoReturnable<Entity> callbackInfo) {
+        if (callbackInfo.getReturnValue() == null) {
+            Entity entity = CubicWorldManager.getEntityById((ServerWorld) (Object) this, id);
+            if (entity != null) callbackInfo.setReturnValue(entity);
+        }
+    }
+
+    /** Includes dragon parts and other packet targets that use the specialized lookup. */
+    @Inject(method = "getEntityOrDragonPart", at = @At("RETURN"), cancellable = true)
+    private void higherworld$findCubeEntityOrPart(
+            int id, CallbackInfoReturnable<Entity> callbackInfo) {
+        if (callbackInfo.getReturnValue() == null) {
+            Entity entity = CubicWorldManager.getEntityById((ServerWorld) (Object) this, id);
+            if (entity != null) callbackInfo.setReturnValue(entity);
+        }
+    }
+
+    /** Sends hurt/death status events to clients tracking cubic entities. */
+    @Inject(method = "sendEntityStatus", at = @At("HEAD"), cancellable = true)
+    private void higherworld$sendCubeEntityStatus(
+            Entity entity, byte status, CallbackInfo callbackInfo) {
+        ServerWorld world = (ServerWorld) (Object) this;
+        if (CubicWorldManager.ownsEntity(world, entity)) {
+            CubicWorldManager.sendEntityStatus(world, entity, status);
+            callbackInfo.cancel();
+        }
+    }
+
+    /** Sends damage-source metadata to clients tracking cubic entities. */
+    @Inject(method = "sendEntityDamage", at = @At("HEAD"), cancellable = true)
+    private void higherworld$sendCubeEntityDamage(
+            Entity entity, DamageSource source, CallbackInfo callbackInfo) {
+        ServerWorld world = (ServerWorld) (Object) this;
+        if (CubicWorldManager.ownsEntity(world, entity)) {
+            CubicWorldManager.sendEntityDamage(world, entity, source);
+            callbackInfo.cancel();
+        }
+    }
+
+    /**
+     * ServerWorld queues vanilla block events through a fixed-height chunk
+     * structure. Apply events in cubic space immediately and send a full-Y
+     * custom payload so chests, spawners and similar blocks stay synchronized.
+     */
+    @Inject(method = "addSyncedBlockEvent", at = @At("HEAD"), cancellable = true)
+    private void higherworld$syncCubeBlockEvent(
+            BlockPos pos, Block block, int type, int data, CallbackInfo callbackInfo) {
+        ServerWorld world = (ServerWorld) (Object) this;
+        if (pos.getY() < world.getBottomY() || pos.getY() > world.getTopYInclusive()) {
+            BlockState state = world.getBlockState(pos);
+            if (state.isOf(block) && state.onSyncedBlockEvent(world, pos, type, data)) {
+                CubeWatchManager.broadcastBlockEvent(world, pos, type, data);
+            }
+            callbackInfo.cancel();
         }
     }
 

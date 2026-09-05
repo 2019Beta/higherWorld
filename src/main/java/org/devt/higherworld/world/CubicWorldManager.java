@@ -17,6 +17,7 @@ import net.minecraft.block.entity.BlockEntity;
 import net.minecraft.block.BlockEntityProvider;
 import net.minecraft.entity.Entity;
 import net.minecraft.entity.Entity.RemovalReason;
+import net.minecraft.entity.damage.DamageSource;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.util.math.BlockPos;
@@ -194,6 +195,30 @@ public final class CubicWorldManager {
     public static boolean addEntity(ServerWorld world, Entity entity) {
         CubeEntityRuntime runtime = ENTITIES.get(world);
         return runtime != null && runtime.add(entity);
+    }
+
+    /** Resolves outside-height entities for ServerWorld interaction packets. */
+    public static Entity getEntityById(ServerWorld world, int id) {
+        CubeEntityRuntime runtime = ENTITIES.get(world);
+        return runtime == null ? null : runtime.getEntityById(id);
+    }
+
+    /** True when the entity is currently owned by the sparse runtime. */
+    public static boolean ownsEntity(ServerWorld world, Entity entity) {
+        CubeEntityRuntime runtime = ENTITIES.get(world);
+        return runtime != null && runtime.ownsEntity(entity);
+    }
+
+    /** Forwards entity status packets to cubic trackers. */
+    public static void sendEntityStatus(ServerWorld world, Entity entity, byte status) {
+        CubeEntityRuntime runtime = ENTITIES.get(world);
+        if (runtime != null) runtime.sendEntityStatus(entity, status);
+    }
+
+    /** Forwards damage-source packets to cubic trackers. */
+    public static void sendEntityDamage(ServerWorld world, Entity entity, DamageSource source) {
+        CubeEntityRuntime runtime = ENTITIES.get(world);
+        if (runtime != null) runtime.sendEntityDamage(entity, source);
     }
 
     /** Forwards movement callbacks without exposing the runtime map. */

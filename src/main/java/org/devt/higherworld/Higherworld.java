@@ -17,6 +17,7 @@ import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import org.devt.higherworld.gpu.GpuAccelerationConfig;
 import org.devt.higherworld.gpu.GpuTerrainAccelerator;
 import org.devt.higherworld.world.CubeBlockUpdatePayload;
+import org.devt.higherworld.world.CubeBlockEventPayload;
 import org.devt.higherworld.world.CubeDataPayload;
 import org.devt.higherworld.world.CubeLightUpdatePayload;
 import org.devt.higherworld.world.CubeUnloadPayload;
@@ -44,6 +45,7 @@ public class Higherworld implements ModInitializer {
         PayloadTypeRegistry.playS2C().register(CubeLightUpdatePayload.ID, CubeLightUpdatePayload.CODEC);
         PayloadTypeRegistry.playS2C().register(CubeUnloadPayload.ID, CubeUnloadPayload.CODEC);
         PayloadTypeRegistry.playS2C().register(CubeBlockUpdatePayload.ID, CubeBlockUpdatePayload.CODEC);
+        PayloadTypeRegistry.playS2C().register(CubeBlockEventPayload.ID, CubeBlockEventPayload.CODEC);
         PayloadTypeRegistry.playS2C().register(
                 TerrainGeneratorStatusPayload.ID, TerrainGeneratorStatusPayload.CODEC);
 

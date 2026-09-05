@@ -16,9 +16,12 @@ import net.minecraft.entity.EntityType;
 import net.minecraft.entity.LoadedEntityProcessor;
 import net.minecraft.entity.SpawnReason;
 import net.minecraft.entity.Entity.RemovalReason;
+import net.minecraft.entity.damage.DamageSource;
 import net.minecraft.nbt.NbtCompound;
 import net.minecraft.nbt.NbtIo;
 import net.minecraft.nbt.NbtSizeTracker;
+import net.minecraft.network.packet.s2c.play.EntityDamageS2CPacket;
+import net.minecraft.network.packet.s2c.play.EntityStatusS2CPacket;
 import net.minecraft.server.network.EntityTrackerEntry;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.server.world.ServerWorld;
@@ -47,6 +50,13 @@ public final class CubeEntityRuntime implements AutoCloseable {
     private CubeEntityIndex index = new CubeEntityIndex();
     private final Map<UUID, Entity> roots = new HashMap<>();
     private final Map<UUID, Entity> entitiesByUuid = new HashMap<>();
+    /**
+     * ServerWorld's normal entity lookup is backed by its fixed-height entity
+     * manager.  Keep the numeric IDs of cubic entities here as well so packet
+     * interactions can resolve them without putting them back into that
+     * manager.
+     */
+    private final Map<Integer, Entity> entitiesById = new HashMap<>();
     private final Map<UUID, Tracker> trackers = new HashMap<>();
     private boolean loaded;
     private boolean dirty;
@@ -64,6 +74,7 @@ public final class CubeEntityRuntime implements AutoCloseable {
         index = storage.load();
         roots.clear();
         entitiesByUuid.clear();
+        entitiesById.clear();
         trackers.clear();
         loaded = true;
         dirty = false;
@@ -87,7 +98,8 @@ public final class CubeEntityRuntime implements AutoCloseable {
         if (index.contains(rootUuid)) return false;
         List<Entity> family = root.streamSelfAndPassengers().toList();
         for (Entity member : family) {
-            if (entitiesByUuid.containsKey(member.getUuid()) || index.contains(member.getUuid())) return false;
+            if (entitiesByUuid.containsKey(member.getUuid()) || index.contains(member.getUuid())
+                    || entitiesById.containsKey(member.getId())) return false;
         }
         byte[] payload;
         try {
@@ -138,7 +150,8 @@ public final class CubeEntityRuntime implements AutoCloseable {
             }
             List<Entity> family = root.streamSelfAndPassengers().toList();
             boolean conflict = family.stream().anyMatch(member ->
-                    entitiesByUuid.containsKey(member.getUuid()));
+                    entitiesByUuid.containsKey(member.getUuid())
+                            || entitiesById.containsKey(member.getId()));
             if (conflict) continue;
             install(root, family);
             restored++;
@@ -243,6 +256,30 @@ public final class CubeEntityRuntime implements AutoCloseable {
         return Math.max(0, index.size() - roots.size());
     }
 
+    /** Returns a materialized cubic entity (or entity part) by network ID. */
+    public synchronized Entity getEntityById(int id) {
+        if (!loaded || closed) return null;
+        return entitiesById.get(id);
+    }
+
+    /** Returns true only for entities currently owned by this sparse runtime. */
+    public synchronized boolean ownsEntity(Entity entity) {
+        return loaded && !closed && entity != null
+                && entitiesByUuid.containsKey(entity.getUuid());
+    }
+
+    /** Sends the vanilla entity-status event through the cubic tracker. */
+    public synchronized void sendEntityStatus(Entity entity, byte status) {
+        Tracker tracker = trackerFor(entity);
+        if (tracker != null) tracker.send(new EntityStatusS2CPacket(entity, status));
+    }
+
+    /** Sends the vanilla damage-source event through the cubic tracker. */
+    public synchronized void sendEntityDamage(Entity entity, DamageSource source) {
+        Tracker tracker = trackerFor(entity);
+        if (tracker != null) tracker.send(new EntityDamageS2CPacket(entity, source));
+    }
+
     /**
      * Returns owners which still have a durable record but no live root.  The
      * manager uses this bounded set to attach FULL futures only for cubes that
@@ -274,6 +311,7 @@ public final class CubeEntityRuntime implements AutoCloseable {
         roots.put(root.getUuid(), root);
         for (Entity member : family) {
             entitiesByUuid.put(member.getUuid(), root);
+            entitiesById.put(member.getId(), member);
             member.setChangeListener(new Listener(member));
         }
         trackers.put(root.getUuid(), new Tracker(root));
@@ -285,6 +323,7 @@ public final class CubeEntityRuntime implements AutoCloseable {
         List<Entity> family = root.streamSelfAndPassengers().toList();
         for (Entity member : family) {
             entitiesByUuid.remove(member.getUuid(), root);
+            entitiesById.remove(member.getId(), member);
             member.setChangeListener(EntityChangeListener.NONE);
         }
         roots.remove(root.getUuid(), root);
@@ -308,6 +347,12 @@ public final class CubeEntityRuntime implements AutoCloseable {
     private void updateTracking(Entity root) {
         Tracker tracker = trackers.get(root.getUuid());
         if (tracker != null) tracker.update();
+    }
+
+    private Tracker trackerFor(Entity entity) {
+        if (entity == null) return null;
+        Entity root = entitiesByUuid.get(entity.getUuid());
+        return root == null ? null : trackers.get(root.getUuid());
     }
 
     private byte[] serialize(Entity root) throws IOException {
@@ -429,6 +474,12 @@ public final class CubeEntityRuntime implements AutoCloseable {
                 if (players.add(player)) entry.startTracking(player);
             }
             entry.tick();
+        }
+
+        private void send(Packet<? super ClientPlayPacketListener> packet) {
+            for (ServerPlayerEntity player : Set.copyOf(players)) {
+                player.networkHandler.send(packet, null);
+            }
         }
 
         private void stopAll() {

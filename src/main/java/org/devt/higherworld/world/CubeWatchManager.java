@@ -137,6 +137,20 @@ public final class CubeWatchManager {
         }
     }
 
+    /** Sends a chest/spawner-style event to clients that already have the cube. */
+    public static void broadcastBlockEvent(ServerWorld world, BlockPos pos, int type, int data) {
+        if (CubicWorldManager.suppressingGenerationUpdates(world)) return;
+        CubePos cubePos = CubePos.fromBlock(pos.getX(), pos.getY(), pos.getZ());
+        BlockState state = world.getBlockState(pos);
+        CubeBlockEventPayload payload = new CubeBlockEventPayload(pos, state, type, data);
+        for (ServerPlayerEntity player : PlayerLookup.around(world, pos.toCenterPos(), 64.0)) {
+            if (hasSent(player, cubePos)
+                    && ServerPlayNetworking.canSend(player, CubeBlockEventPayload.ID)) {
+                ServerPlayNetworking.send(player, payload);
+            }
+        }
+    }
+
     /**
      * Loading follows the client's view distance, but simulation must follow
      * the server's (usually smaller) simulation distance.  Ticking every FULL
