@@ -28,6 +28,8 @@ final class CubeTaskScheduler implements AutoCloseable {
     private final CubeIoScheduler io;
     private final CubeTicketManager tickets = new CubeTicketManager();
     private final ConcurrentMap<CubePos, CubeHolder> holders = new ConcurrentHashMap<>();
+    /** Lifecycle-maintained frontier; cached terrain/payload cubes never enter it. */
+    private final Set<CubeHolder> fullTickingHolders = ConcurrentHashMap.newKeySet();
     /** Lowest request priority seen for each live lifecycle node. */
     private final ConcurrentMap<CubePos, Integer> requestPriorities = new ConcurrentHashMap<>();
     /**
@@ -214,6 +216,12 @@ final class CubeTaskScheduler implements AutoCloseable {
         dependencyEpoch.incrementAndGet();
         waitingSinceEpoch.remove(holder);
         synchronized (holder) {
+            if (!holder.failed() && holder.target() == CubeStatus.FULL
+                    && holder.status() == CubeStatus.FULL) {
+                fullTickingHolders.add(holder);
+            } else {
+                fullTickingHolders.remove(holder);
+            }
             if (holder.target() == CubeStatus.EMPTY
                     || holder.failed()
                     || holder.status().isAtLeast(holder.target())) {
@@ -241,6 +249,10 @@ final class CubeTaskScheduler implements AutoCloseable {
     /** Requeues a holder whose next stage still needs a bounded commit slice. */
     void requeue(CubeHolder holder) {
         holderChanged(holder);
+    }
+
+    Iterable<CubeHolder> fullTickingHolders() {
+        return fullTickingHolders;
     }
 
     /**
@@ -736,6 +748,7 @@ final class CubeTaskScheduler implements AutoCloseable {
         generationExecutor.shutdownNow();
         holders.values().forEach(CubeHolder::cancel);
         holders.clear();
+        fullTickingHolders.clear();
         requestPriorities.clear();
         requiredPositions = Set.of();
         prefetchPositions = Set.of();

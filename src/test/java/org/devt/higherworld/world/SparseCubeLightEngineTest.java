@@ -10,6 +10,30 @@ import org.junit.jupiter.api.Test;
 
 class SparseCubeLightEngineTest {
     @Test
+    void unloadingSourceCubeSeedsSurvivingFacesWithoutRecreatingTheCube() {
+        TestAccess access = new TestAccess();
+        CubePos sourceCube = new CubePos(0, 0, 0);
+        CubePos neighbour = new CubePos(1, 0, 0);
+        access.add(sourceCube);
+        access.add(neighbour);
+        Point source = new Point(15, 8, 8);
+        access.emission.put(source, 15);
+        SparseCubeLightEngine engine = new SparseCubeLightEngine(access);
+        engine.queueCube(sourceCube, true);
+        assertTrue(engine.propagate(200_000).complete());
+        assertEquals(14, access.block(16, 8, 8));
+
+        access.cubes.remove(sourceCube);
+        access.emission.remove(source);
+        engine.discardCube(sourceCube);
+        engine.queueCube(sourceCube, false);
+        assertEquals(1, engine.pendingCubeCount());
+        assertTrue(engine.propagate(200_000).complete());
+        assertEquals(0, access.block(16, 8, 8));
+        assertEquals(1, access.cubes.size());
+    }
+
+    @Test
     void queuedCubesShareBudgetAndUnloadedWorkIsDiscarded() {
         TestAccess access = new TestAccess();
         CubePos first = new CubePos(-2, -20, 0);

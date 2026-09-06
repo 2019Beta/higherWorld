@@ -42,6 +42,7 @@ final class CubicWorldState implements AutoCloseable {
     private static final int LIGHT_STEPS_PER_SLICE = 50_000;
     private static final long LIGHT_NANOS_PER_SLICE = 1_000_000L;
     private static final int EVICTIONS_PER_PASS = 32;
+    private static final int MAINTENANCE_SCANS_PER_PASS = 256;
     private static final long EVICTION_NANOS_PER_PASS = 2_000_000L;
     private static final int LIGHT_BROADCASTS_PER_TICK = 2;
     private static final long MAX_CACHED_PAYLOAD_BYTES = 32L * 1024L * 1024L;
@@ -57,6 +58,9 @@ final class CubicWorldState implements AutoCloseable {
     private final CustomWorldSettings customWorldSettings;
     private final ConcurrentMap<ColumnPos, CubeColumn<LoadedCube>> columns = new ConcurrentHashMap<>();
     private final ConcurrentMap<CubePos, LoadedCube> cubes = new ConcurrentHashMap<>();
+    // Resume across ticks so a retained/clean prefix cannot starve the tail.
+    private Iterator<LoadedCube> saveCursor = java.util.Collections.emptyIterator();
+    private Iterator<LoadedCube> evictionCursor = java.util.Collections.emptyIterator();
     private final ConcurrentMap<CubePos, LoadContext> loadContexts = new ConcurrentHashMap<>();
     private final ConcurrentMap<BlockColumnPos, Integer> highestBlocks = new ConcurrentHashMap<>();
     /** Small LRU of immutable codec results reused by send/save paths. */
@@ -356,15 +360,6 @@ final class CubicWorldState implements AutoCloseable {
         simulationServices.open();
     }
 
-    private Collection<CubePos> loadedFullCubes() {
-        Set<CubePos> result = new HashSet<>();
-        for (Map.Entry<CubePos, LoadedCube> entry : cubes.entrySet()) {
-            LoadContext context = loadContexts.get(entry.getKey());
-            if (context != null && context.full) result.add(entry.getKey());
-        }
-        return Set.copyOf(result);
-    }
-
     private Collection<CubeSpawnPolicy.SimulationWindow> simulationWindows() {
         int simulationDistance = Math.max(
                 0, world.getServer().getPlayerManager().getSimulationDistance());
@@ -631,7 +626,10 @@ final class CubicWorldState implements AutoCloseable {
         // Serialization still reads Minecraft's ChunkSection and therefore
         // stays on the server thread.  Queue one snapshot per tick instead of
         // encoding every loaded cube and then waiting for fsync in one tick.
-        for (LoadedCube cube : loadedCubes()) {
+        if (!saveCursor.hasNext()) saveCursor = cubes.values().iterator();
+        for (int scanned = 0; scanned < MAINTENANCE_SCANS_PER_PASS && saveCursor.hasNext(); scanned++) {
+            LoadedCube cube = saveCursor.next();
+            if (cubes.get(cube.pos()) != cube) continue;
             LoadContext context = loadContexts.get(cube.pos());
             if (cube.isDirty() && (context == null || context.full || context.persistable)) {
                 save(cube, false, false);
@@ -643,60 +641,63 @@ final class CubicWorldState implements AutoCloseable {
     void evictExcept(Set<CubePos> retained) throws IOException {
         IOException failure = null;
         int evicted = 0;
+        Set<ColumnPos> changedSkyColumns = new HashSet<>();
         long started = System.nanoTime();
-        boolean budgetExhausted = false;
-        for (Map.Entry<ColumnPos, CubeColumn<LoadedCube>> entry : columns.entrySet()) {
-            if (budgetExhausted) break;
-            CubeColumn<LoadedCube> column = entry.getValue();
-            boolean removedFromColumn = false;
-            for (LoadedCube cube : List.copyOf(column.loaded())) {
-                if (evicted >= EVICTIONS_PER_PASS
-                        || System.nanoTime() - started >= EVICTION_NANOS_PER_PASS) {
-                    budgetExhausted = true;
-                    break;
-                }
-                // A ticket's dependency halo is not necessarily present in a
-                // player's sent/pending set.  Evicting it while FEATURES or
-                // LIGHT is waiting makes the DAG restart mid-commit and can
-                // expose an incomplete neighbour to gameplay code.
-                if (!isOutsideVanillaHeight(cube.pos()) || retained.contains(cube.pos())
-                        || taskScheduler.isRequired(cube.pos())) {
+        if (!evictionCursor.hasNext()) evictionCursor = cubes.values().iterator();
+        for (int scanned = 0; scanned < MAINTENANCE_SCANS_PER_PASS && evictionCursor.hasNext(); scanned++) {
+            if (evicted >= EVICTIONS_PER_PASS
+                    || System.nanoTime() - started >= EVICTION_NANOS_PER_PASS) break;
+            LoadedCube cube = evictionCursor.next();
+            if (cubes.get(cube.pos()) != cube) continue;
+            // A ticket's dependency halo is not necessarily present in a
+            // player's sent/pending set.  Evicting it while FEATURES or
+            // LIGHT is waiting makes the DAG restart mid-commit and can
+            // expose an incomplete neighbour to gameplay code.
+            if (!isOutsideVanillaHeight(cube.pos()) || retained.contains(cube.pos())
+                    || taskScheduler.isRequired(cube.pos())) {
+                continue;
+            }
+            try {
+                // Eviction is two-phase.  First queue the latest immutable
+                // payload; a later maintenance pass removes the live cube
+                // only after the asynchronous write has completed.
+                if (cube.isDirty()) {
+                    save(cube, false, false);
                     continue;
                 }
-                try {
-                    // Eviction is two-phase.  First queue the latest immutable
-                    // payload; a later maintenance pass removes the live cube
-                    // only after the asynchronous write has completed.
-                    if (cube.isDirty()) {
-                        save(cube, false, false);
-                        continue;
-                    }
-                    if (!taskScheduler.saveComplete(cube.pos())) continue;
-                    column.remove(cube.pos().y());
-                    cubes.remove(cube.pos(), cube);
-                    lightEngine.discardCube(cube.pos());
-                    invalidatePayload(cube.pos());
-                    loadContexts.remove(cube.pos());
-                    removeIndexedHeights(cube);
-                    taskScheduler.release(cube.pos());
-                    removedFromColumn = true;
-                    evicted++;
-                } catch (IOException exception) {
-                    if (failure == null) {
-                        failure = exception;
-                    } else {
-                        failure.addSuppressed(exception);
-                    }
+                if (!taskScheduler.saveComplete(cube.pos())) continue;
+                ColumnPos columnPos = new ColumnPos(cube.pos().x(), cube.pos().z());
+                CubeColumn<LoadedCube> column = columns.get(columnPos);
+                if (column == null) continue;
+                column.remove(cube.pos().y());
+                cubes.remove(cube.pos(), cube);
+                simulationServices.fullCubeUnloaded(cube.pos());
+                lightEngine.discardCube(cube.pos());
+                invalidatePayload(cube.pos());
+                loadContexts.remove(cube.pos());
+                removeIndexedHeights(cube);
+                if (cube.pos().minBlockY() > world.getTopYInclusive()) {
+                    // Above the vanilla band, removing the highest cube
+                    // can expose disconnected lower cubes to direct sky.
+                    changedSkyColumns.add(columnPos);
+                }
+                // The removed cube is no longer managed: seed just its
+                // surviving neighbour faces, not every cube in the column.
+                lightEngine.queueCube(cube.pos(), false);
+                taskScheduler.release(cube.pos());
+                evicted++;
+                if (column.isEmpty()) columns.remove(columnPos, column);
+            } catch (IOException exception) {
+                if (failure == null) {
+                    failure = exception;
+                } else {
+                    failure.addSuppressed(exception);
                 }
             }
-            if (removedFromColumn && !column.isEmpty()) {
-                // Only a boundary changed. Reinitializing every one of the
-                // remaining cube's 4096 cells creates an unload-time light storm.
-                column.forEach(remaining -> lightEngine.queueCube(remaining.pos(), false));
-            }
-            if (column.isEmpty()) {
-                columns.remove(entry.getKey(), column);
-            }
+        }
+        for (ColumnPos pos : changedSkyColumns) {
+            CubeColumn<LoadedCube> column = columns.get(pos);
+            if (column != null) column.forEach(cube -> lightEngine.queueCube(cube.pos(), false));
         }
         // The ordinary tick slice drains boundary light work incrementally.
         if (failure != null) {
@@ -705,7 +706,7 @@ final class CubicWorldState implements AutoCloseable {
     }
 
     void tick() {
-        simulationServices.tick(loadedFullCubes(), world.getTime());
+        simulationServices.tick(world.getTime());
         // Vanilla's scheduled tick phase has already run by the time the
         // HigherWorld END_WORLD_TICK callback arrives. Cube events are kept
         // in a separate deterministic queue and are drained with a hard
@@ -733,23 +734,23 @@ final class CubicWorldState implements AutoCloseable {
             if (!batch.isEmpty()) CubeWatchManager.broadcastLightUpdates(world, batch);
         }
         int randomTickSpeed = world.getGameRules().getValue(GameRules.RANDOM_TICK_SPEED);
-        for (CubeColumn<LoadedCube> column : columns.values()) {
-            column.forEach(cube -> {
-                // Loaded is not the same as ticketed.  Direct block queries can
-                // leave a sparse cube cached for a short time; ticking it would
-                // continue simulation after its owner has gone away.
-                if (!taskScheduler.isRequired(cube.pos())) return;
-                CubeHolder holder = taskScheduler.holder(cube.pos());
-                // A lower-priority ticket may deliberately downgrade an
-                // already-loaded cube to TERRAIN/FEATURES.  Status is
-                // monotonic within an epoch, so target must be checked too;
-                // otherwise the old FULL state would keep ticking forever.
-                if (!holder.target().isAtLeast(CubeStatus.FULL)
-                        || !holder.status().isAtLeast(CubeStatus.FULL)) return;
-                if (!CubeWatchManager.shouldTick(world, cube.pos())) return;
-                cube.tickBlockEntities(world);
-                cube.tickRandomly(world, randomTickSpeed);
-            });
+        for (CubeHolder holder : taskScheduler.fullTickingHolders()) {
+            LoadedCube cube = loadedCube(holder.pos());
+            if (cube == null) continue;
+            // Loaded is not the same as ticketed.  Direct block queries can
+            // leave a sparse cube cached for a short time; ticking it would
+            // continue simulation after its owner has gone away.
+            if (!taskScheduler.isRequired(cube.pos())) continue;
+            // A lower-priority ticket may deliberately downgrade an
+            // already-loaded cube to TERRAIN/FEATURES.  Status is
+            // monotonic within an epoch, so target must be checked too;
+            // otherwise the old FULL state would keep ticking forever.
+            if (!holder.target().isAtLeast(CubeStatus.FULL)
+                    || !holder.status().isAtLeast(CubeStatus.FULL)
+                    || holder.failed()) continue;
+            if (!CubeWatchManager.shouldTick(world, cube.pos())) continue;
+            cube.tickBlockEntities(world);
+            cube.tickRandomly(world, randomTickSpeed);
         }
     }
 
@@ -968,6 +969,7 @@ final class CubicWorldState implements AutoCloseable {
     private void markCubeFull(LoadContext context) {
         if (context.full) return;
         context.full = true;
+        simulationServices.fullCubeLoaded(context.cube.pos());
         // A PAYLOAD response may have been cached with HWC6/hasLight=false.
         // FULL is a lifecycle transition rather than a block mutation, so it
         // is not guaranteed to change LoadedCube.revision(); invalidate the
@@ -1003,6 +1005,7 @@ final class CubicWorldState implements AutoCloseable {
                 if (column.isEmpty()) columns.remove(new ColumnPos(pos.x(), pos.z()), column);
             }
             cubes.remove(pos, existing.cube);
+            simulationServices.fullCubeUnloaded(pos);
             invalidatePayload(pos);
             removeIndexedHeights(existing.cube);
         }
@@ -1434,6 +1437,8 @@ final class CubicWorldState implements AutoCloseable {
         }
         columns.clear();
         cubes.clear();
+        saveCursor = java.util.Collections.emptyIterator();
+        evictionCursor = java.util.Collections.emptyIterator();
         loadContexts.clear();
         clearPayloadCache();
         CubeScheduledTickQueue.unregister(world, scheduledTicks);

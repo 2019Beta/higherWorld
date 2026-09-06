@@ -12,8 +12,10 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.NavigableSet;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.TreeSet;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 
@@ -59,7 +61,7 @@ public final class CubeSimulationServices implements AutoCloseable {
     private final EntityTicketSink entityTicketSink;
     private final CubePoiIndex poiIndex = new CubePoiIndex();
     private final Map<Object, CubeSpawnPolicy.Ticket> entityTickets = new HashMap<>();
-    private List<CubePos> fullCubes = List.of();
+    private final NavigableSet<CubePos> fullCubes = new TreeSet<>(CUBE_ORDER);
     private List<CubeSpawnPolicy.SimulationWindow> simulationWindows = List.of();
     private boolean opened;
     private boolean closed;
@@ -237,12 +239,25 @@ public final class CubeSimulationServices implements AutoCloseable {
     public synchronized void tick(Collection<CubePos> loadedFullCubes, long gameTime) {
         ensureOpen();
         Objects.requireNonNull(loadedFullCubes, "loadedFullCubes");
-        List<CubePos> cubes = new ArrayList<>();
+        fullCubes.clear();
         for (CubePos cube : loadedFullCubes) {
-            if (cube != null && cube.isBlockRangeRepresentable()) cubes.add(cube);
+            if (cube != null && cube.isBlockRangeRepresentable()) fullCubes.add(cube);
         }
-        cubes.sort(CUBE_ORDER);
-        fullCubes = List.copyOf(cubes);
+        tick(gameTime);
+    }
+
+    /** World lifecycle hooks keep the spawn index current without a cache scan. */
+    synchronized void fullCubeLoaded(CubePos cube) {
+        ensureOpen();
+        if (cube.isBlockRangeRepresentable()) fullCubes.add(cube);
+    }
+
+    synchronized void fullCubeUnloaded(CubePos cube) {
+        fullCubes.remove(cube);
+    }
+
+    synchronized void tick(long gameTime) {
+        ensureOpen();
         simulationWindows = readWindows();
 
         var iterator = entityTickets.entrySet().iterator();
@@ -397,6 +412,7 @@ public final class CubeSimulationServices implements AutoCloseable {
                 entityTicketSink.remove(owner);
             }
             entityTickets.clear();
+            fullCubes.clear();
             closed = true;
         }
         if (failure != null) throw failure;

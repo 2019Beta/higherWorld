@@ -890,7 +890,9 @@ public final class CubeWatchManager {
     static final class AdaptiveBudget {
         private static final long TARGET_NANOS = 6_000_000L;
         private static final long MAX_DEBT_NANOS = 300_000_000L;
+        private static final long MIN_COMMIT_NANOS = 500_000L;
         private double averageNanos = TARGET_NANOS;
+        private double averageCommitNanos = TARGET_NANOS;
         private long debtNanos;
 
         int cubeAllowance() {
@@ -914,15 +916,17 @@ public final class CubeWatchManager {
 
         long claimCommitNanos() {
             if (debtNanos > 0L) {
-                debtNanos = Math.max(0L, debtNanos - TARGET_NANOS);
-                return 0L;
+                // Repay overruns with a smaller slice, never a multi-second
+                // blackout that drains the IO/GPU pipeline between bursts.
+                debtNanos = Math.max(0L, debtNanos - (TARGET_NANOS - MIN_COMMIT_NANOS));
+                return MIN_COMMIT_NANOS;
             }
-            return Math.max(500_000L, Math.min(TARGET_NANOS, (long) (TARGET_NANOS *
-                    TARGET_NANOS / Math.max(TARGET_NANOS, averageNanos))));
+            return Math.max(MIN_COMMIT_NANOS, Math.min(TARGET_NANOS, (long) (TARGET_NANOS *
+                    TARGET_NANOS / Math.max(TARGET_NANOS, averageCommitNanos))));
         }
 
         void recordCommit(long elapsedNanos) {
-            record(elapsedNanos);
+            averageCommitNanos = averageCommitNanos * 0.8 + elapsedNanos * 0.2;
             if (elapsedNanos > TARGET_NANOS) {
                 debtNanos = Math.min(MAX_DEBT_NANOS,
                         debtNanos + elapsedNanos - TARGET_NANOS);

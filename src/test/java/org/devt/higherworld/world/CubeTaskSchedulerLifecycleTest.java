@@ -19,6 +19,34 @@ class CubeTaskSchedulerLifecycleTest {
     Path directory;
 
     @Test
+    void tickingFrontierTracksFullPromotionDowngradeFailureAndCancellation() throws Exception {
+        CubePos pos = new CubePos(0, -20, 0);
+        try (CubeStorage storage = new CubeStorage(directory);
+                CubeIoScheduler io = new CubeIoScheduler(storage);
+                CubeTaskScheduler scheduler = new CubeTaskScheduler(io)) {
+            CubeHolder holder = scheduler.holder(pos);
+            holder.request(CubeStatus.FULL);
+            holder.advance(CubeStatus.PAYLOAD);
+            assertFalse(scheduler.fullTickingHolders().iterator().hasNext());
+            holder.complete(null);
+            assertSame(holder, scheduler.fullTickingHolders().iterator().next());
+            holder.lowerTarget(CubeStatus.PAYLOAD);
+            assertFalse(scheduler.fullTickingHolders().iterator().hasNext());
+            holder.request(CubeStatus.FULL);
+            assertSame(holder, scheduler.fullTickingHolders().iterator().next());
+            holder.fail(new IllegalStateException("test"));
+            assertFalse(scheduler.fullTickingHolders().iterator().hasNext());
+            holder.cancel();
+            holder.request(CubeStatus.FULL);
+            holder.complete(null);
+            assertTrue(scheduler.fullTickingHolders().iterator().hasNext());
+            scheduler.release(pos);
+            assertFalse(scheduler.fullTickingHolders().iterator().hasNext());
+            assertEquals(0, scheduler.holderCount());
+        }
+    }
+
+    @Test
     void cachedTicketClosureDoesNotRetainFinishedStreamingRoots() throws Exception {
         CubePos center = new CubePos(12, -20, -7);
         CubePos streaming = new CubePos(100, -40, 100);

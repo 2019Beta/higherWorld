@@ -32,6 +32,38 @@ class CubeSimulationServicesTest {
     Path directory;
 
     @Test
+    void incrementalFullIndexMatchesSnapshotAcrossUnloadAndReload() throws Exception {
+        CubePos first = new CubePos(0, -2, 0);
+        CubePos second = new CubePos(1, -2, 0);
+        var windows = List.of(new CubeSpawnPolicy.SimulationWindow(first, 4, 4));
+        try (CubeSimulationServices incremental = new CubeSimulationServices(
+                    directory.resolve("incremental.bin"), alwaysFullAccess(), () -> windows);
+                CubeSimulationServices reference = new CubeSimulationServices(
+                    directory.resolve("reference.bin"), alwaysFullAccess(), () -> windows)) {
+            incremental.open();
+            reference.open();
+            incremental.fullCubeLoaded(second);
+            incremental.fullCubeLoaded(first);
+            incremental.fullCubeLoaded(first);
+            incremental.tick(1L);
+            reference.tick(List.of(first, second), 1L);
+            assertFalse(reference.spawnCandidates(42L, 1L, 2).isEmpty());
+            assertEquals(reference.spawnCandidates(42L, 1L, 2),
+                    incremental.spawnCandidates(42L, 1L, 2));
+            incremental.fullCubeUnloaded(first);
+            incremental.tick(2L);
+            reference.tick(List.of(second), 2L);
+            assertEquals(reference.spawnCandidates(42L, 2L, 2),
+                    incremental.spawnCandidates(42L, 2L, 2));
+            incremental.fullCubeLoaded(first);
+            incremental.tick(3L);
+            reference.tick(List.of(first, second), 3L);
+            assertEquals(reference.spawnCandidates(42L, 3L, 2),
+                    incremental.spawnCandidates(42L, 3L, 2));
+        }
+    }
+
+    @Test
     void poiIndexSurvivesServiceCloseAndReopen() throws Exception {
         Path file = directory.resolve("simulation_services.bin");
         CubePathfindingAccess access = alwaysFullAccess();
