@@ -1,6 +1,6 @@
 package org.devt.higherworld.world;
 
-import net.minecraft.SharedConstants;
+import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.registry.entry.RegistryEntry;
 import net.minecraft.server.world.ServerWorld;
@@ -16,6 +16,8 @@ import org.devt.higherworld.mixin.NoiseConfigAccessor;
 
 /** Complete per-world noise settings for the unbounded-downward overworld. */
 final class InfiniteNoiseSettings {
+    private static final int VANILLA_LAVA_LEVEL = -54;
+
     private InfiniteNoiseSettings() {
     }
 
@@ -30,11 +32,11 @@ final class InfiniteNoiseSettings {
 
         NoiseChunkGeneratorAccessor accessor = (NoiseChunkGeneratorAccessor) (Object) generator;
         accessor.higherworld$setSettings(RegistryEntry.of(rewritten));
-        // NoiseChunkGenerator's vanilla sampler uses a fixed lava level below
-        // Y=-54.  That level is safe only inside the finite vanilla band: when
-        // reused below it, it bypasses the aquifer noise and fills every deep
-        // opening with lava. Use one continuous base level instead.
-        accessor.higherworld$setFluidLevelSampler(() -> unboundedVanillaFluidSampler(rewritten));
+        // Do not let the finite vanilla lava floor leak into the unbounded
+        // extension. The original band keeps its water aquifer, while samples
+        // below the vanilla lava cutoff become air.
+        accessor.higherworld$setFluidLevelSampler(() -> dryDeepFluidSampler(
+                rewritten.seaLevel(), rewritten.defaultFluid()));
 
         NoiseConfig noiseConfig = world.getChunkManager().getNoiseConfig();
         NoiseRouter sampledRouter = InfiniteDownwardGenerator.removeVanillaBottomSlide(
@@ -45,13 +47,13 @@ final class InfiniteNoiseSettings {
     static ChunkGeneratorSettings createSparseSettings(
             ChunkGeneratorSettings source, GenerationShapeConfig shape, NoiseRouter router) {
         return copy(source, shape, Blocks.DEEPSLATE.getDefaultState(),
-                source.defaultFluid(), router, source.aquifers());
+                Blocks.AIR.getDefaultState(), router, false);
     }
 
-    static void useUnboundedAquifers(NoiseChunkGenerator generator) {
-        ChunkGeneratorSettings settings = generator.getSettings().value();
+    static void makeSparseGeneratorDry(NoiseChunkGenerator generator) {
+        AquiferSampler.FluidLevel air = airLevel();
         ((NoiseChunkGeneratorAccessor) (Object) generator)
-                .higherworld$setFluidLevelSampler(() -> unboundedVanillaFluidSampler(settings));
+                .higherworld$setFluidLevelSampler(() -> (x, y, z) -> air);
     }
 
     private static ChunkGeneratorSettings copy(
@@ -72,19 +74,16 @@ final class InfiniteNoiseSettings {
                 source.usesLegacyRandom());
     }
 
-    /**
-     * Keep the aquifer picker independent of the finite vanilla dimension
-     * bottom. A fixed lava level would short-circuit the aquifer noise below
-     * Y=-54; a continuous base lets the floodedness, spread, and lava noises
-     * choose the fluid type and surface at every generated Y coordinate.
-     */
-    private static AquiferSampler.FluidLevelSampler unboundedVanillaFluidSampler(
-            ChunkGeneratorSettings settings) {
-        AquiferSampler.FluidLevel base = new AquiferSampler.FluidLevel(
-                settings.seaLevel(), settings.defaultFluid());
+    static AquiferSampler.FluidLevelSampler dryDeepFluidSampler(
+            int seaLevel, BlockState defaultFluid) {
         AquiferSampler.FluidLevel air = new AquiferSampler.FluidLevel(
                 Integer.MAX_VALUE, Blocks.AIR.getDefaultState());
-        return (x, y, z) -> SharedConstants.DISABLE_FLUID_GENERATION
-                ? air : base;
+        AquiferSampler.FluidLevel water = new AquiferSampler.FluidLevel(
+                seaLevel, defaultFluid);
+        return (x, y, z) -> y < VANILLA_LAVA_LEVEL ? air : water;
+    }
+
+    private static AquiferSampler.FluidLevel airLevel() {
+        return new AquiferSampler.FluidLevel(Integer.MAX_VALUE, Blocks.AIR.getDefaultState());
     }
 }

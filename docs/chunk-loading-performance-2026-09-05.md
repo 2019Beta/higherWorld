@@ -69,3 +69,13 @@
 - Gradle 在本机仍在任务执行前因 `Unable to establish loopback connection` 失败；没有把它伪装成通过。
 - 早期 `build/` 诊断文件被外部 clean 删除，所以不引用旧进程 JFR；本报告引用当前 PID 的 30 秒 JFR、线程 dump、server-thread 对象反射和 GPU harness 结果。
 - 当前重启实例已不再满足“所有 feature owner 都被 wide halo 卡住”：777/2,434 个 owner 已 ready，但 1,639 个仍被阻塞。后续验证仍应检查这些 owner、`readyQueue/queuedReady` 和 generation executor/batcher 是否随移动操作持续推进；本次 JFR 的非零提交采样不足以给出完整提交成功率。
+
+## 最终修复与收尾验证（2026-09-06）
+
+`VanillaPlacedFeatureGenerator.createFeatureChunk` 的 `FeatureBatchWriter` 分支现对每个临时 `ChunkSection` 只获取一次 palette lock，在 `try/finally` 中用 `setBlockState(..., false)` 完成 4096 个方块写入，再释放锁，最后才包装为 `TrackingChunkSection`。`false` 只选择 `PalettedContainer.swapUnsafe()`，`ChunkSection` 仍更新非空方块、随机刻和流体计数；原有 translated 分支保持逐方块 setter。当前生产源码用独立 `javac` 编译成功（退出码 0），`javap` 已确认生成的字节码包含一次 `lock`、带异常清理的 `unlock`，以及五参数 `setBlockState` 的 `false` 参数。
+
+当前已有的调度修复会即时保留宽 halo 引用并在就绪提交时过滤无效候选；`markInFlight` 会发布 prefetch 变更；当 `readyQueue` 超过 `4 * live + 1024` 时压缩过期对象；epoch 刷新会补足扫描预算；存在正预算时允许首个候选推进，避免首轮扫描把可执行工作全部跳过。
+
+当前版本的独立手工 harness 已通过 23 个调度、watch 和预算测试，结果为 `tests=23 failures=0`。按要求执行的 Gradle 定向测试仍在任务启动前因 `Unable to establish loopback connection` 失败，因此没有把 Gradle 结果记为通过。
+
+临时 Minecraft palette smoke 未能在普通独立 JVM 中执行完成：缓存的 Minecraft 类需要游戏启动器提供的运行时转换，初始化阶段触发 `VerifyError`（`MobEntity.isInAttackRange`）；这次没有据此给出 palette 等价性或 setter 提速数字。当前结果也尚未经过游戏内重新加载后的实测，区块移动时的 feature 推进、总体加载时间和客户端表现仍需用包含该生产类的重启实例复测。

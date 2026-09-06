@@ -18,7 +18,7 @@ import org.devt.higherworld.storage.CubePos;
 
 /** Lazily extends Overworld terrain below the vanilla generation band. */
 final class InfiniteDownwardGenerator {
-    static final int GENERATION_VERSION = 16;
+    static final int GENERATION_VERSION = 17;
     private static final BlockState AIR = Blocks.AIR.getDefaultState();
     private static final BlockState DEEPSLATE = Blocks.DEEPSLATE.getDefaultState();
     private static final int NOISE_CELL_SIZE = 4;
@@ -226,6 +226,12 @@ final class InfiniteDownwardGenerator {
             ServerWorld world, LoadedCube cube, StructureGenerationSettings structureSettings) {
         if (cube.generationVersion() >= GENERATION_VERSION) {
             return false;
+        }
+        if (cube.generationVersion() == 16) {
+            removeGeneratedFluids(cube);
+            cube.setGenerationVersion(GENERATION_VERSION);
+            cube.markDirty();
+            return true;
         }
         if (cube.generationVersion() == 15) {
             removeGeneratedFluids(cube);

@@ -35,6 +35,22 @@ class CustomGenerationTest {
     }
 
     @Test
+    void dungeonBudgetIsDistributedAcrossOneVerticalBand() {
+        int bottomSection = -4;
+        int dungeonCount = 7;
+        int planned = 0;
+        for (int offset = 0; offset < CustomDungeonGenerator.DUNGEON_BAND_CUBES; offset++) {
+            planned += CustomDungeonGenerator.plannedAttemptsForCube(
+                    42L, bottomSection, new CubePos(2, bottomSection - 1 - offset, 3),
+                    dungeonCount);
+        }
+
+        assertEquals(dungeonCount, planned);
+        assertEquals(0, CustomDungeonGenerator.plannedAttemptsForCube(
+                42L, bottomSection, new CubePos(2, bottomSection, 3), dungeonCount));
+    }
+
+    @Test
     void terrainNoiseIsDeterministicAndParametersMatter() {
         CustomWorldSettings defaults = CustomWorldSettings.customDefaults();
         double first = CustomCubeGenerator.terrainDensity(12345L, defaults, 18.0, -96.0, -7.0);

@@ -1022,6 +1022,11 @@ final class CubicWorldState implements AutoCloseable {
                                         pos, CubeStatus.FEATURES)) {
                             if (InfiniteDownwardGenerator.upgradeLegacyTerrain(
                                     world, context.cube, effectiveStructureSettings())) {
+                                // Terrain migrations can add/remove opaque or
+                                // luminous blocks. Re-seed lighting instead of
+                                // trusting the snapshot stored with the old
+                                // generator output.
+                                context.hasSavedLight = false;
                                 Higherworld.LOGGER.debug(
                                         "Upgraded generated terrain cube {}", pos);
                             }

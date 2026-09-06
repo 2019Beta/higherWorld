@@ -53,6 +53,8 @@ final class VanillaPlacedFeatureGenerator {
     private static final int VANILLA_BOTTOM_Y = -64;
     private static final int VANILLA_HEIGHT = 384;
     private static final int REPEATED_BAND_HEIGHT = 64;
+    /** Monster-room placement counts are tuned for a full-height vanilla chunk. */
+    private static final int DUNGEON_REPETITION_BANDS = 4; // 4 x 64 = 256 blocks
     /** Large dripstone searches up to 30 blocks across a band boundary. */
     private static final int FEATURE_VERTICAL_HALO = 32;
     private static final int FEATURE_SOURCE_BAND_RADIUS = 1;
@@ -383,6 +385,10 @@ final class VanillaPlacedFeatureGenerator {
 
                 for (FeatureCall call : features) {
                     PlacedFeature feature = call.feature();
+                    if (!shouldGenerateFeature(registry, feature, repeatedBand,
+                            boundaryMode)) {
+                        continue;
+                    }
                     int registryId = registry.getRawId(feature);
                     int decoratorIndex = registryId >= 0 ? registryId : call.index();
                     random.setDecoratorSeed(
@@ -461,12 +467,41 @@ final class VanillaPlacedFeatureGenerator {
         long populationSeed = random.setPopulationSeed(bandSeed, originX, originZ);
         BlockPos origin = new BlockPos(originX, VANILLA_BOTTOM_Y, originZ);
         for (FeatureCall call : features) {
+            if (!shouldGenerateFeature(registry, call.feature(), key.repeatedBand(),
+                    BoundaryMode.TRANSLATED)) {
+                continue;
+            }
             int registryId = registry.getRawId(call.feature());
             int decoratorIndex = registryId >= 0 ? registryId : call.index();
             random.setDecoratorSeed(populationSeed, decoratorIndex, call.step().ordinal());
             call.feature().generate(access, generator, random, origin);
         }
         return writer.snapshot(world);
+    }
+
+    /**
+     * A vanilla monster-room placed feature already contains a count for a
+     * full-height chunk. Replaying it in every 64-block deep band multiplies
+     * that count as the sparse world is extended downward. Keep the feature in
+     * one band out of four, matching the 256-block budget used by custom
+     * dungeons. Other placed features retain their existing repeated-band
+     * behavior.
+     */
+    private static boolean shouldGenerateFeature(
+            Registry<PlacedFeature> registry, PlacedFeature feature,
+            long repeatedBand, BoundaryMode boundaryMode) {
+        if (boundaryMode != BoundaryMode.TRANSLATED || !isDungeonFeature(registry, feature)) {
+            return true;
+        }
+        return Math.floorMod(repeatedBand, DUNGEON_REPETITION_BANDS) == 0;
+    }
+
+    private static boolean isDungeonFeature(
+            Registry<PlacedFeature> registry, PlacedFeature feature) {
+        return registry.getKey(feature).map(key -> {
+            String path = key.getValue().getPath();
+            return "monster_room".equals(path) || "monster_room_deep".equals(path);
+        }).orElse(false);
     }
 
     private static void applyBatch(

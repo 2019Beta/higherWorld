@@ -15,6 +15,8 @@ import org.devt.higherworld.storage.CubePos;
 /** Cube-local stone-brick dungeon rooms for custom worlds. */
 final class CustomDungeonGenerator {
     private static final long SALT = 0x44554E47454F4E4CL;
+    /** Keep the configured dungeon budget independent from cube height. */
+    static final int DUNGEON_BAND_CUBES = 16; // 256 blocks / 16 blocks per cube
 
     private CustomDungeonGenerator() {
     }
@@ -23,23 +25,96 @@ final class CustomDungeonGenerator {
         if (!settings.dungeons() || settings.dungeonCount() == 0) {
             return;
         }
-        Random random = new Random(seed(world.getSeed(), cube.pos()));
+        long depthIndex = depthIndex(world.getBottomSectionCoord(), cube.pos().y());
+        if (depthIndex < 0) {
+            return;
+        }
+        int cubeOffset = (int) Math.floorMod(depthIndex, DUNGEON_BAND_CUBES);
+        long band = Math.floorDiv(depthIndex, DUNGEON_BAND_CUBES);
+        // A dungeon count is a budget for one 256-block vertical band in a
+        // horizontal chunk column.  Assign each attempt to one of the sixteen
+        // cubes in that band so loading order cannot multiply the result.
+        Random planningRandom = new Random(seed(world.getSeed(), cube.pos(), band));
         for (int attempt = 0; attempt < settings.dungeonCount(); attempt++) {
-            int halfWidth = random.nextBoolean() ? 2 : 3;
-            int halfDepth = random.nextBoolean() ? 2 : 3;
-            int centerX = halfWidth + 1 + random.nextInt(CubePos.SIZE - (halfWidth * 2 + 2));
-            int centerZ = halfDepth + 1 + random.nextInt(CubePos.SIZE - (halfDepth * 2 + 2));
-            int centerY = 2 + random.nextInt(CubePos.SIZE - 4);
+            int targetCubeOffset = planningRandom.nextInt(DUNGEON_BAND_CUBES);
+            int halfWidth = planningRandom.nextBoolean() ? 2 : 3;
+            int halfDepth = planningRandom.nextBoolean() ? 2 : 3;
+            int centerX = halfWidth + 1
+                    + planningRandom.nextInt(CubePos.SIZE - (halfWidth * 2 + 2));
+            int centerZ = halfDepth + 1
+                    + planningRandom.nextInt(CubePos.SIZE - (halfDepth * 2 + 2));
+            int centerY = 2 + planningRandom.nextInt(CubePos.SIZE - 4);
+            if (targetCubeOffset != cubeOffset) {
+                continue;
+            }
             if (!canFit(cube, centerX, centerY, centerZ, halfWidth, halfDepth)) {
                 continue;
             }
-            placeRoom(world, cube, random, centerX, centerY, centerZ, halfWidth, halfDepth);
+            Random roomRandom = new Random(seed(
+                    world.getSeed(), cube.pos(), band, attempt));
+            placeRoom(world, cube, roomRandom, centerX, centerY, centerZ, halfWidth, halfDepth);
         }
+    }
+
+    /** Returns the planned attempts assigned to a cube, before terrain checks. */
+    static int plannedAttemptsForCube(
+            long worldSeed, int bottomSectionCoord, CubePos cubePos, int dungeonCount) {
+        if (dungeonCount <= 0) {
+            return 0;
+        }
+        long depthIndex = depthIndex(bottomSectionCoord, cubePos.y());
+        if (depthIndex < 0) {
+            return 0;
+        }
+        int cubeOffset = (int) Math.floorMod(depthIndex, DUNGEON_BAND_CUBES);
+        long band = Math.floorDiv(depthIndex, DUNGEON_BAND_CUBES);
+        Random planningRandom = new Random(seed(worldSeed, cubePos, band));
+        int planned = 0;
+        for (int attempt = 0; attempt < dungeonCount; attempt++) {
+            int targetCubeOffset = planningRandom.nextInt(DUNGEON_BAND_CUBES);
+            int halfWidth = planningRandom.nextBoolean() ? 2 : 3;
+            int halfDepth = planningRandom.nextBoolean() ? 2 : 3;
+            planningRandom.nextInt(CubePos.SIZE - (halfWidth * 2 + 2));
+            planningRandom.nextInt(CubePos.SIZE - (halfDepth * 2 + 2));
+            planningRandom.nextInt(CubePos.SIZE - 4);
+            if (targetCubeOffset == cubeOffset) {
+                planned++;
+            }
+        }
+        return planned;
     }
 
     private static boolean canFit(
             LoadedCube cube, int centerX, int centerY, int centerZ,
             int halfWidth, int halfDepth) {
+        // DungeonFeature does not succeed in arbitrary solid terrain. It
+        // requires a small connection to an existing cave (one to five
+        // exposed air pairs on the outside wall). Without this check every
+        // custom attempt becomes a room, which is much denser than ordinary
+        // monster_room generation even when the attempt budget is correct.
+        int minX = centerX - halfWidth - 1;
+        int maxX = centerX + halfWidth + 1;
+        int minZ = centerZ - halfDepth - 1;
+        int maxZ = centerZ + halfDepth + 1;
+        int openings = 0;
+        for (int x = minX; x <= maxX; x++) {
+            for (int z = minZ; z <= maxZ; z++) {
+                if (!isSolid(cube.section().getBlockState(x, centerY - 1, z))
+                        || !isSolid(cube.section().getBlockState(x, centerY + 2, z))) {
+                    return false;
+                }
+                boolean outsideWall = x == minX || x == maxX || z == minZ || z == maxZ;
+                if (outsideWall
+                        && cube.section().getBlockState(x, centerY, z).isAir()
+                        && cube.section().getBlockState(x, centerY + 1, z).isAir()) {
+                    openings++;
+                }
+            }
+        }
+        if (openings < 1 || openings > 5) {
+            return false;
+        }
+
         for (int y = centerY - 1; y <= centerY + 2; y++) {
             for (int z = centerZ - halfDepth; z <= centerZ + halfDepth; z++) {
                 for (int x = centerX - halfWidth; x <= centerX + halfWidth; x++) {
@@ -138,11 +213,24 @@ final class CustomDungeonGenerator {
                 || state.isOf(Blocks.GRASS_BLOCK) || state.isAir();
     }
 
-    private static long seed(long worldSeed, CubePos pos) {
+    private static boolean isSolid(BlockState state) {
+        return state.isSolid();
+    }
+
+    private static long depthIndex(int bottomSectionCoord, int cubeY) {
+        return (long) bottomSectionCoord - 1L - cubeY;
+    }
+
+    private static long seed(long worldSeed, CubePos pos, long band) {
+        return seed(worldSeed, pos, band, 0L);
+    }
+
+    private static long seed(long worldSeed, CubePos pos, long band, long attempt) {
         long value = worldSeed ^ SALT
                 ^ (long) pos.x() * 0x9E3779B97F4A7C15L
-                ^ (long) pos.y() * 0xC2B2AE3D27D4EB4FL
-                ^ (long) pos.z() * 0x165667B19E3779F9L;
+                ^ band * 0xC2B2AE3D27D4EB4FL
+                ^ (long) pos.z() * 0x165667B19E3779F9L
+                ^ attempt * 0xA24BAED4963EE407L;
         value = (value ^ (value >>> 30)) * 0xBF58476D1CE4E5B9L;
         value = (value ^ (value >>> 27)) * 0x94D049BB133111EBL;
         return value ^ (value >>> 31);
