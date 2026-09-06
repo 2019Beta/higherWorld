@@ -16,13 +16,51 @@ final class CubeTicketManager {
      * can scan this small set while holding the monitor.
      */
     private final Map<Object, CubeTicket> tickets = new HashMap<>();
+    /** Immutable spatial demand, reused while watcher payload roots change. */
+    private Map<CubePos, CubeStatus> requiredStatuses = Map.of();
 
     synchronized void replace(CubeTicket ticket) {
-        tickets.put(ticket.key(), ticket);
+        CubeTicket previous = tickets.put(ticket.key(), ticket);
+        if (previous == null || !previous.center().equals(ticket.center())
+                || !previous.radius().equals(ticket.radius())
+                || previous.targetStatus() != ticket.targetStatus()) {
+            requiredStatuses = null;
+        }
     }
 
     synchronized void remove(Object key) {
-        tickets.remove(key);
+        if (tickets.remove(key) != null) requiredStatuses = null;
+    }
+
+    /** Ticket movement invalidates the closure; payload completion does not. */
+    synchronized Map<CubePos, CubeStatus> requiredStatuses() {
+        if (requiredStatuses == null) {
+            Map<CubePos, CubeStatus> required = new HashMap<>();
+            for (CubeTicket ticket : tickets.values()) {
+                collectRequired(ticket.center(), ticket.radius(), ticket.targetStatus(), required);
+            }
+            requiredStatuses = Map.copyOf(required);
+        }
+        return requiredStatuses;
+    }
+
+    /** Expands cuboids through the decreasing stage DAG without starting IO. */
+    static void collectRequired(
+            CubePos center, CubeDependencyRadius radius, CubeStatus target,
+            Map<CubePos, CubeStatus> required) {
+        radius.forEach(center, pos -> required.merge(pos, target,
+                (first, second) -> first.ordinal() >= second.ordinal() ? first : second));
+        for (CubeStatus stage : CubeStatus.values()) {
+            if (stage.ordinal() > target.ordinal()) break;
+            CubeStatus neighbour = stage.neighbourPrerequisite();
+            if (neighbour == null) continue;
+            CubeDependencyRadius dependency = stage.dependencyRadius();
+            CubeDependencyRadius expanded = new CubeDependencyRadius(
+                    Math.addExact(radius.x(), dependency.x()),
+                    Math.addExact(radius.y(), dependency.y()),
+                    Math.addExact(radius.z(), dependency.z()));
+            collectRequired(center, expanded, neighbour, required);
+        }
     }
 
     synchronized Set<CubePos> activePositions() {

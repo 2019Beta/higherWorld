@@ -393,6 +393,35 @@ final class CubicWorldState implements AutoCloseable {
         return suppressingGenerationUpdates.get();
     }
 
+    /**
+     * Copies one loaded TERRAIN cube's section for batch feature reads.
+     * Returns {@code null} when the cube is not loaded or below TERRAIN;
+     * feature code then reads that position as air, exactly like the
+     * ordinary read path.  Section reads are server-thread state and the
+     * snapshot is only valid for the duration of one batch generation.
+     */
+    BlockState[] snapshotSection(CubePos pos) {
+        LoadedCube cube = loadedCube(pos);
+        if (cube == null) return null;
+        LoadContext context = loadContexts.get(pos);
+        if (context != null && context.committing) return copySection(cube);
+        if (!taskScheduler.reached(pos, CubeStatus.TERRAIN)) return null;
+        return copySection(cube);
+    }
+
+    private static BlockState[] copySection(LoadedCube cube) {
+        BlockState[] snapshot = new BlockState[CubePos.SIZE * CubePos.SIZE * CubePos.SIZE];
+        for (int localY = 0; localY < CubePos.SIZE; localY++) {
+            for (int localZ = 0; localZ < CubePos.SIZE; localZ++) {
+                for (int localX = 0; localX < CubePos.SIZE; localX++) {
+                    snapshot[(localY * CubePos.SIZE + localZ) * CubePos.SIZE + localX] =
+                            cube.section().getBlockState(localX, localY, localZ);
+                }
+            }
+        }
+        return snapshot;
+    }
+
     Integer highestBlockY(int blockX, int blockZ) {
         return highestBlocks.get(new BlockColumnPos(blockX, blockZ));
     }
@@ -645,6 +674,7 @@ final class CubicWorldState implements AutoCloseable {
                     if (!taskScheduler.saveComplete(cube.pos())) continue;
                     column.remove(cube.pos().y());
                     cubes.remove(cube.pos(), cube);
+                    lightEngine.discardCube(cube.pos());
                     invalidatePayload(cube.pos());
                     loadContexts.remove(cube.pos());
                     removeIndexedHeights(cube);
@@ -740,7 +770,8 @@ final class CubicWorldState implements AutoCloseable {
             }
             CubeHolder holder = ready.get(index);
             try {
-                boolean progressed = tryAdvance(holder, taskScheduler.priority(holder.pos()));
+                boolean progressed = tryAdvance(
+                        holder, taskScheduler.priority(holder.pos()), deadline);
                 if (!progressed) taskScheduler.requeue(holder);
             } catch (IOException | RuntimeException exception) {
                 holder.fail(exception);
@@ -865,7 +896,7 @@ final class CubicWorldState implements AutoCloseable {
                     ensureStage(dependency, CubeStatus.TERRAIN, priority + 1, null, false);
                 }
             }
-            commitFeatures(holder, context);
+            commitFeatures(holder, context, Long.MAX_VALUE);
         }
         if (target.isAtLeast(CubeStatus.PAYLOAD)
                 && !holder.status().isAtLeast(CubeStatus.PAYLOAD)) {
@@ -896,7 +927,7 @@ final class CubicWorldState implements AutoCloseable {
         return context.cube;
     }
 
-    private boolean tryAdvance(CubeHolder holder, int priority) throws IOException {
+    private boolean tryAdvance(CubeHolder holder, int priority, long deadlineNanos) throws IOException {
         Optional<byte[]> payload = holder.ioFuture().getNow(null);
         if (payload == null) return false;
         LoadContext context = context(holder, payload);
@@ -909,8 +940,12 @@ final class CubicWorldState implements AutoCloseable {
                     && !taskScheduler.featureBatchTerrainReady(world, holder, priority)) {
                 return false;
             }
-            commitFeatures(holder, context);
-            return true;
+            // Feature batches for a fresh column can cost far more than one
+            // commit slice. The generator checks the deadline between batch
+            // keys and reports its progress through the context, so the next
+            // slice resumes instead of the tick overrunning its budget and
+            // stalling every other cube behind a debt pause.
+            return commitFeatures(holder, context, deadlineNanos);
         }
         if (holder.target().isAtLeast(CubeStatus.PAYLOAD)
                 && !holder.status().isAtLeast(CubeStatus.PAYLOAD)) {
@@ -1080,20 +1115,23 @@ final class CubicWorldState implements AutoCloseable {
         }
     }
 
-    private void commitFeatures(CubeHolder holder, LoadContext context) {
+    private boolean commitFeatures(
+            CubeHolder holder, LoadContext context, long deadlineNanos) {
         try (GenerationStageScope stageScope = enterGenerationStage(
                 holder.pos(), CubeStatus.FEATURES)) {
-            commitFeaturesBody(holder, context);
+            return commitFeaturesBody(holder, context, deadlineNanos);
         }
     }
 
-    private void commitFeaturesBody(CubeHolder holder, LoadContext context) {
+    private boolean commitFeaturesBody(
+            CubeHolder holder, LoadContext context, long deadlineNanos) {
         boolean alreadyCommittingFeatures = committingFeatures.get();
         boolean wasSuppressing = suppressingGenerationUpdates.get();
         committingFeatures.set(true);
         suppressingGenerationUpdates.set(true);
         context.committing = true;
         try (GenerationReadScope readScope = beginGenerationRead(context.cube)) {
+            boolean done = true;
             if (context.payload == null && shouldGenerate(holder.pos())) {
                 // A streamed PAYLOAD cube is intentionally not promoted to
                 // FULL, but it is still real generated world state.  Mark it
@@ -1103,16 +1141,29 @@ final class CubicWorldState implements AutoCloseable {
                 context.persistable = true;
                 try (CubeSpatialLock.Scope ignored = generationLocks.lock(
                         holder.pos(), CubeStatus.FEATURES.dependencyRadius())) {
+                    int progress;
                     if (customWorld) {
-                        CustomCubeGenerator.finishGeneration(world, context.cube, customWorldSettings,
-                                structureSettings, generateStructures);
+                        progress = CustomCubeGenerator.finishGeneration(
+                                world, context.cube, customWorldSettings,
+                                structureSettings, generateStructures,
+                                context.featureProgress, deadlineNanos);
                     } else {
-                        InfiniteDownwardGenerator.generateFeatures(
-                                world, context.cube, effectiveStructureSettings());
+                        progress = InfiniteDownwardGenerator.generateFeatures(
+                                world, context.cube, effectiveStructureSettings(),
+                                context.featureProgress, deadlineNanos);
+                    }
+                    if (progress < 0) {
+                        done = true;
+                    } else {
+                        context.featureProgress = progress;
+                        done = false;
                     }
                 }
             }
-            holder.advance(CubeStatus.FEATURES);
+            if (done) {
+                holder.advance(CubeStatus.FEATURES);
+            }
+            return done;
         } finally {
             context.committing = false;
             if (alreadyCommittingFeatures) committingFeatures.set(true);
@@ -1410,6 +1461,14 @@ final class CubicWorldState implements AutoCloseable {
         private boolean committing;
         private boolean full;
         private boolean persistable;
+        /**
+         * Feature commit cursor for bounded commit slices.  Vanilla: 0 means
+         * the structure pass is still pending, 1..27 count the placed-feature
+         * batch keys already applied.  Custom: 0..7 index the finish stages.
+         * A lifecycle restart recreates this context, which restarts the
+         * feature pass from zero.
+         */
+        private int featureProgress;
 
         private LoadContext(LoadedCube cube, byte[] payload, long epoch) {
             this.cube = cube;

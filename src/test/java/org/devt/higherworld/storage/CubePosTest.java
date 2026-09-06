@@ -8,6 +8,23 @@ import org.junit.jupiter.api.Test;
 
 class CubePosTest {
     @Test
+    void denseDeepViewHasDispersedHashes() {
+        var hashes = new java.util.HashSet<Integer>();
+        int count = 0;
+        for (int x = -16; x <= 16; x++) {
+            for (int y = -48; y <= -16; y++) {
+                for (int z = -16; z <= 16; z++) {
+                    CubePos pos = new CubePos(x, y, z);
+                    assertEquals(pos.hashCode(), new CubePos(x, y, z).hashCode());
+                    hashes.add(pos.hashCode());
+                    count++;
+                }
+            }
+        }
+        assertTrue(hashes.size() > count * 0.99, "Dense view hashes must not collapse onto planes");
+    }
+
+    @Test
     void convertsNegativeBlocksWithFloorDivision() {
         assertEquals(new CubePos(-1, -1, -1), CubePos.fromBlock(-1, -16, -15));
         assertEquals(new CubePos(-2, -2, -2), CubePos.fromBlock(-17, -17, -32));

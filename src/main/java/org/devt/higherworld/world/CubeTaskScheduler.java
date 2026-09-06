@@ -17,6 +17,8 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import net.minecraft.server.world.ServerWorld;
+import org.devt.higherworld.Higherworld;
+import org.devt.higherworld.gpu.GpuAccelerationConfig;
 import org.devt.higherworld.gpu.GpuTerrainAccelerator;
 import org.devt.higherworld.storage.CubeIoScheduler;
 import org.devt.higherworld.storage.CubePos;
@@ -70,6 +72,23 @@ final class CubeTaskScheduler implements AutoCloseable {
             new PriorityBlockingQueue<>(256, CubeTaskScheduler::compareReadyEntries);
     /** At most one live ready entry per holder; stale physical entries are skipped. */
     private final ConcurrentMap<CubeHolder, ReadyEntry> queuedReady = new ConcurrentHashMap<>();
+    /**
+     * Holders whose next stage is still missing a dependency stay out of the
+     * priority queue.  Re-offering every blocked holder on every commit scan
+     * made the physical queue grow to ~10x the live entry count; the scans
+     * then spent their whole budget polling and re-queuing the same blocked
+     * front instead of committing work.  A waiter is re-offered only after
+     * some holder somewhere advanced (the epoch gate below), and only at a
+     * bounded rate, so dependency completion still wakes owners promptly
+     * without resurrecting the queue churn.
+     */
+    private final ConcurrentMap<CubeHolder, Long> waitingSinceEpoch = new ConcurrentHashMap<>();
+    /** Rotating scan order for {@link #waitingSinceEpoch}; server-thread only. */
+    private final java.util.ArrayDeque<WaitingRef> waitingOrder = new java.util.ArrayDeque<>();
+    /** Upper bound of waiting holders rechecked per commit scan. */
+    private static final int MAX_WAITING_RECHECK = 512;
+    /** Bumped by every holder change; gates the waiting recheck scan. */
+    private final AtomicLong dependencyEpoch = new AtomicLong();
     private volatile long priorityEpoch;
 
     CubeTaskScheduler(CubeIoScheduler io) {
@@ -188,6 +207,12 @@ final class CubeTaskScheduler implements AutoCloseable {
     }
 
     private void holderChanged(CubeHolder holder) {
+        // Any lifecycle change may have satisfied a waiting holder's
+        // dependency.  A single counter is deliberately cheaper than reverse
+        // dependency edges; the bounded recheck scan tolerates the occasional
+        // unrelated wake-up.
+        dependencyEpoch.incrementAndGet();
+        waitingSinceEpoch.remove(holder);
         synchronized (holder) {
             if (holder.target() == CubeStatus.EMPTY
                     || holder.failed()
@@ -497,12 +522,21 @@ final class CubeTaskScheduler implements AutoCloseable {
         ArrayList<CubeHolder> result = new ArrayList<>(limit);
         Set<CubeHolder> selected = new HashSet<>();
         Set<CubeHolder> epochRefreshed = new HashSet<>();
-        ArrayList<ReadyEntry> blocked = new ArrayList<>();
         compactReadyQueueIfNeeded();
         int scanBudget = readyQueue.size();
-        while (result.size() < limit && scanBudget-- > 0) {
+        while (result.size() < limit) {
             ReadyEntry entry = readyQueue.poll();
-            if (entry == null) break;
+            if (entry == null) {
+                // The frontier is drained. Recheck a bounded slice of the
+                // dependency-waiting set; re-offered holders are polled again
+                // in the same pass, so a completed dependency wakes its owner
+                // without rescanning the whole set.
+                int reoffered = recheckWaitingHolders();
+                if (reoffered == 0) return result;
+                scanBudget += reoffered;
+                continue;
+            }
+            if (scanBudget-- <= 0) return result;
             CubeHolder holder = entry.holder();
             // The queue is intentionally lazy: a state update can supersede an
             // entry while its old object is still physically present. Only the
@@ -531,19 +565,59 @@ final class CubeTaskScheduler implements AutoCloseable {
             if (!nextCommitDependenciesReady(holder)) {
                 // Do not put a blocked high-priority node back at the head
                 // while scanning. Its lower-priority TERRAIN/FEATURES
-                // prerequisites are in this same queue; re-offering it here
-                // would make the priority queue return the same node until
-                // scanBudget is exhausted, so the dependency can never run.
-                blocked.add(entry);
+                // prerequisites advance independently; the epoch-gated
+                // waiting recheck re-offers it once some dependency has
+                // actually moved, instead of bouncing it through the queue
+                // on every scan.
+                long blockedEpoch = dependencyEpoch.get();
+                waitingSinceEpoch.put(holder, blockedEpoch);
+                // Always enqueue a ref.  Transient duplicates are harmless:
+                // a ref whose epoch no longer matches the map value is stale
+                // and is dropped on its first pop.
+                waitingOrder.addLast(new WaitingRef(holder, blockedEpoch));
                 continue;
             }
             if (selected.add(holder)) result.add(holder);
         }
-        // Requeue the current snapshot after the scan. State changes racing
-        // this loop may already have installed a newer entry, in which case
-        // the marker prevents a duplicate.
-        blocked.forEach(entry -> holderChanged(entry.holder()));
         return result;
+    }
+
+    /**
+     * Re-offers waiting holders whose recorded dependency epoch is stale.
+     * Server-thread only.  Each holder is rechecked at most once per epoch
+     * change and the round is bounded, so a large waiting set cannot turn
+     * back into the old unbounded queue churn.
+     */
+    private int recheckWaitingHolders() {
+        int budget = Math.min(MAX_WAITING_RECHECK, waitingOrder.size());
+        long epoch = dependencyEpoch.get();
+        int reoffered = 0;
+        while (budget-- > 0 && !waitingOrder.isEmpty()) {
+            WaitingRef ref = waitingOrder.pollFirst();
+            CubeHolder holder = ref.holder();
+            Long since = waitingSinceEpoch.get(holder);
+            if (since == null || since != ref.epoch()) {
+                // The holder left the set (or was re-blocked) after this ref
+                // was enqueued; the map value owns the holder now.
+                continue;
+            }
+            if (ref.epoch() == epoch) {
+                // Nothing advanced since this holder was blocked. Rotate the
+                // ref instead of re-offering it; its epoch is rechecked on a
+                // later round.
+                waitingOrder.addLast(ref);
+                continue;
+            }
+            waitingSinceEpoch.remove(holder);
+            if (holder.failed()
+                    || holder.target() == CubeStatus.EMPTY
+                    || holder.status().isAtLeast(holder.target())) {
+                continue;
+            }
+            holderChanged(holder);
+            reoffered++;
+        }
+        return reoffered;
     }
 
     private void compactReadyQueueIfNeeded() {
@@ -592,12 +666,12 @@ final class CubeTaskScheduler implements AutoCloseable {
 
     private void refreshTargets() {
         priorityEpoch++;
-        Map<CubePos, CubeStatus> required = new HashMap<>();
-        for (CubeTicket ticket : tickets.activeTickets()) {
-            collectRequired(ticket.center(), ticket.radius(), ticket.targetStatus(), required);
-        }
+        // Most refreshes only change a bounded set of streaming roots. Reuse
+        // the simulation closure instead of allocating its cuboids each tick.
+        Map<CubePos, CubeStatus> required = new HashMap<>(tickets.requiredStatuses());
         for (CubePos pos : prefetchPositions) {
-            collectRequired(pos, CubeDependencyRadius.NONE, CubeStatus.PAYLOAD, required);
+            CubeTicketManager.collectRequired(
+                    pos, CubeDependencyRadius.NONE, CubeStatus.PAYLOAD, required);
         }
 
         // A placed-feature batch has a wider terrain read set than the normal
@@ -649,41 +723,6 @@ final class CubeTaskScheduler implements AutoCloseable {
         });
     }
 
-    /**
-     * Adds one ticket and all of its transitive neighbour requirements by
-     * expanding the ticket cuboid.  Dependency status always decreases, so
-     * this visits at most the small status DAG once per edge rather than
-     * recursively starting from every active cube position.
-     */
-    private static void collectRequired(
-            CubePos center, CubeDependencyRadius radius, CubeStatus target,
-            Map<CubePos, CubeStatus> required) {
-        mergeAll(required, center, radius, target);
-        for (CubeStatus stage : CubeStatus.values()) {
-            if (stage.ordinal() > target.ordinal()) break;
-            CubeStatus neighbour = stage.neighbourPrerequisite();
-            if (neighbour == null) continue;
-
-            CubeDependencyRadius expanded = expanded(radius, stage.dependencyRadius());
-            collectRequired(center, expanded, neighbour, required);
-        }
-    }
-
-    private static CubeDependencyRadius expanded(
-            CubeDependencyRadius first, CubeDependencyRadius second) {
-        return new CubeDependencyRadius(
-                Math.addExact(first.x(), second.x()),
-                Math.addExact(first.y(), second.y()),
-                Math.addExact(first.z(), second.z()));
-    }
-
-    private static void mergeAll(
-            Map<CubePos, CubeStatus> required, CubePos center,
-            CubeDependencyRadius radius, CubeStatus target) {
-        radius.forEach(center,
-                pos -> required.merge(pos, target, CubeTaskScheduler::maximum));
-    }
-
     private static CubeStatus maximum(CubeStatus first, CubeStatus second) {
         return first.ordinal() >= second.ordinal() ? first : second;
     }
@@ -706,11 +745,15 @@ final class CubeTaskScheduler implements AutoCloseable {
         featureTerrainRequestCount = 0L;
         readyQueue.clear();
         queuedReady.clear();
+        waitingSinceEpoch.clear();
+        waitingOrder.clear();
     }
 
     private record ReadyEntry(
             CubeHolder holder, long changeVersion, int priority,
             int statusOrdinal, long priorityEpoch) {}
+
+    private record WaitingRef(CubeHolder holder, long epoch) {}
 
     private static int compareReadyEntries(ReadyEntry first, ReadyEntry second) {
         // Ticket priority includes distance from the ticket centre.  It must be
@@ -878,11 +921,23 @@ final class CubeTaskScheduler implements AutoCloseable {
                         live.stream().map(VanillaTerrainRequest::request).toList();
                 generated = VanillaCubeTerrainGenerator.prepareGpuTerrainBatch(terrainRequests);
             } catch (Throwable throwable) {
-                // The GPU facade only throws when fallback_on_error=false (or
-                // when a lifecycle invariant is broken).  Match the custom
-                // batcher here: do not silently hide an explicitly requested
-                // hard failure behind a CPU result.
-                for (VanillaTerrainRequest request : live) fail(request, throwable);
+                // The GPU facade throws when fallback_on_error=false, or when
+                // a request violates a validation invariant (an over-large
+                // batch once failed thousands of cubes here with no log at
+                // all).  Honor an explicitly requested hard failure; any
+                // other throwable falls back to per-request CPU generation
+                // instead of failing the whole collected batch.
+                if (!GpuAccelerationConfig.settings().fallbackOnError()) {
+                    Higherworld.LOGGER.error(
+                            "Cannot rasterize vanilla terrain batch of {} cubes",
+                            live.size(), throwable);
+                    for (VanillaTerrainRequest request : live) fail(request, throwable);
+                    return;
+                }
+                Higherworld.LOGGER.warn(
+                        "Vanilla terrain GPU batch failed; falling back to CPU for {} cubes",
+                        live.size(), throwable);
+                for (VanillaTerrainRequest request : live) submitCpuFallback(request);
                 return;
             }
             if (generated == null) {
@@ -1044,7 +1099,20 @@ final class CubeTaskScheduler implements AutoCloseable {
                 gpu = GpuTerrainAccelerator.trySampleAndRasterizeCustomBatch(
                         live.get(0).seed(), positions, live.get(0).settings(), solid);
             } catch (Throwable throwable) {
-                for (CustomTerrainRequest request : live) fail(request, throwable);
+                // Same contract as the vanilla batcher: honor an explicitly
+                // requested hard failure, otherwise fall back to CPU instead
+                // of silently failing every request in the collected batch.
+                if (!GpuAccelerationConfig.settings().fallbackOnError()) {
+                    Higherworld.LOGGER.error(
+                            "Cannot rasterize custom terrain batch of {} cubes",
+                            live.size(), throwable);
+                    for (CustomTerrainRequest request : live) fail(request, throwable);
+                    return;
+                }
+                Higherworld.LOGGER.warn(
+                        "Custom terrain GPU batch failed; falling back to CPU for {} cubes",
+                        live.size(), throwable);
+                for (CustomTerrainRequest request : live) submitCpuFallback(request);
                 return;
             }
             if (gpu) {

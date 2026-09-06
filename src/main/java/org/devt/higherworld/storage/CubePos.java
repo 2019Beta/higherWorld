@@ -5,6 +5,24 @@ public record CubePos(int x, int y, int z) {
     public static final int SIZE = 16;
     public static final int REGION_DIAMETER = 16;
 
+    /** Disperse spatial neighbours in the scheduler's hash maps and immutable sets. */
+    @Override
+    public int hashCode() {
+        // The record default (961*x + 31*y + z) clusters dense cuboids and
+        // aliases coordinates separated by (0, 1, -31). Mix each axis before
+        // combining; a final avalanche also disperses open-addressed SetN slots.
+        int hash = mix(x) ^ Integer.rotateLeft(mix(y), 11) ^ Integer.rotateLeft(mix(z), 22);
+        return mix(hash);
+    }
+
+    private static int mix(int value) {
+        value ^= value >>> 16;
+        value *= 0x7feb352d;
+        value ^= value >>> 15;
+        value *= 0x846ca68b;
+        return value ^ (value >>> 16);
+    }
+
     public static CubePos fromBlock(int blockX, int blockY, int blockZ) {
         return new CubePos(Math.floorDiv(blockX, SIZE), Math.floorDiv(blockY, SIZE), Math.floorDiv(blockZ, SIZE));
     }

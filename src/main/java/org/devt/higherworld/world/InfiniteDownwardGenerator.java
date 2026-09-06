@@ -45,6 +45,7 @@ final class InfiniteDownwardGenerator {
         EXTENDED_OVERWORLD_DENSITIES.remove(world);
         VanillaCubeTerrainGenerator.release(world);
         VanillaPlacedFeatureGenerator.release(world);
+        VanillaStructureGenerator.release(world);
     }
 
     static void generate(
@@ -61,10 +62,34 @@ final class InfiniteDownwardGenerator {
 
     static void generateFeatures(
             ServerWorld world, LoadedCube cube, StructureGenerationSettings structureSettings) {
-        VanillaStructureGenerator.generate(world, cube, structureSettings);
-        VanillaPlacedFeatureGenerator.generate(world, cube);
-        cube.setGenerationVersion(GENERATION_VERSION);
-        cube.markDirty();
+        generateFeatures(world, cube, structureSettings, 0, Long.MAX_VALUE);
+    }
+
+    /**
+     * Progress-aware feature pass.  Progress 0 runs the structure pass and
+     * 1..27 count the applied placed-feature batch keys; a negative result
+     * means the cube is complete.  The deadline is checked between work
+     * units so a streaming commit never holds the server thread past its
+     * slice; the synchronous path passes {@code Long.MAX_VALUE}.
+     */
+    static int generateFeatures(
+            ServerWorld world, LoadedCube cube, StructureGenerationSettings structureSettings,
+            int progress, long deadlineNanos) {
+        if (progress == 0) {
+            VanillaStructureGenerator.generate(world, cube, structureSettings);
+            progress = 1;
+            if (System.nanoTime() >= deadlineNanos) {
+                return 1;
+            }
+        }
+        int next = VanillaPlacedFeatureGenerator.generateBatchedSafe(
+                world, cube, progress - 1, deadlineNanos);
+        if (next < 0) {
+            cube.setGenerationVersion(GENERATION_VERSION);
+            cube.markDirty();
+            return -1;
+        }
+        return next + 1;
     }
 
     /** Removes fluids produced by generator revisions with unsafe deep aquifers. */

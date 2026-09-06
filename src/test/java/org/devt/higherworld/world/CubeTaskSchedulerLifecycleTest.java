@@ -19,6 +19,30 @@ class CubeTaskSchedulerLifecycleTest {
     Path directory;
 
     @Test
+    void cachedTicketClosureDoesNotRetainFinishedStreamingRoots() throws Exception {
+        CubePos center = new CubePos(12, -20, -7);
+        CubePos streaming = new CubePos(100, -40, 100);
+        try (CubeStorage storage = new CubeStorage(directory);
+                CubeIoScheduler io = new CubeIoScheduler(storage);
+                CubeTaskScheduler scheduler = new CubeTaskScheduler(io)) {
+            scheduler.replaceTicket(CubeTicket.playerSimulation("player", center, 1, 0));
+            scheduler.retainPrefetches(Set.of(streaming));
+            assertTrue(scheduler.isRequired(streaming));
+            assertTrue(scheduler.isRequired(new CubePos(101, -40, 100)));
+
+            scheduler.retainPrefetches(Set.of());
+            assertFalse(scheduler.isRequired(streaming));
+            assertFalse(scheduler.isRequired(new CubePos(101, -40, 100)));
+            assertTrue(scheduler.isRequired(center));
+            assertTrue(scheduler.isRequired(new CubePos(15, -20, -7)));
+            assertEquals(0, scheduler.holderCount());
+
+            scheduler.removeTicket(CubeTicket.playerSimulationKey("player"));
+            assertFalse(scheduler.isRequired(center));
+        }
+    }
+
+    @Test
     void ticketClosureRetainsDependencyHaloUntilTicketRemoval() throws Exception {
         CubePos center = new CubePos(12, -20, -7);
         try (CubeStorage storage = new CubeStorage(directory);
@@ -377,6 +401,66 @@ class CubeTaskSchedulerLifecycleTest {
             assertTrue(nextReady.get(0) != halo);
             assertEquals(CubeStatus.TERRAIN, nextReady.get(0).status());
             assertEquals(CubeStatus.PAYLOAD, nextReady.get(0).target());
+        }
+    }
+
+    @Test
+    void blockedHoldersWaitOutsideTheReadyQueueUntilADependencyAdvances() throws Exception {
+        CubePos haloPos = new CubePos(100, -20, 100);
+        try (CubeStorage storage = new CubeStorage(directory);
+                CubeIoScheduler io = new CubeIoScheduler(storage);
+                CubeTaskScheduler scheduler = new CubeTaskScheduler(io)) {
+            scheduler.replaceTicket(new CubeTicket(
+                    "feature-owners", CubeTicketType.COLLISION, new CubePos(0, -20, 0),
+                    new CubeDependencyRadius(8, 0, 8), CubeStatus.PAYLOAD, 0));
+            scheduler.replaceTicket(new CubeTicket(
+                    "feature-halo", CubeTicketType.COLLISION, haloPos,
+                    CubeDependencyRadius.NONE, CubeStatus.TERRAIN, 100_000));
+
+            CubeHolder halo = scheduler.holder(haloPos);
+            halo.advance(CubeStatus.IO_READY);
+            halo.request(CubeStatus.TERRAIN);
+
+            for (int x = -8; x < 8; x++) {
+                for (int z = -8; z < 8; z++) {
+                    CubePos ownerPos = new CubePos(x, -20, z);
+                    CubeHolder owner = scheduler.holder(ownerPos);
+                    owner.advance(CubeStatus.TERRAIN);
+                    owner.request(CubeStatus.PAYLOAD);
+                    for (int offsetY = -1; offsetY <= 1; offsetY++) {
+                        for (int offsetZ = -1; offsetZ <= 1; offsetZ++) {
+                            for (int offsetX = -1; offsetX <= 1; offsetX++) {
+                                CubeHolder dependency = scheduler.holder(new CubePos(
+                                        x + offsetX, -20 + offsetY, z + offsetZ));
+                                dependency.advance(CubeStatus.TERRAIN);
+                                dependency.request(CubeStatus.TERRAIN);
+                            }
+                        }
+                    }
+                    scheduler.registerFeatureTerrainDependenciesForTest(
+                            ownerPos, List.of(haloPos));
+                }
+            }
+
+            List<CubeHolder> ready = scheduler.readyForCommit(256);
+            assertEquals(1, ready.size());
+            assertSame(halo, ready.get(0));
+
+            // Blocked owners must stay parked in the waiting set instead of
+            // bouncing through the physical queue: repeated scans leave the
+            // queue empty rather than re-offering thousands of stale entries.
+            for (int scan = 0; scan < 8; scan++) {
+                assertTrue(scheduler.readyForCommit(256).isEmpty());
+            }
+            assertTrue(scheduler.readyQueueSizeForTest()
+                    <= 4L * scheduler.queuedReadySizeForTest() + 1024L);
+
+            // A dependency advance wakes an owner within the next scan.
+            halo.advance(CubeStatus.TERRAIN);
+            List<CubeHolder> woken = scheduler.readyForCommit(1);
+            assertEquals(1, woken.size());
+            assertEquals(CubeStatus.TERRAIN, woken.get(0).status());
+            assertEquals(CubeStatus.PAYLOAD, woken.get(0).target());
         }
     }
 

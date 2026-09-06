@@ -10,6 +10,32 @@ import org.junit.jupiter.api.Test;
 
 class SparseCubeLightEngineTest {
     @Test
+    void queuedCubesShareBudgetAndUnloadedWorkIsDiscarded() {
+        TestAccess access = new TestAccess();
+        CubePos first = new CubePos(-2, -20, 0);
+        CubePos second = new CubePos(2, -20, 0);
+        access.add(first);
+        access.add(second);
+        access.emission.put(new Point(second.minBlockX(), second.minBlockY(), 0), 15);
+        SparseCubeLightEngine engine = new SparseCubeLightEngine(access);
+        engine.queueCube(first, true);
+        engine.queueCube(second, true);
+        engine.queueCube(first, true);
+        assertEquals(2, engine.pendingCubeCount());
+
+        // The second cube must progress without waiting for 4096 old cells.
+        engine.propagate(65);
+        assertEquals(15, access.block(second.minBlockX(), second.minBlockY(), 0));
+        engine.discardCube(first);
+        assertEquals(1, engine.pendingCubeCount());
+        assertTrue(engine.propagate(200_000).complete());
+        assertEquals(0, engine.pendingCubeCount());
+        engine.queueCube(first, true);
+        engine.clear();
+        assertTrue(engine.propagate(1).complete());
+    }
+
+    @Test
     void blockLightCrossesCubeBoundaryAndFallsOff() {
         TestAccess access = new TestAccess();
         access.add(new CubePos(0, 0, 0));

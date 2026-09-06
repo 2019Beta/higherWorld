@@ -11,6 +11,26 @@ import org.junit.jupiter.api.Test;
 /** Pure scheduling checks for the watcher state machine. */
 class CubeWatchManagerQueueTest {
     @Test
+    void movingCenterPromotesPreviouslyDistantPendingAndReadyWork() {
+        CubeWatchManager.WatchState state = new CubeWatchManager.WatchState();
+        CubeWatchManager.Watch oldNear = state.addForTest(new CubePos(0, -20, 0), 0);
+        CubeWatchManager.Watch newNear = state.addForTest(new CubePos(8, -20, 0), 0);
+        state.setCenterForTest(new CubePos(0, -20, 0));
+        state.setCenterForTest(new CubePos(8, -20, 0));
+        assertSame(newNear, state.pollPendingStart());
+        assertSame(oldNear, state.pollPendingStart());
+        state.markInFlight(oldNear, 1);
+        state.markInFlight(newNear, 1);
+        state.markReady(oldNear);
+        state.markReady(newNear);
+        state.setCenterForTest(new CubePos(0, -20, 0));
+        assertSame(oldNear, state.pollReadySend());
+        assertSame(newNear, state.pollReadySend());
+        assertTrue(state.activeUnsentForTest(oldNear.pos));
+        assertTrue(state.activeUnsentForTest(newNear.pos));
+    }
+
+    @Test
     void phaseTransitionsCannotLeaveDuplicateActiveQueueEntries() {
         CubeWatchManager.WatchState state = new CubeWatchManager.WatchState();
         CubeWatchManager.Watch watch = state.addForTest(new CubePos(0, -1, 0), 0);

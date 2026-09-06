@@ -9,6 +9,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.Set;
 
+import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.fluid.FluidState;
@@ -362,11 +363,22 @@ public final class CubicWorldManager {
                 previous.onStateReplaced(world, pos, false);
                 blockState.onBlockAdded(world, pos, previous, false);
                 world.onBlockStateChanged(pos, previous, blockState);
-                if ((flags & net.minecraft.block.Block.NOTIFY_LISTENERS) != 0) {
+                if ((flags & Block.NOTIFY_LISTENERS) != 0) {
                     world.updateListeners(pos, previous, blockState, flags);
                 }
-                if ((flags & net.minecraft.block.Block.NOTIFY_NEIGHBORS) != 0 && maxUpdateDepth > 0) {
+                if ((flags & Block.NOTIFY_NEIGHBORS) != 0 && maxUpdateDepth > 0) {
                     world.updateNeighborsAlways(pos, blockState.getBlock(), null);
+                }
+                if ((flags & Block.FORCE_STATE) == 0 && maxUpdateDepth > 0) {
+                    // World#setBlockState normally runs this state-replacement
+                    // chain after changing a WorldChunk.  The sparse cube has
+                    // no WorldChunk, so reproduce it here. In particular,
+                    // FallingBlock#getStateForNeighborUpdate schedules the
+                    // next fall from this chain when its support is removed.
+                    int neighborFlags = flags & ~(Block.NOTIFY_NEIGHBORS | Block.SKIP_DROPS);
+                    previous.prepare(world, pos, neighborFlags, maxUpdateDepth - 1);
+                    blockState.updateNeighbors(world, pos, neighborFlags, maxUpdateDepth - 1);
+                    blockState.prepare(world, pos, neighborFlags, maxUpdateDepth - 1);
                 }
                 if (!result.changedLight().isEmpty()) {
                     CubeWatchManager.broadcastLightUpdates(world, result.changedLight());
@@ -592,6 +604,16 @@ public final class CubicWorldManager {
     public static Integer highestBlockY(ServerWorld world, int blockX, int blockZ) {
         CubicWorldState state = WORLDS.get(world);
         return state == null ? null : state.highestBlockY(blockX, blockZ);
+    }
+
+    /**
+     * Copies one sparse TERRAIN section for feature batch reads.  The batch
+     * writer uses these snapshots instead of a full {@code world.getBlockState}
+     * dispatch for every probed position below the vanilla band.
+     */
+    static BlockState[] snapshotCubeSection(ServerWorld world, CubePos pos) {
+        CubicWorldState state = WORLDS.get(world);
+        return state == null ? null : state.snapshotSection(pos);
     }
 
     public static int lightLevel(ServerWorld world, LightType type, BlockPos pos) {

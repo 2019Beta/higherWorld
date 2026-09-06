@@ -156,19 +156,58 @@ final class CustomCubeGenerator {
     static void finishGeneration(
             ServerWorld world, LoadedCube cube, CustomWorldSettings settings,
             StructureGenerationSettings structureSettings, boolean generateStructures) {
-        CustomCaveGenerator.generate(world, cube, settings.caves());
-        if (settings.ravines()) {
-            CustomCaveGenerator.generateRavine(world, cube);
+        finishGeneration(world, cube, settings, structureSettings,
+                generateStructures, 0, Long.MAX_VALUE);
+    }
+
+    /**
+     * Deadline-sliced variant.  {@code progress} indexes the finish stages
+     * below; a negative result means the cube is complete, otherwise the
+     * returned value is the next resume cursor.  The first fresh stage of a
+     * slice always runs, so a streaming commit keeps making progress without
+     * holding the server thread past its budget.
+     */
+    static int finishGeneration(
+            ServerWorld world, LoadedCube cube, CustomWorldSettings settings,
+            StructureGenerationSettings structureSettings, boolean generateStructures,
+            int progress, long deadlineNanos) {
+        switch (progress) {
+            case 0:
+                CustomCaveGenerator.generate(world, cube, settings.caves());
+                if (System.nanoTime() >= deadlineNanos) return 1;
+                // fallthrough
+            case 1:
+                if (settings.ravines()) {
+                    CustomCaveGenerator.generateRavine(world, cube);
+                }
+                if (System.nanoTime() >= deadlineNanos) return 2;
+                // fallthrough
+            case 2:
+                if (generateStructures) {
+                    VanillaStructureGenerator.generate(world, cube, structureSettings, settings);
+                }
+                if (System.nanoTime() >= deadlineNanos) return 3;
+                // fallthrough
+            case 3:
+                CustomLakeGenerator.generate(world, cube, settings);
+                if (System.nanoTime() >= deadlineNanos) return 4;
+                // fallthrough
+            case 4:
+                CustomDungeonGenerator.generate(world, cube, settings);
+                if (System.nanoTime() >= deadlineNanos) return 5;
+                // fallthrough
+            case 5:
+                CustomOreGenerator.generateUniform(world, cube, settings);
+                if (System.nanoTime() >= deadlineNanos) return 6;
+                // fallthrough
+            case 6:
+                CustomOreGenerator.generatePeriodic(world, cube, settings);
+                // fallthrough
+            default:
+                cube.setGenerationVersion(GENERATION_VERSION);
+                cube.markDirty();
+                return -1;
         }
-        if (generateStructures) {
-            VanillaStructureGenerator.generate(world, cube, structureSettings, settings);
-        }
-        CustomLakeGenerator.generate(world, cube, settings);
-        CustomDungeonGenerator.generate(world, cube, settings);
-        CustomOreGenerator.generateUniform(world, cube, settings);
-        CustomOreGenerator.generatePeriodic(world, cube, settings);
-        cube.setGenerationVersion(GENERATION_VERSION);
-        cube.markDirty();
     }
 
     /** Samples the migrated CustomTerrainGenerator equation at an exact point. */

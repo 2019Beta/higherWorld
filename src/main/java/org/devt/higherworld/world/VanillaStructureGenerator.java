@@ -35,8 +35,21 @@ import org.devt.higherworld.storage.CubePos;
 /** Places translated copies of vanilla-generated structure starts into sparse cubes. */
 final class VanillaStructureGenerator {
     private static final int VERTICAL_PERIOD = 128;
+    /**
+     * {@code getStructureStarts} re-probes every registered structure for
+     * every call, and a cube column commits its feature pass cube by cube.
+     * The starts are treated read-only (each placement works on an NBT copy),
+     * so one bounded per-world cache removes the repeated probing without
+     * changing placement output.
+     */
+    private static final int MAX_START_CACHES = 4_096;
+    private static final Map<ServerWorld, StartCache> START_CACHES = new java.util.concurrent.ConcurrentHashMap<>();
 
     private VanillaStructureGenerator() {
+    }
+
+    static void release(ServerWorld world) {
+        START_CACHES.remove(world);
     }
 
     static void generate(
@@ -56,8 +69,9 @@ final class VanillaStructureGenerator {
         CubePos cubePos = cube.pos();
         ChunkPos chunkPos = new ChunkPos(cubePos.x(), cubePos.z());
         Registry<Structure> registry = world.getRegistryManager().getOrThrow(RegistryKeys.STRUCTURE);
-        List<StructureStart> starts = world.getStructureAccessor().getStructureStarts(
-                chunkPos, structure -> isEnabled(registry, structure, settings, customSettings));
+        List<StructureStart> starts = START_CACHES.computeIfAbsent(
+                world, ignored -> new StartCache()).starts(
+                        world, chunkPos, registry, settings, customSettings);
         if (starts.isEmpty()) {
             return;
         }
@@ -338,5 +352,25 @@ final class VanillaStructureGenerator {
 
     private static int ceilDiv(int dividend, int divisor) {
         return -Math.floorDiv(-dividend, divisor);
+    }
+
+    /** Access-order LRU of read-only structure-start lists for one world. */
+    private static final class StartCache {
+        private final Map<ChunkPos, List<StructureStart>> starts =
+                new java.util.LinkedHashMap<>(64, 0.75f, true);
+
+        private synchronized List<StructureStart> starts(
+                ServerWorld world, ChunkPos chunkPos, Registry<Structure> registry,
+                StructureGenerationSettings settings, CustomWorldSettings customSettings) {
+            List<StructureStart> existing = starts.get(chunkPos);
+            if (existing != null) return existing;
+            List<StructureStart> computed = world.getStructureAccessor().getStructureStarts(
+                    chunkPos, structure -> isEnabled(registry, structure, settings, customSettings));
+            starts.put(chunkPos, computed);
+            while (starts.size() > MAX_START_CACHES) {
+                starts.remove(starts.keySet().iterator().next());
+            }
+            return computed;
+        }
     }
 }

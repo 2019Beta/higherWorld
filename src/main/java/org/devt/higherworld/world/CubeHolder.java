@@ -77,6 +77,12 @@ final class CubeHolder {
                 current.stage(stage).complete(null);
             }
             current.status = reached;
+            if (reached.isAtLeast(CubeStatus.TERRAIN)) {
+                // The section now owns the committed terrain. Keeping the
+                // completed future here pins its raw snapshot even after the
+                // terrain batch LRU evicts it (often 64 KiB per deep batch).
+                current.terrainPreparationFuture = null;
+            }
             changed = true;
         }
         if (changed) notifyChanged();
@@ -154,7 +160,9 @@ final class CubeHolder {
         current.status = CubeStatus.EMPTY;
         CancellationException cancelled = new CancellationException("Cube lifecycle cancelled: " + pos);
         if (current.ioFuture != null) current.ioFuture.cancel(false);
-        if (current.terrainPreparationFuture != null) current.terrainPreparationFuture.cancel(false);
+        CompletableFuture<CubeTerrainSnapshot> preparation = current.terrainPreparationFuture;
+        current.terrainPreparationFuture = null;
+        if (preparation != null) preparation.cancel(false);
         current.stageFutures.values().forEach(future -> future.completeExceptionally(cancelled));
         current.fullFuture.completeExceptionally(cancelled);
         notifyChanged();

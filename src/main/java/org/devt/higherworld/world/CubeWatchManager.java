@@ -33,11 +33,16 @@ public final class CubeWatchManager {
     // PAYLOAD streaming is deliberately cheaper than a FULL ticket, so it can
     // use a larger pipeline without opening the lighting graph.  The previous
     // 4/8 limits left thousands of deep cubes waiting behind a tiny read/send
-    // window even when IO and generation were already idle.
-    private static final int CUBE_WORK_PER_WORLD_TICK = 24;
-    private static final int MAX_CUBE_WORK_PER_WORLD_TICK = 64;
-    private static final int POLL_ATTEMPTS_PER_PLAYER_TICK = 128;
-    private static final int READ_AHEAD_PER_WORLD_TICK = 64;
+    // window even when IO and generation were already idle; the later 24/64
+    // limits still left the batched IO/GPU pipeline underfed while the
+    // server thread sat in the ready-queue scan, so a healthy world may now
+    // scale up to a larger window.
+    private static final int CUBE_WORK_PER_WORLD_TICK = 32;
+    private static final int MAX_CUBE_WORK_PER_WORLD_TICK = 96;
+    private static final int POLL_ATTEMPTS_PER_PLAYER_TICK = 256;
+    private static final int READ_AHEAD_PER_WORLD_TICK = 128;
+    /** Backpressure includes ready-to-send roots, not just running reads. */
+    private static final int MAX_ACTIVE_UNSENT = 512;
     private static final long PREFETCH_RETRY_DELAY_TICKS = 2L;
     private static final long SEND_RETRY_DELAY_TICKS = 1L;
     private static final Map<UUID, WatchState> WATCHERS = new HashMap<>();
@@ -239,7 +244,7 @@ public final class CubeWatchManager {
 
         // Starting a read is intentionally separate from sending its result.
         // The read-ahead budget is shared by every watcher in this world.
-        while (readAheadBudget.hasRemaining()) {
+        while (readAheadBudget.hasRemaining() && state.activeUnsent.size() < MAX_ACTIVE_UNSENT) {
             Watch watch = state.pollPendingStart();
             if (watch == null) break;
 
@@ -410,8 +415,7 @@ public final class CubeWatchManager {
 
     /**
      * Slides an axis-aligned view by visiting only the old/new box difference.
-     * Queue entries for positions in the overlap are reprioritized lazily when
-     * polled, so a camera move no longer clears and recreates the full view PQ.
+     * Retain overlapping requests and reorder them for the new player center.
      */
     private static void updateWindowIncrementally(
             ServerPlayerEntity player, WatchState state, ServerWorld world,
@@ -432,6 +436,9 @@ public final class CubeWatchManager {
                 state.addWatch(pos, cubePriority(pos, center));
             }
         });
+        // A priority can decrease as well as increase. Repairing only the head
+        // leaves newly nearby requests hidden behind older distant entries.
+        state.rebuildQueues();
     }
 
     private static void rebuildFullWindow(

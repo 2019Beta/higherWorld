@@ -167,6 +167,11 @@ final class VanillaPlacedFeatureGenerator {
             return created;
         }
 
+        /** Non-computing peek used by the sliced commit to decide the deadline gate. */
+        private synchronized FeatureBatchSnapshot batchIfPresent(FeatureBatchKey key) {
+            return batches.get(key);
+        }
+
         private synchronized List<FeatureCall> plan(
                 FeaturePlanKey key, Supplier<List<FeatureCall>> factory) {
             List<FeatureCall> existing = plans.get(key);
@@ -195,20 +200,50 @@ final class VanillaPlacedFeatureGenerator {
     }
 
     private static final class FeatureBatchWriter {
+        /** Reads of cubes that are not loaded (or below TERRAIN) are air. */
+        private static final BlockState[] AIR_SECTION = new BlockState[CubePos.SIZE * CubePos.SIZE * CubePos.SIZE];
+        static {
+            java.util.Arrays.fill(AIR_SECTION, Blocks.AIR.getDefaultState());
+        }
+        private final ServerWorld world;
         private final BlockBox virtualBand;
         private final int offsetY;
         private final Map<BlockPos, BlockState> writes = new java.util.LinkedHashMap<>();
         private final Map<BlockPos, BlockEntity> blockEntities = new HashMap<>();
+        /**
+         * Lazily copied sparse sections under the virtual band.  Features
+         * probe tens of thousands of terrain positions while a fresh batch is
+         * generated; serving those probes from a snapshot removes one
+         * ServerWorld/palette dispatch per probe.  Missing cubes use the
+         * shared air section so the snapshot cache stays total.
+         */
+        private final Map<CubePos, BlockState[]> terrainSnapshots = new HashMap<>();
 
-        private FeatureBatchWriter(BlockBox virtualBand, int offsetY) {
+        private FeatureBatchWriter(ServerWorld world, BlockBox virtualBand, int offsetY) {
+            this.world = world;
             this.virtualBand = virtualBand;
             this.offsetY = offsetY;
         }
 
-        private BlockState read(ServerWorld world, BlockPos virtualPos) {
+        private BlockState read(BlockPos virtualPos) {
             BlockState written = writes.get(virtualPos);
-            return written != null
-                    ? written : world.getBlockState(translate(virtualPos, offsetY));
+            if (written != null) return written;
+            int actualX = virtualPos.getX();
+            int actualY = virtualPos.getY() + offsetY;
+            int actualZ = virtualPos.getZ();
+            if (actualY < world.getBottomY()) {
+                CubePos cubePos = CubePos.fromBlock(actualX, actualY, actualZ);
+                BlockState[] snapshot = terrainSnapshots.get(cubePos);
+                if (snapshot == null) {
+                    BlockState[] copied = CubicWorldManager.snapshotCubeSection(world, cubePos);
+                    snapshot = copied == null ? AIR_SECTION : copied;
+                    terrainSnapshots.put(cubePos, snapshot);
+                }
+                return snapshot[(Math.floorMod(actualY, CubePos.SIZE) * CubePos.SIZE
+                        + Math.floorMod(actualZ, CubePos.SIZE)) * CubePos.SIZE
+                        + Math.floorMod(actualX, CubePos.SIZE)];
+            }
+            return world.getBlockState(new BlockPos(actualX, actualY, actualZ));
         }
 
         private boolean acceptsY(int y) {
@@ -250,17 +285,23 @@ final class VanillaPlacedFeatureGenerator {
      * ChunkSectionCache, bypassing StructureWorldAccess#setBlockState. Keep
      * that scratch section connected to the batch write set so those writes
      * survive until the target cube is committed.
+     *
+     * <p>The section is deliberately lazy: instead of pre-filling 8 x 4096
+     * blocks per feature batch key (the old hot path), reads are served on
+     * demand from the batch writer and the palette only accumulates the few
+     * states a feature actually places.</p>
      */
     private static final class TrackingChunkSection extends net.minecraft.world.chunk.ChunkSection {
         private final FeatureBatchWriter writer;
         private final int baseX;
         private final int baseY;
         private final int baseZ;
+        private final BlockPos.Mutable scratch = new BlockPos.Mutable();
 
         private TrackingChunkSection(
-                net.minecraft.world.chunk.ChunkSection source,
+                net.minecraft.world.chunk.PalettesFactory palettesFactory,
                 FeatureBatchWriter writer, int baseX, int baseY, int baseZ) {
-            super(source.getBlockStateContainer(), source.getBiomeContainer());
+            super(palettesFactory);
             this.writer = writer;
             this.baseX = baseX;
             this.baseY = baseY;
@@ -270,12 +311,25 @@ final class VanillaPlacedFeatureGenerator {
         @Override
         public BlockState setBlockState(
                 int localX, int localY, int localZ, BlockState state, boolean lock) {
-            BlockState previous = super.setBlockState(localX, localY, localZ, state, lock);
+            scratch.set(baseX + localX, baseY + localY, baseZ + localZ);
+            BlockState previous = writer.read(scratch);
+            super.setBlockState(localX, localY, localZ, state, lock);
             if (!previous.equals(state)) {
-                writer.write(new BlockPos(
-                        baseX + localX, baseY + localY, baseZ + localZ), state);
+                writer.write(scratch, state);
             }
             return previous;
+        }
+
+        @Override
+        public BlockState getBlockState(int localX, int localY, int localZ) {
+            scratch.set(baseX + localX, baseY + localY, baseZ + localZ);
+            return writer.read(scratch);
+        }
+
+        @Override
+        public FluidState getFluidState(int localX, int localY, int localZ) {
+            scratch.set(baseX + localX, baseY + localY, baseZ + localZ);
+            return writer.read(scratch).getFluidState();
         }
     }
 
@@ -288,10 +342,16 @@ final class VanillaPlacedFeatureGenerator {
     private record BiomeQueryKey(int chunkX, int chunkZ, long repeatedBand) {
     }
 
-    private record FeatureWrite(BlockPos pos, BlockState state) {
-        private FeatureWrite {
-            pos = pos.toImmutable();
+    /** The enclosing snapshot partition owns the full cube coordinate. */
+    record FeatureWrite(int localIndex, BlockState state) {
+        FeatureWrite(BlockPos pos, BlockState state) {
+            this((pos.getX() & 15) | ((pos.getY() & 15) << 4)
+                    | ((pos.getZ() & 15) << 8), state);
         }
+
+        int localX() { return localIndex & 15; }
+        int localY() { return (localIndex >>> 4) & 15; }
+        int localZ() { return (localIndex >>> 8) & 15; }
     }
 
     private record FeatureBlockEntity(BlockPos pos, NbtCompound nbt) {
@@ -407,6 +467,26 @@ final class VanillaPlacedFeatureGenerator {
      */
     private static void generateBatched(
             ServerWorld world, LoadedCube cube, List<GenerationStep.Feature> steps) {
+        generateBatched(world, cube, steps, 0, Long.MAX_VALUE);
+    }
+
+    /** Sliced entry for the streaming feature pass with the safe underground steps. */
+    static int generateBatchedSafe(
+            ServerWorld world, LoadedCube cube, int keysDone, long deadlineNanos) {
+        return generateBatched(world, cube, SAFE_UNDERGROUND_STEPS, keysDone, deadlineNanos);
+    }
+
+    /**
+     * Deadline-sliced variant.  {@code keysDone} counts the batch keys already
+     * applied to this cube; a negative result means the cube is complete,
+     * otherwise the returned value is the next resume cursor.  The deadline is
+     * checked before generating a fresh (uncached) key, so the first fresh key
+     * always makes progress while a 27-key frontier column is spread over as
+     * many commit slices as the budget requires.
+     */
+    static int generateBatched(
+            ServerWorld world, LoadedCube cube, List<GenerationStep.Feature> steps,
+            int keysDone, long deadlineNanos) {
         long repeatedBand = repeatedBand(world, cube.pos());
         int sectionsPerBand = sectionsPerBand();
         ChunkGenerator generator = world.getChunkManager().getChunkGenerator();
@@ -420,6 +500,7 @@ final class VanillaPlacedFeatureGenerator {
         // whose translated coordinates belong to this cube.  This is what
         // keeps a dripstone column (or an ore vein) from being sliced at the
         // old vanilla floor.
+        int keyIndex = 0;
         for (long sourceBand = repeatedBand - FEATURE_SOURCE_BAND_RADIUS;
                 sourceBand <= repeatedBand + FEATURE_SOURCE_BAND_RADIUS; sourceBand++) {
             long bandSeed = world.getSeed() ^ sourceBand * 0xD1B54A32D192ED03L;
@@ -428,15 +509,27 @@ final class VanillaPlacedFeatureGenerator {
                     chunkZ <= cube.pos().z() + FEATURE_ORIGIN_RADIUS; chunkZ++) {
                 for (int chunkX = cube.pos().x() - FEATURE_ORIGIN_RADIUS;
                         chunkX <= cube.pos().x() + FEATURE_ORIGIN_RADIUS; chunkX++) {
+                    if (keyIndex < keysDone) {
+                        keyIndex++;
+                        continue;
+                    }
                     FeatureBatchKey key = new FeatureBatchKey(
                             chunkX, chunkZ, sourceBand, stepsMask);
-                    FeatureBatchSnapshot batch = cache.batch(key, () -> generateBatch(
-                            world, generator, registry, cache, key, steps,
-                            bandSeed, sourceOffsetY));
+                    FeatureBatchSnapshot batch = cache.batchIfPresent(key);
+                    if (batch == null) {
+                        if (keyIndex > keysDone && System.nanoTime() >= deadlineNanos) {
+                            return keyIndex;
+                        }
+                        batch = cache.batch(key, () -> generateBatch(
+                                world, generator, registry, cache, key, steps,
+                                bandSeed, sourceOffsetY));
+                    }
                     applyBatch(world, cube, batch, sourceOffsetY);
+                    keyIndex++;
                 }
             }
         }
+        return -1;
     }
 
     private static FeatureBatchSnapshot generateBatch(
@@ -444,6 +537,7 @@ final class VanillaPlacedFeatureGenerator {
             FeatureCache cache, FeatureBatchKey key, List<GenerationStep.Feature> steps,
             long bandSeed, int offsetY) {
         FeatureBatchWriter writer = new FeatureBatchWriter(
+                world,
                 new BlockBox(key.chunkX() * CubePos.SIZE,
                         VANILLA_BOTTOM_Y - FEATURE_VERTICAL_HALO,
                         key.chunkZ() * CubePos.SIZE,
@@ -518,17 +612,16 @@ final class VanillaPlacedFeatureGenerator {
                 Math.floorDiv(cube.pos().minBlockY() - offsetY, CubePos.SIZE),
                 cube.pos().z());
         for (FeatureWrite write : batch.writesFor(virtualTarget)) {
-            BlockPos virtual = write.pos();
-            BlockPos actual = translate(virtual, offsetY);
-            if (actual.getX() < minX || actual.getX() > maxX
-                    || actual.getY() < minY || actual.getY() > maxY
-                    || actual.getZ() < minZ || actual.getZ() > maxZ) {
-                continue;
-            }
-            BlockState previous = cube.getBlockState(actual);
+            // Repeated bands and cube partitions are section-aligned. Their
+            // local coordinates survive translation, including negative Y.
+            BlockState previous = cube.section().getBlockState(
+                    write.localX(), write.localY(), write.localZ());
             BlockState state = write.state();
             cube.setGeneratedBlockState(
-                    actual.getX() - minX, actual.getY() - minY, actual.getZ() - minZ, state);
+                    write.localX(), write.localY(), write.localZ(), state);
+            if (!previous.hasBlockEntity() && !state.hasBlockEntity()) continue;
+            BlockPos actual = new BlockPos(
+                    minX + write.localX(), minY + write.localY(), minZ + write.localZ());
             if (previous.hasBlockEntity() && !state.hasBlockEntity()) {
                 cube.removeBlockEntity(actual);
             }
@@ -745,7 +838,7 @@ final class VanillaPlacedFeatureGenerator {
                     // "nothing was placed" result.
                     return false;
                 }
-                BlockState previous = batchWriter.read(world, stablePos);
+                BlockState previous = batchWriter.read(stablePos);
                 batchWriter.write(stablePos, state);
                 updateFeatureChunk(featureChunks, stablePos, state, batchWriter);
                 if (state.hasBlockEntity() && state.getBlock() instanceof BlockEntityProvider provider) {
@@ -810,13 +903,13 @@ final class VanillaPlacedFeatureGenerator {
             return batchWriter == null
                     ? featureBlockState(world, cube, virtualCube, offsetY,
                             boundaryMode, clippedBlockStates, virtualPos)
-                    : batchWriter.read(world, virtualPos);
+                    : batchWriter.read(virtualPos);
         }
         if ("getFluidState".equals(name) && virtualPos != null) {
             return (batchWriter == null
                     ? featureFluidState(world, cube, virtualCube, offsetY,
                             boundaryMode, clippedBlockStates, virtualPos)
-                    : batchWriter.read(world, virtualPos).getFluidState());
+                    : batchWriter.read(virtualPos).getFluidState());
         }
         if (batchWriter != null && "getBlockEntity".equals(name)
                 && virtualPos != null) {
@@ -873,7 +966,7 @@ final class VanillaPlacedFeatureGenerator {
             BlockState state = batchWriter == null
                     ? featureBlockState(world, cube, virtualCube, offsetY,
                             boundaryMode, clippedBlockStates, virtualPos)
-                    : batchWriter.read(world, virtualPos);
+                    : batchWriter.read(virtualPos);
             return ((Predicate<BlockState>) predicate).test(state);
         }
         if ("testFluidState".equals(name) && virtualPos != null
@@ -881,14 +974,14 @@ final class VanillaPlacedFeatureGenerator {
             FluidState state = batchWriter == null
                     ? featureFluidState(world, cube, virtualCube, offsetY,
                             boundaryMode, clippedBlockStates, virtualPos)
-                    : batchWriter.read(world, virtualPos).getFluidState();
+                    : batchWriter.read(virtualPos).getFluidState();
             return ((Predicate<FluidState>) predicate).test(state);
         }
         if (("removeBlock".equals(name) || "breakBlock".equals(name)) && virtualPos != null) {
             if (batchWriter != null) {
                 BlockPos stablePos = virtualPos.toImmutable();
                 if (!batchWriter.acceptsY(stablePos.getY())) return false;
-                BlockState previous = batchWriter.read(world, stablePos);
+                BlockState previous = batchWriter.read(stablePos);
                 batchWriter.write(stablePos, Blocks.AIR.getDefaultState());
                 batchWriter.blockEntities.remove(stablePos);
                 updateFeatureChunk(
@@ -1023,36 +1116,16 @@ final class VanillaPlacedFeatureGenerator {
         if (batchWriter != null) {
             // Give OreFeature a real section for every coordinate in the
             // virtual halo.  The old fixed vanilla-height ProtoChunk returned
-            // null for y < -64 and silently dropped the ore vein.
-            int firstSection = 0;
+            // null for y < -64 and silently dropped the ore vein.  Reads are
+            // served lazily by TrackingChunkSection, so creating the eight
+            // scratch sections no longer means pre-filling 32k blocks from
+            // the world per feature batch key.
             int lastSection = chunk.getSectionArray().length - 1;
-            BlockPos.Mutable mutable = new BlockPos.Mutable();
-            for (int sectionIndex = firstSection; sectionIndex <= lastSection; sectionIndex++) {
-                net.minecraft.world.chunk.ChunkSection section = chunk.getSectionArray()[sectionIndex];
+            net.minecraft.world.chunk.PalettesFactory palettesFactory = world.getPalettesFactory();
+            for (int sectionIndex = 0; sectionIndex <= lastSection; sectionIndex++) {
                 int sectionMinY = height.getBottomY() + sectionIndex * CubePos.SIZE;
-                // The scratch section is private until it is published below.
-                // Hold its palette lock once and use the explicitly unsafe
-                // setter inside the single-threaded fill.  ChunkSection's
-                // boolean overload still updates block/fluid/random-tick
-                // counts; false only selects PalettedContainer.swapUnsafe()
-                // instead of taking the same lock for every voxel.
-                section.lock();
-                try {
-                    for (int localY = 0; localY < CubePos.SIZE; localY++) {
-                        for (int localZ = 0; localZ < CubePos.SIZE; localZ++) {
-                            for (int localX = 0; localX < CubePos.SIZE; localX++) {
-                                mutable.set(chunkX * CubePos.SIZE + localX,
-                                        sectionMinY + localY, chunkZ * CubePos.SIZE + localZ);
-                                section.setBlockState(localX, localY, localZ,
-                                        batchWriter.read(world, mutable), false);
-                            }
-                        }
-                    }
-                } finally {
-                    section.unlock();
-                }
                 chunk.getSectionArray()[sectionIndex] = new TrackingChunkSection(
-                        section, batchWriter,
+                        palettesFactory, batchWriter,
                         chunkX * CubePos.SIZE, sectionMinY, chunkZ * CubePos.SIZE);
             }
         } else if (chunkX == cube.pos().x() && chunkZ == cube.pos().z()) {
@@ -1162,7 +1235,7 @@ final class VanillaPlacedFeatureGenerator {
             BlockState state = batchWriter == null
                     ? featureBlockState(world, cube, virtualCube, offsetY,
                             boundaryMode, clippedBlockStates, mutable)
-                    : batchWriter.read(world, mutable);
+                    : batchWriter.read(mutable);
             if (!state.isAir()) {
                 return y + 1;
             }

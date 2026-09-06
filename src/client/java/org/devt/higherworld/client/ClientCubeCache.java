@@ -213,6 +213,7 @@ public final class ClientCubeCache {
             removed = CUBES.remove(pos, current);
         }
         if (!removed) return;
+        LIGHT_ENGINE.discardCube(pos);
         removeBlockEntities(pos);
         queueLoadedNeighbours(pos);
         queueRenderNeighborhood(pos);

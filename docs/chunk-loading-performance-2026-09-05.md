@@ -79,3 +79,78 @@
 当前版本的独立手工 harness 已通过 23 个调度、watch 和预算测试，结果为 `tests=23 failures=0`。按要求执行的 Gradle 定向测试仍在任务启动前因 `Unable to establish loopback connection` 失败，因此没有把 Gradle 结果记为通过。
 
 临时 Minecraft palette smoke 未能在普通独立 JVM 中执行完成：缓存的 Minecraft 类需要游戏启动器提供的运行时转换，初始化阶段触发 `VerifyError`（`MobEntity.isInAttackRange`）；这次没有据此给出 palette 等价性或 setter 提速数字。当前结果也尚未经过游戏内重新加载后的实测，区块移动时的 feature 推进、总体加载时间和客户端表现仍需用包含该生产类的重启实例复测。
+
+## 零碎生成/加载的结构性修复（2026-09-06）
+
+上一轮 runtime-state 显示 readyQueue 物理条目约为 live 条目的 10.5 倍，每次提交扫描都要在
+priority queue 上消费数万个条目；blocked holder 每次扫描都会重新入队，构成持续的队列 churn。
+结合 JFR 中 `createFeatureChunk` 的 palette 拷贝热点，本轮做如下结构性修复：
+
+### 调度器：依赖阻塞的 holder 移出优先级队列
+
+- `CubeTaskScheduler` 新增 `waitingSinceEpoch` + `waitingOrder`（带 epoch 的旋转引用队列）与
+  全局 `dependencyEpoch` 计数器。`nextCommitDependenciesReady` 不通过的 holder 不再每次扫描
+  重新入队，而是记入 waiting 集合；只有某个 holder 状态变化（`holderChanged` 递增纪元）后才
+  在下一轮按上限 512 个/次重新检查并重新入队。物理队列收缩到 live 量级，扫描成本不再随阻塞
+  规模增长，依赖完成后的唤醒延迟 ≤ 1-2 tick。
+- `readyForCommit` 的队列排空后执行有界 waiting 复查，复查重新入队的条目在同一轮继续被轮询，
+  保持原有的“阻塞的高优先级节点不饿死其依赖”语义。
+
+### FEATURES 提交按 tick 预算切片
+
+- `advanceReadyTasks` 把提交 deadline 传入 `tryAdvance` → `commitFeatures`。香草路径
+  `VanillaPlacedFeatureGenerator.generateBatched` 按 27 个 batch key（3 个 source band × 9 个
+  chunk）切片，只在生成未缓存的 key 前检查 deadline（本轮首个新 key 保证前进）；`LoadContext`
+  记录 `featureProgress` 光标跨 tick 续传，完成后才 `advance(FEATURES)`。自定义世界
+  `CustomCubeGenerator.finishGeneration` 在 7 个阶段之间同样切片。同步路径传 `Long.MAX_VALUE`
+  保持一次性完成。新列一次提交不再把 27 个 batch 的生成压进单个 tick，消除了
+  大提交 → 债务暂停 → 提交归零的停-走循环。
+
+### feature batch 临时 section 惰性化 + 地形快照读取
+
+- `createFeatureChunk` 不再为每个 batch key 预填充 8×4096 个方块（JFR 热点）。`TrackingChunkSection`
+  改为空 palette 的惰性 section，重写 `getBlockState`/`getFluidState` 从 `FeatureBatchWriter`
+  按需读取（writes 优先，其次真实地形），`setBlockState` 记录写入。
+- `FeatureBatchWriter` 增加按 cube 惰性拷贝的稀疏地形快照（`CubicWorldState.snapshotSection`），
+  低于香草高度带的探测读不再逐位置走 `world.getBlockState` 分发；未加载/未达 TERRAIN 的 cube
+  读作空气，与原读路径语义一致。
+
+### 结构起点缓存与流预算
+
+- `VanillaStructureGenerator` 增加按世界、按 ChunkPos 的有界 LRU（4096 条）缓存
+  `getStructureStarts` 结果（起点对象只读，放置走 NBT 拷贝），列内逐 cube 提交不再重复探测
+  全部注册结构。
+- `CubeWatchManager`：read-ahead 64→128、发送上限 64→96、基准 24→32、轮询尝试 128→256；
+  GPU terrain batcher 批量上限 16→32，与放大的预取管道匹配。
+
+### 验证
+
+- `gradlew compileJava compileClientJava assemble`（--offline）通过并产出 jar；Gradle 测试任务
+  因 `FabricLoaderLauncherSessionListener` 无法实例化而无法启动（沿用仓库已有约束）。
+- 独立 JUnit harness 全量运行 132 个测试：122 通过、10 个失败全部为
+  `NoClassDefFoundError: net.minecraft.block.Blocks` 静态初始化失败（普通 JVM 缺少游戏启动器
+  运行时转换），与无本批改动的基线行为一致（基线同样失败），非本轮改动引入。
+- 调度/预算/watcher 定向测试 28/28 通过，含新增的
+  `blockedHoldersWaitOutsideTheReadyQueueUntilADependencyAdvances`（阻塞 holder 不churn、
+  依赖推进后同轮唤醒）。
+- 切片只改变提交时机，不改变生成内容：香草 feature batch 的随机源均为 seed+位置+band 派生，
+  自定义各阶段无 `world.getRandom()`/时间依赖，结构缓存不改变放置输出。
+
+## 批量上限回归与修复（2026-09-06 晚）
+
+把 GPU terrain batcher 批量上限从 16 提到 32 时，`GpuTerrainAccelerator`/
+`OpenClTerrainAccelerator` 的 host 缓冲仍按 16 个 cube 分配（`MAX_DENSITY_BATCH`、
+`MAX_CUSTOM_BATCH`、`MAX_BATCH_CUBES = 16`）。超过 16 的批次触发
+`IllegalArgumentException: Density batch must contain 1-16 grids`，batcher 的 catch
+把整批请求静默置为失败且不打日志。运行态确认 5,734 个 holder 因此永久失败（failure-dump
+agent 采样），685 个 feature halo 依赖失败后 91 个 owner 全部永久阻塞，表现为"深层完全不加载"。
+
+修复：
+
+- `VanillaTerrainBatcher`/`CustomTerrainBatcher` 的 `MAX_BATCH` 与
+  `VanillaCubeTerrainGenerator.MAX_GPU_BATCHES` 回退为 16，与 GPU host 缓冲容量一致。
+- 两个 batcher 的 GPU 调用 catch 不再静默：`fallback_on_error=false` 时保持硬失败并记录
+  error 日志；其余情况记录 warn 日志并逐请求回退 CPU 生成，单个异常批次不再连坐整批 cube。
+- 诊断新增 `SnapshotAgent5`（每 5 秒快照失败 holder 及其异常）与 `FailureDumpAgent` 系列，
+  附到运行中的游戏进程即可确认失败原因；注意同一 Agent-Class 名只能加载一次。
+
