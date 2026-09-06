@@ -45,6 +45,8 @@ final class CubeTaskScheduler implements AutoCloseable {
      * cancellable when a view leaves them.
      */
     private volatile Set<CubePos> prefetchPositions = Set.of();
+    /** Server-thread cache: finishing holders does not change spatial demand. */
+    private Map<CubePos, CubeStatus> prefetchRequiredStatuses = Map.of();
     private final ThreadPoolExecutor generationExecutor;
     /** Collects independent custom cubes so OpenCL sees a useful work batch. */
     private final CustomTerrainBatcher customTerrainBatcher = new CustomTerrainBatcher();
@@ -163,7 +165,17 @@ final class CubeTaskScheduler implements AutoCloseable {
      * block payload must not start the lighting graph for the whole view.
      */
     void retainPrefetches(Set<CubePos> retained) {
-        prefetchPositions = Set.copyOf(retained);
+        if (!prefetchPositions.equals(retained)) {
+            prefetchPositions = Set.copyOf(retained);
+            Map<CubePos, CubeStatus> required = new HashMap<>();
+            for (CubePos pos : prefetchPositions) {
+                CubeTicketManager.collectRequired(
+                        pos, CubeDependencyRadius.NONE, CubeStatus.PAYLOAD, required);
+            }
+            prefetchRequiredStatuses = Map.copyOf(required);
+        }
+        // Still reconcile holders: ad-hoc requests and feature terrain reads
+        // can change even when the watcher roots themselves have not moved.
         refreshTargets();
     }
 
@@ -681,10 +693,8 @@ final class CubeTaskScheduler implements AutoCloseable {
         // Most refreshes only change a bounded set of streaming roots. Reuse
         // the simulation closure instead of allocating its cuboids each tick.
         Map<CubePos, CubeStatus> required = new HashMap<>(tickets.requiredStatuses());
-        for (CubePos pos : prefetchPositions) {
-            CubeTicketManager.collectRequired(
-                    pos, CubeDependencyRadius.NONE, CubeStatus.PAYLOAD, required);
-        }
+        prefetchRequiredStatuses.forEach((pos, target) ->
+                required.merge(pos, target, CubeTaskScheduler::maximum));
 
         // A placed-feature batch has a wider terrain read set than the normal
         // FEATURES dependency radius.  Keep only entries whose owner is still
@@ -752,6 +762,7 @@ final class CubeTaskScheduler implements AutoCloseable {
         requestPriorities.clear();
         requiredPositions = Set.of();
         prefetchPositions = Set.of();
+        prefetchRequiredStatuses = Map.of();
         featureTerrainDependencies.clear();
         featureTerrainRequiredCounts.clear();
         featureTerrainReady.clear();

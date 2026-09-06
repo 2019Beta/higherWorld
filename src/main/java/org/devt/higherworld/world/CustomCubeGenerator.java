@@ -137,18 +137,24 @@ final class CustomCubeGenerator {
         // a snapshot to a pre-populated section (for example during a repair).
         boolean clearAir = !cube.section().isEmpty();
 
-        for (int localY = 0; localY < CubePos.SIZE; localY++) {
-            for (int localZ = 0; localZ < CubePos.SIZE; localZ++) {
-                for (int localX = 0; localX < CubePos.SIZE; localX++) {
-                    if (solid[blockIndex(localX, localY, localZ)]) {
-                        cube.setGeneratedBlockState(localX, localY, localZ,
-                                DEEPSLATE);
-                    } else if (clearAir) {
-                        cube.setGeneratedBlockState(localX, localY, localZ,
-                                AIR);
+        // The commit owns the section; acquire its palette lock once instead
+        // of taking and releasing it for each of the 4096 possible writes.
+        var section = cube.section();
+        section.lock();
+        try {
+            for (int localY = 0; localY < CubePos.SIZE; localY++) {
+                for (int localZ = 0; localZ < CubePos.SIZE; localZ++) {
+                    for (int localX = 0; localX < CubePos.SIZE; localX++) {
+                        if (solid[blockIndex(localX, localY, localZ)]) {
+                            section.setBlockState(localX, localY, localZ, DEEPSLATE, false);
+                        } else if (clearAir) {
+                            section.setBlockState(localX, localY, localZ, AIR, false);
+                        }
                     }
                 }
             }
+        } finally {
+            section.unlock();
         }
     }
 

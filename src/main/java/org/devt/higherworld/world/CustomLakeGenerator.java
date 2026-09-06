@@ -95,20 +95,22 @@ final class CustomLakeGenerator {
     /** Finds the highest solid/air interface present in this cube. */
     static int highestSurfaceY(LoadedCube cube) {
         CubePos pos = cube.pos();
-        int highest = Integer.MIN_VALUE;
-        for (int z = 0; z < CubePos.SIZE; z++) {
-            for (int x = 0; x < CubePos.SIZE; x++) {
-                for (int y = CubePos.SIZE - 2; y >= 0; y--) {
-                    BlockState current = cube.section().getBlockState(x, y, z);
+        if (cube.section().isEmpty()) return Integer.MIN_VALUE;
+        // Descending layers let the first interface answer the global maximum.
+        // Test air above first: solid underground cubes need only one read per cell.
+        for (int y = CubePos.SIZE - 2; y >= 0; y--) {
+            for (int z = 0; z < CubePos.SIZE; z++) {
+                for (int x = 0; x < CubePos.SIZE; x++) {
                     BlockState above = cube.section().getBlockState(x, y + 1, z);
-                    if (!current.isAir() && current.getFluidState().isEmpty() && above.isAir()) {
-                        highest = Math.max(highest, pos.minBlockY() + y);
-                        break;
+                    if (!above.isAir()) continue;
+                    BlockState current = cube.section().getBlockState(x, y, z);
+                    if (!current.isAir() && current.getFluidState().isEmpty()) {
+                        return pos.minBlockY() + y;
                     }
                 }
             }
         }
-        return highest;
+        return Integer.MIN_VALUE;
     }
 
     private static boolean knownBiomes(ServerWorld world, Set<String> values) {

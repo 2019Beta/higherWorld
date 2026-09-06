@@ -19,6 +19,32 @@ class CubeTaskSchedulerLifecycleTest {
     Path directory;
 
     @Test
+    void unchangedPrefetchRootsStillReconcileAdHocRequestsAndTicketChanges() throws Exception {
+        CubePos root = new CubePos(0, -20, 0);
+        CubePos transientPos = new CubePos(100, -20, 100);
+        try (CubeStorage storage = new CubeStorage(directory);
+                CubeIoScheduler io = new CubeIoScheduler(storage);
+                CubeTaskScheduler scheduler = new CubeTaskScheduler(io)) {
+            scheduler.retainPrefetches(Set.of(root));
+            CubeHolder transientHolder = scheduler.holder(transientPos);
+            transientHolder.request(CubeStatus.TERRAIN);
+            scheduler.retainPrefetches(new java.util.HashSet<>(Set.of(root)));
+            assertFalse(scheduler.isRequired(transientPos));
+            assertEquals(CubeStatus.EMPTY, transientHolder.target());
+            assertTrue(scheduler.isRequired(new CubePos(1, -20, 0)));
+            scheduler.replaceTicket(new CubeTicket("test", CubeTicketType.PLAYER, transientPos,
+                    CubeDependencyRadius.NONE, CubeStatus.FULL, 0));
+            scheduler.retainPrefetches(Set.of(root));
+            assertTrue(scheduler.isRequired(transientPos));
+            scheduler.removeTicket("test");
+            assertFalse(scheduler.isRequired(transientPos));
+            scheduler.retainPrefetches(Set.of());
+            assertFalse(scheduler.isRequired(root));
+            assertFalse(scheduler.isRequired(new CubePos(1, -20, 0)));
+        }
+    }
+
+    @Test
     void tickingFrontierTracksFullPromotionDowngradeFailureAndCancellation() throws Exception {
         CubePos pos = new CubePos(0, -20, 0);
         try (CubeStorage storage = new CubeStorage(directory);
