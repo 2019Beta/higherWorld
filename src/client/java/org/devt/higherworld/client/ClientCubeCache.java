@@ -2,7 +2,6 @@ package org.devt.higherworld.client;
 
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.Collection;
 import java.util.LinkedHashSet;
 import java.util.Map;
@@ -20,15 +19,19 @@ import net.minecraft.world.Heightmap;
 import net.minecraft.world.LightType;
 import net.minecraft.block.entity.BlockEntity;
 import net.minecraft.block.entity.BlockEntityTicker;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import org.devt.higherworld.world.CubeBlockEventPayload;
 import org.devt.higherworld.storage.CubePos;
 import org.devt.higherworld.world.CubeLightData;
 import org.devt.higherworld.world.CubeRecordCodec;
 import org.devt.higherworld.world.CubeRevisionGate;
+import org.devt.higherworld.world.CubeStreamFeedbackPayload;
+import org.devt.higherworld.world.CubeStreamQueue;
 import org.devt.higherworld.world.SparseCubeLightEngine;
 
 /** Sparse client-side mirror of the cubes sent by the server. */
 public final class ClientCubeCache {
+    private static int feedbackTicks;
     /**
      * Light propagation is deliberately drained from the client tick instead
      * of from packet handlers.  A packet can add several thousand nodes when a
@@ -41,8 +44,7 @@ public final class ClientCubeCache {
     private static final int MAX_PENDING_UPDATES_PER_TICK = 512;
     private static final long PENDING_UPDATE_BUDGET_NANOS = 4_000_000L;
     private static final ConcurrentMap<CubePos, CubeEntry> CUBES = new ConcurrentHashMap<>();
-    private static final ConcurrentLinkedQueue<PendingUpdate> PENDING_UPDATES =
-            new ConcurrentLinkedQueue<>();
+    private static final CubeStreamQueue<PendingUpdate> PENDING_UPDATES = new CubeStreamQueue<>();
     /**
      * A light packet can arrive in the same network tick as the first cube
      * payload. Retain the newest one until that payload installs the cube;
@@ -83,7 +85,7 @@ public final class ClientCubeCache {
             MinecraftClient client, CubePos pos, long revision, byte[] payload) {
         if (client != null && pos != null && payload != null) {
             PENDING_UPDATES.offer(PendingUpdate.data(
-                    client, client.world, pos, revision, payload));
+                    client, client.world, pos, revision, payload), payload.length, System.nanoTime());
         }
     }
 
@@ -92,14 +94,14 @@ public final class ClientCubeCache {
             MinecraftClient client, CubePos pos, long revision, byte[] payload) {
         if (client != null && pos != null && payload != null) {
             PENDING_UPDATES.offer(PendingUpdate.light(
-                    client, client.world, pos, revision, payload));
+                    client, client.world, pos, revision, payload), payload.length, System.nanoTime());
         }
     }
 
     /** Queues an unload so packet bursts share one cache/render publication. */
     public static void enqueueUnload(MinecraftClient client, CubePos pos, long revision) {
         if (client != null && pos != null) {
-            PENDING_UPDATES.offer(PendingUpdate.unload(client, client.world, pos, revision));
+            PENDING_UPDATES.offer(PendingUpdate.unload(client, client.world, pos, revision), 0, System.nanoTime());
         }
     }
 
@@ -299,6 +301,7 @@ public final class ClientCubeCache {
     public static void clear() {
         synchronized (ClientCubeCache.class) {
             PENDING_UPDATES.clear();
+            feedbackTicks = 0;
             CUBES.clear();
             PENDING_LIGHTS.clear();
             CUBE_HEIGHTS.clear();
@@ -321,6 +324,24 @@ public final class ClientCubeCache {
         // wait behind the entire view; the set still turns duplicate cube plus
         // six-neighbour notifications into one submission per affected section.
         flushRenderUpdates();
+        if (++feedbackTicks >= 5) {
+            feedbackTicks = 0;
+            sendStreamFeedback();
+        }
+    }
+
+    public static void beginStream(long streamId) {
+        PENDING_UPDATES.begin(streamId);
+    }
+
+    private static void sendStreamFeedback() {
+        if (MinecraftClient.getInstance().world == null) return;
+        var feedback = PENDING_UPDATES.feedback(System.nanoTime(), PENDING_RENDER_CUBES.size(),
+                LIGHT_ENGINE.pendingCubeCount());
+        if (feedback.streamId() != 0
+                && ClientPlayNetworking.canSend(CubeStreamFeedbackPayload.ID)) {
+            ClientPlayNetworking.send(feedback);
+        }
     }
 
     private static boolean drainPendingUpdates() {

@@ -21,6 +21,8 @@ import org.devt.higherworld.world.CubeBlockEventPayload;
 import org.devt.higherworld.world.CubeDataPayload;
 import org.devt.higherworld.world.CubeLightUpdatePayload;
 import org.devt.higherworld.world.CubeUnloadPayload;
+import org.devt.higherworld.world.CubeStreamStartPayload;
+import org.devt.higherworld.world.CubeStreamFeedbackPayload;
 import org.devt.higherworld.world.CubeWatchManager;
 import org.devt.higherworld.world.CubicWorldManager;
 import org.devt.higherworld.world.TerrainGeneratorStatusPayload;
@@ -44,6 +46,10 @@ public class Higherworld implements ModInitializer {
         PayloadTypeRegistry.playS2C().register(CubeDataPayload.ID, CubeDataPayload.CODEC);
         PayloadTypeRegistry.playS2C().register(CubeLightUpdatePayload.ID, CubeLightUpdatePayload.CODEC);
         PayloadTypeRegistry.playS2C().register(CubeUnloadPayload.ID, CubeUnloadPayload.CODEC);
+        PayloadTypeRegistry.playS2C().register(CubeStreamStartPayload.ID, CubeStreamStartPayload.CODEC);
+        PayloadTypeRegistry.playC2S().register(CubeStreamFeedbackPayload.ID, CubeStreamFeedbackPayload.CODEC);
+        ServerPlayNetworking.registerGlobalReceiver(CubeStreamFeedbackPayload.ID, (payload, context) ->
+                context.server().execute(() -> CubeWatchManager.acceptStreamFeedback(context.player(), payload)));
         PayloadTypeRegistry.playS2C().register(CubeBlockUpdatePayload.ID, CubeBlockUpdatePayload.CODEC);
         PayloadTypeRegistry.playS2C().register(CubeBlockEventPayload.ID, CubeBlockEventPayload.CODEC);
         PayloadTypeRegistry.playS2C().register(
@@ -61,6 +67,8 @@ public class Higherworld implements ModInitializer {
         });
         ServerPlayConnectionEvents.JOIN.register((handler, sender, server) ->
                 sendTerrainGeneratorStatus(handler.player));
+        ServerPlayConnectionEvents.DISCONNECT.register((handler, server) ->
+                CubeWatchManager.removePlayer(handler.player));
         ServerTickEvents.END_SERVER_TICK.register(Higherworld::syncTerrainGeneratorStatus);
         ServerTickEvents.START_WORLD_TICK.register(CubeWatchManager::midTick);
         ServerTickEvents.END_WORLD_TICK.register(CubeWatchManager::tick);

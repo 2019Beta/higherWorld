@@ -758,7 +758,7 @@ final class CubicWorldState implements AutoCloseable {
     void advanceReadyTasks(long budgetNanos) {
         if (budgetNanos <= 0L) return;
         long deadline = System.nanoTime() + Math.max(0L, budgetNanos);
-        List<CubeHolder> ready = taskScheduler.readyForCommit(256);
+        List<CubeHolder> ready = taskScheduler.readyForCommit(256, deadline);
         for (int index = 0; index < ready.size(); index++) {
             if (commitBudgetExhausted(System.nanoTime(), deadline, index)) {
                 // readyForCommit removes the whole batch from its queue. Put

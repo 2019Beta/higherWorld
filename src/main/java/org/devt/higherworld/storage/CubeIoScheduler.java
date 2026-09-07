@@ -84,6 +84,15 @@ public final class CubeIoScheduler implements AutoCloseable {
         });
     }
 
+    /** Cancels one removed demand without scanning every outstanding read. */
+    public void cancelPrefetch(CubePos pos) {
+        ReadTask task = reads.remove(pos);
+        if (task != null) {
+            executor.remove(task);
+            task.future.cancel(false);
+        }
+    }
+
     public ReadResult poll(CubePos pos, int priority) throws IOException {
         Optional<byte[]> cachedWrite = latestPendingWrite(pos);
         if (cachedWrite.isPresent()) {

@@ -9,12 +9,15 @@ import org.devt.higherworld.world.CubeBlockEventPayload;
 import org.devt.higherworld.world.CubeDataPayload;
 import org.devt.higherworld.world.CubeLightUpdatePayload;
 import org.devt.higherworld.world.CubeUnloadPayload;
+import org.devt.higherworld.world.CubeStreamStartPayload;
 import org.devt.higherworld.world.TerrainGeneratorStatusPayload;
 
 public class HigherworldClient implements ClientModInitializer {
 
     @Override
     public void onInitializeClient() {
+        ClientPlayNetworking.registerGlobalReceiver(CubeStreamStartPayload.ID, (payload, context) ->
+                ClientCubeCache.beginStream(payload.streamId()));
         ClientTickEvents.END_CLIENT_TICK.register(client -> ClientCubeCache.tick());
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> client.execute(() -> {
             ClientCubeCache.clear();

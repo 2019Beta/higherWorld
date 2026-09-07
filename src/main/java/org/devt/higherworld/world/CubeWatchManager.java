@@ -12,11 +12,13 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 
 import net.fabricmc.fabric.api.networking.v1.PlayerLookup;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
 import net.minecraft.block.BlockState;
+import net.minecraft.network.packet.CustomPayload;
 import net.minecraft.server.network.ServerPlayerEntity;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.util.math.BlockPos;
@@ -47,8 +49,34 @@ public final class CubeWatchManager {
     private static final long SEND_RETRY_DELAY_TICKS = 1L;
     private static final Map<UUID, WatchState> WATCHERS = new HashMap<>();
     private static final Map<ServerWorld, AdaptiveBudget> BUDGETS = new HashMap<>();
+    private static final AtomicLong STREAM_IDS = new AtomicLong();
 
     private CubeWatchManager() {
+    }
+
+    public static void acceptStreamFeedback(ServerPlayerEntity player, CubeStreamFeedbackPayload feedback) {
+        WatchState state = WATCHERS.get(player.getUuid());
+        if (state != null && state.player == player && state.world == player.getEntityWorld()) {
+            state.stream.feedback(feedback, state.world.getTime());
+        }
+    }
+
+    public static void removePlayer(ServerPlayerEntity player) {
+        WatchState state = WATCHERS.get(player.getUuid());
+        if (state == null || state.player != player) return;
+        WATCHERS.remove(player.getUuid());
+        if (state.world != null) {
+            CubicWorldManager.removeTicket(state.world, CubeTicket.playerSimulationKey(player.getUuid()));
+            refreshPrefetches(state.world);
+        }
+        state.invalidate();
+    }
+
+    private static void sendTracked(ServerPlayerEntity player,
+            CustomPayload payload, int bytes) {
+        ServerPlayNetworking.send(player, payload);
+        WatchState state = WATCHERS.get(player.getUuid());
+        if (state != null && state.world == player.getEntityWorld()) state.stream.recordSent(bytes);
     }
 
     public static void tick(ServerWorld world) {
@@ -68,7 +96,16 @@ public final class CubeWatchManager {
         for (int index = 0; index < playerCount; index++) {
             ServerPlayerEntity player = players.get((firstPlayer + index) % playerCount);
             present.add(player.getUuid());
-            WatchState state = WATCHERS.computeIfAbsent(player.getUuid(), ignored -> new WatchState());
+            WatchState state = WATCHERS.get(player.getUuid());
+            if (state != null && state.player != null && state.player != player) {
+                removePlayer(state.player);
+                state = null;
+            }
+            if (state == null) {
+                state = new WatchState();
+                WATCHERS.put(player.getUuid(), state);
+            }
+            state.player = player;
             watcherTicketsChanged |= update(player, state, workBudget, readAheadBudget);
         }
         Iterator<Map.Entry<UUID, WatchState>> watchers = WATCHERS.entrySet().iterator();
@@ -197,7 +234,7 @@ public final class CubeWatchManager {
         CubeDataPayload payload = new CubeDataPayload(
                 pos, CubicWorldManager.cubeRevision(world, pos), data);
         for (ServerPlayerEntity player : recipients) {
-            ServerPlayNetworking.send(player, payload);
+            sendTracked(player, payload, data.length);
         }
     }
 
@@ -221,7 +258,7 @@ public final class CubeWatchManager {
             CubeLightUpdatePayload payload = new CubeLightUpdatePayload(
                     pos, CubicWorldManager.cubeRevision(world, pos), data);
             for (ServerPlayerEntity player : recipients) {
-                ServerPlayNetworking.send(player, payload);
+                sendTracked(player, payload, data.length);
             }
         }
     }
@@ -244,7 +281,8 @@ public final class CubeWatchManager {
 
         // Starting a read is intentionally separate from sending its result.
         // The read-ahead budget is shared by every watcher in this world.
-        while (readAheadBudget.hasRemaining() && state.activeUnsent.size() < MAX_ACTIVE_UNSENT) {
+        while (readAheadBudget.hasRemaining() && state.activeUnsent.size() < MAX_ACTIVE_UNSENT
+                && state.stream.canSend(0, world.getTime())) {
             Watch watch = state.pollPendingStart();
             if (watch == null) break;
 
@@ -270,7 +308,8 @@ public final class CubeWatchManager {
         }
 
         int pollAttempts = 0;
-        while (workBudget.hasRemaining() && pollAttempts < POLL_ATTEMPTS_PER_PLAYER_TICK) {
+        while (workBudget.hasRemaining() && pollAttempts < POLL_ATTEMPTS_PER_PLAYER_TICK
+                && state.stream.canSend(0, world.getTime())) {
             Watch watch = state.pollReadySend();
             if (watch == null) break;
             pollAttempts++;
@@ -300,10 +339,14 @@ public final class CubeWatchManager {
                         SEND_RETRY_DELAY_TICKS);
                 continue;
             }
+            if (!state.stream.canSend(payload.length, world.getTime())) {
+                state.scheduleRetry(watch, world.getTime(), RetryTarget.SEND, SEND_RETRY_DELAY_TICKS);
+                break;
+            }
             workBudget.consume();
             if (payload.length != 0 && CubeDataPayload.canEncode(payload)) {
-                ServerPlayNetworking.send(player, new CubeDataPayload(
-                        pos, CubicWorldManager.cubeRevision(world, pos), payload));
+                sendTracked(player, new CubeDataPayload(
+                        pos, CubicWorldManager.cubeRevision(world, pos), payload), payload.length);
             }
             // Track empty positions too. They are implicit air and need no packet,
             // but remembering them prevents rechecking the overlapping 3D view
@@ -391,6 +434,12 @@ public final class CubeWatchManager {
             retainWorldPrefetches(previousWorld, state);
         }
         state.world = world;
+        if (!sameWorld) {
+            long streamId = STREAM_IDS.incrementAndGet();
+            boolean supported = ServerPlayNetworking.canSend(player, CubeStreamStartPayload.ID);
+            state.stream.start(streamId, supported, world.getTime());
+            if (supported) ServerPlayNetworking.send(player, new CubeStreamStartPayload(streamId));
+        }
         state.center = center;
         state.horizontalRadius = horizontalRadius;
         if (center.y() - VERTICAL_RADIUS < world.getBottomSectionCoord()
@@ -652,6 +701,8 @@ public final class CubeWatchManager {
     }
 
     static final class WatchState {
+        private final CubeStreamBudget stream = new CubeStreamBudget();
+        private ServerPlayerEntity player;
         private ServerWorld world;
         private CubePos center;
         private int horizontalRadius;

@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 
 import java.nio.file.Path;
 import java.util.List;
@@ -17,6 +18,57 @@ import org.junit.jupiter.api.io.TempDir;
 class CubeTaskSchedulerLifecycleTest {
     @TempDir
     Path directory;
+
+    @Test
+    void largeBlockedFrontiersReturnAndWakeWithoutSyntheticEpochChanges() throws Exception {
+        for (int count : new int[] {513, 1024}) {
+            try (CubeStorage storage = new CubeStorage(directory.resolve("waiters-" + count));
+                    CubeIoScheduler io = new CubeIoScheduler(storage);
+                    CubeTaskScheduler scheduler = new CubeTaskScheduler(io)) {
+                CubePos haloPos = new CubePos(-100, -20, -100);
+                CubeHolder halo = scheduler.holder(haloPos);
+                halo.advance(CubeStatus.IO_READY);
+                // Terrain preparation remains in flight throughout the blocked scans.
+                halo.request(CubeStatus.TERRAIN);
+                halo.startTerrain(java.util.concurrent.CompletableFuture::new);
+                for (int x = -1; x <= count; x++) {
+                    for (int y = -21; y <= -19; y++) {
+                        for (int z = -1; z <= 1; z++) {
+                            scheduler.holder(new CubePos(x, y, z)).advance(CubeStatus.TERRAIN);
+                        }
+                    }
+                }
+                for (int x = 0; x < count; x++) {
+                    CubePos pos = new CubePos(x, -20, 0);
+                    scheduler.holder(pos).request(CubeStatus.PAYLOAD);
+                    scheduler.registerFeatureTerrainDependenciesForTest(pos, List.of(haloPos));
+                }
+                assertTimeoutPreemptively(java.time.Duration.ofSeconds(3), () -> {
+                    for (int scan = 0; scan < 8; scan++) {
+                        assertTrue(scheduler.readyForCommit(256).isEmpty());
+                        // Unrelated real progress must not cause waiter ping-pong.
+                        scheduler.holder(new CubePos(-200 - scan, -20, 0))
+                                .advance(CubeStatus.IO_READY);
+                    }
+                });
+                halo.advance(CubeStatus.TERRAIN);
+                assertFalse(scheduler.readyForCommit(1).isEmpty());
+            }
+        }
+    }
+
+    @Test
+    void expiredScanDeadlineDoesNotConsumeReadyWork() throws Exception {
+        try (CubeStorage storage = new CubeStorage(directory);
+                CubeIoScheduler io = new CubeIoScheduler(storage);
+                CubeTaskScheduler scheduler = new CubeTaskScheduler(io)) {
+            CubeHolder holder = scheduler.holder(new CubePos(0, -20, 0));
+            holder.request(CubeStatus.TERRAIN);
+            holder.advance(CubeStatus.IO_READY);
+            assertTrue(scheduler.readyForCommit(1, System.nanoTime() - 1).isEmpty());
+            assertSame(holder, scheduler.readyForCommit(1).getFirst());
+        }
+    }
 
     @Test
     void unchangedPrefetchRootsStillReconcileAdHocRequestsAndTicketChanges() throws Exception {
