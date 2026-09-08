@@ -30,9 +30,7 @@ final class CubeStreamBudget {
         if (bytes < 0) return false;
         if (!enabled) return true;
         if (tick - lastFeedbackTick > 40) return false;
-        if (feedback != null && (feedback.pendingBytes() >= WINDOW_BYTES / 2
-                || feedback.pendingUpdates() >= 512 || feedback.oldestMillis() >= 250
-                || feedback.pendingRenders() >= 768 || feedback.pendingLightCubes() >= 512)) return false;
+        if (feedback != null && feedback.hasBackpressure()) return false;
         long outstanding = sentBytes - processedBytes;
         return outstanding < WINDOW_BYTES && bytes <= WINDOW_BYTES - outstanding;
     }

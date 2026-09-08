@@ -23,6 +23,9 @@ import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import org.devt.higherworld.world.CubeBlockEventPayload;
 import org.devt.higherworld.storage.CubePos;
 import org.devt.higherworld.world.CubeLightData;
+import org.devt.higherworld.world.CubeLookupCache;
+import org.devt.higherworld.world.CubeFeedbackCadence;
+import org.devt.higherworld.world.CubeWorkEvent;
 import org.devt.higherworld.world.CubeRecordCodec;
 import org.devt.higherworld.world.CubeRevisionGate;
 import org.devt.higherworld.world.CubeStreamFeedbackPayload;
@@ -31,7 +34,7 @@ import org.devt.higherworld.world.SparseCubeLightEngine;
 
 /** Sparse client-side mirror of the cubes sent by the server. */
 public final class ClientCubeCache {
-    private static int feedbackTicks;
+    private static final CubeFeedbackCadence FEEDBACK_CADENCE = new CubeFeedbackCadence();
     /**
      * Light propagation is deliberately drained from the client tick instead
      * of from packet handlers.  A packet can add several thousand nodes when a
@@ -63,6 +66,8 @@ public final class ClientCubeCache {
     private static final ConcurrentMap<BlockColumnPos, Integer> HIGHEST_BLOCKS =
             new ConcurrentHashMap<>();
     private static volatile ClientWorld owner;
+    /** Invalidates task-local section lookups on publication, removal or world change. */
+    private static volatile long sectionEpoch;
     /** Block entities are indexed by their owning cube to keep render rebuilds local. */
     private static final ConcurrentMap<CubePos, ConcurrentMap<BlockPos, BlockEntity>> BLOCK_ENTITIES =
             new ConcurrentHashMap<>();
@@ -142,6 +147,7 @@ public final class ClientCubeCache {
                     CUBES.put(pos, replacement);
                 }
             }
+            sectionEpoch++;
         }
         removeBlockEntities(pos);
         ConcurrentMap<BlockPos, BlockEntity> cubeBlockEntities =
@@ -213,6 +219,7 @@ public final class ClientCubeCache {
             }
             removeCubeHeightsLocked(pos);
             removed = CUBES.remove(pos, current);
+            if (removed) sectionEpoch++;
         }
         if (!removed) return;
         LIGHT_ENGINE.discardCube(pos);
@@ -301,7 +308,7 @@ public final class ClientCubeCache {
     public static void clear() {
         synchronized (ClientCubeCache.class) {
             PENDING_UPDATES.clear();
-            feedbackTicks = 0;
+            FEEDBACK_CADENCE.reset();
             CUBES.clear();
             PENDING_LIGHTS.clear();
             CUBE_HEIGHTS.clear();
@@ -310,6 +317,7 @@ public final class ClientCubeCache {
             LIGHT_ENGINE.clear();
             PENDING_RENDER_CUBES.clear();
             owner = null;
+            sectionEpoch++;
         }
     }
 
@@ -324,10 +332,7 @@ public final class ClientCubeCache {
         // wait behind the entire view; the set still turns duplicate cube plus
         // six-neighbour notifications into one submission per affected section.
         flushRenderUpdates();
-        if (++feedbackTicks >= 5) {
-            feedbackTicks = 0;
-            sendStreamFeedback();
-        }
+        sendStreamFeedback();
     }
 
     public static void beginStream(long streamId) {
@@ -339,7 +344,8 @@ public final class ClientCubeCache {
         var feedback = PENDING_UPDATES.feedback(System.nanoTime(), PENDING_RENDER_CUBES.size(),
                 LIGHT_ENGINE.pendingCubeCount());
         if (feedback.streamId() != 0
-                && ClientPlayNetworking.canSend(CubeStreamFeedbackPayload.ID)) {
+                && ClientPlayNetworking.canSend(CubeStreamFeedbackPayload.ID)
+                && FEEDBACK_CADENCE.shouldSend(feedback)) {
             ClientPlayNetworking.send(feedback);
         }
     }
@@ -363,10 +369,16 @@ public final class ClientCubeCache {
             // alone is not enough: a packet queued for the previous world must
             // not be applied to the newly joined world during a fast reconnect.
             if (update.client() != client || update.world() != world) continue;
-            switch (update.type()) {
-                case DATA -> put(world, update.pos(), update.revision(), update.payload());
-                case LIGHT -> updateLight(world, update.pos(), update.revision(), update.payload());
-                case UNLOAD -> unload(world, update.pos(), update.revision());
+            try (CubeWorkEvent event = CubeWorkEvent.start(switch (update.type()) {
+                case DATA -> "client.decode_publish";
+                case LIGHT -> "client.light_publish";
+                case UNLOAD -> "client.unload";
+            }, update.pos())) {
+                switch (update.type()) {
+                    case DATA -> put(world, update.pos(), update.revision(), update.payload());
+                    case LIGHT -> updateLight(world, update.pos(), update.revision(), update.payload());
+                    case UNLOAD -> unload(world, update.pos(), update.revision());
+                }
             }
         }
         return !PENDING_UPDATES.isEmpty();
@@ -485,6 +497,7 @@ public final class ClientCubeCache {
                     LIGHT_ENGINE.clear();
                     PENDING_RENDER_CUBES.clear();
                     owner = world;
+                    sectionEpoch++;
                 }
             }
         }
@@ -801,9 +814,28 @@ public final class ClientCubeCache {
     }
 
     private static final class ClientLightAccess implements SparseCubeLightEngine.Access {
+        private final CubeLookupCache<CubeEntry> lookup = new CubeLookupCache<>(CUBES::get);
+        private boolean inSlice;
+
+        @Override
+        public void beginSlice() {
+            lookup.clear();
+            inSlice = true;
+        }
+
+        @Override
+        public void endSlice() {
+            inSlice = false;
+            lookup.clear();
+        }
+
+        private CubeEntry cubeAt(int x, int y, int z) {
+            return inSlice ? lookup.getBlock(x, y, z, sectionEpoch) : CUBES.get(CubePos.fromBlock(x, y, z));
+        }
+
         @Override
         public boolean managed(int x, int y, int z) {
-            return CUBES.containsKey(CubePos.fromBlock(x, y, z));
+            return cubeAt(x, y, z) != null;
         }
 
         @Override
@@ -829,7 +861,7 @@ public final class ClientCubeCache {
 
         @Override
         public int block(int x, int y, int z) {
-            CubeEntry entry = CUBES.get(CubePos.fromBlock(x, y, z));
+            CubeEntry entry = cubeAt(x, y, z);
             if (entry != null) return entry.light().workingBlock(local(x), local(y), local(z));
             ClientWorld world = owner;
             if (world != null && y >= world.getBottomY() && y <= world.getTopYInclusive()) {
@@ -840,7 +872,7 @@ public final class ClientCubeCache {
 
         @Override
         public int sky(int x, int y, int z) {
-            CubeEntry entry = CUBES.get(CubePos.fromBlock(x, y, z));
+            CubeEntry entry = cubeAt(x, y, z);
             if (entry != null) return entry.light().workingSky(local(x), local(y), local(z));
             ClientWorld world = owner;
             if (world != null && y >= world.getBottomY() && y <= world.getTopYInclusive()) {
@@ -851,13 +883,13 @@ public final class ClientCubeCache {
 
         @Override
         public boolean setBlock(int x, int y, int z, int value) {
-            CubeEntry entry = CUBES.get(CubePos.fromBlock(x, y, z));
+            CubeEntry entry = cubeAt(x, y, z);
             return entry != null && entry.light().setWorkingBlock(local(x), local(y), local(z), value);
         }
 
         @Override
         public boolean setSky(int x, int y, int z, int value) {
-            CubeEntry entry = CUBES.get(CubePos.fromBlock(x, y, z));
+            CubeEntry entry = cubeAt(x, y, z);
             return entry != null && entry.light().setWorkingSky(local(x), local(y), local(z), value);
         }
 
@@ -867,10 +899,52 @@ public final class ClientCubeCache {
             if (entry != null && entry.light().publish()) queueRenderNeighborhood(pos);
         }
 
-        private static BlockState state(int x, int y, int z) {
-            CubeEntry entry = CUBES.get(CubePos.fromBlock(x, y, z));
+        private BlockState state(int x, int y, int z) {
+            CubeEntry entry = cubeAt(x, y, z);
             return entry == null ? Blocks.VOID_AIR.getDefaultState()
                     : entry.section().getBlockState(local(x), local(y), local(z));
+        }
+    }
+
+    /**
+     * Owned by one ChunkRendererRegion/build task. Retains live sections, not
+     * frozen air snapshots: an epoch change refreshes even a previously missing
+     * neighbour. In-place block/light updates remain visible as before, and the
+     * existing render invalidations still schedule a rebuild after each update.
+     */
+    public static final class RenderAccess {
+        private final ClientWorld world;
+        private final CubeLookupCache<CubeEntry> lookup;
+
+        public RenderAccess(ClientWorld world) {
+            this.world = world;
+            lookup = new CubeLookupCache<>(pos -> owner == world ? CUBES.get(pos) : null);
+        }
+
+        private CubeEntry entry(BlockPos pos) {
+            // A cancelled task from an old world must never reset the new cache.
+            if (owner != world) return null;
+            return lookup.getBlock(pos.getX(), pos.getY(), pos.getZ(), sectionEpoch);
+        }
+
+        public BlockState blockState(BlockPos pos) {
+            CubeEntry cube = entry(pos);
+            return cube == null ? Blocks.VOID_AIR.getDefaultState()
+                    : cube.section().getBlockState(local(pos.getX()), local(pos.getY()), local(pos.getZ()));
+        }
+
+        public BlockEntity blockEntity(BlockPos pos) {
+            if (owner != world) return null;
+            var entities = BLOCK_ENTITIES.get(CubePos.fromBlock(pos.getX(), pos.getY(), pos.getZ()));
+            return entities == null ? null : entities.get(pos);
+        }
+
+        public int lightLevel(LightType type, BlockPos pos) {
+            CubeEntry cube = entry(pos);
+            if (cube == null) return 0;
+            return type == LightType.BLOCK
+                    ? cube.light().block(local(pos.getX()), local(pos.getY()), local(pos.getZ()))
+                    : cube.light().sky(local(pos.getX()), local(pos.getY()), local(pos.getZ()));
         }
     }
 }

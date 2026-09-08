@@ -22,6 +22,15 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 @Mixin(ChunkRendererRegion.class)
 abstract class ChunkRendererRegionMixin {
     @Shadow @Final private World world;
+    @Unique private ClientCubeCache.RenderAccess higherworld$cubeAccess;
+
+    @Unique
+    private ClientCubeCache.RenderAccess higherworld$cubeAccess() {
+        if (higherworld$cubeAccess == null) {
+            higherworld$cubeAccess = new ClientCubeCache.RenderAccess((ClientWorld) world);
+        }
+        return higherworld$cubeAccess;
+    }
 
     /**
      * SectionBuilder reads through this view. Reading only from RenderedChunk's
@@ -32,7 +41,7 @@ abstract class ChunkRendererRegionMixin {
     private void higherworld$getCubeBlockState(
             BlockPos pos, CallbackInfoReturnable<BlockState> callbackInfo) {
         if (outsideVanillaHeight(pos)) {
-            callbackInfo.setReturnValue(ClientCubeCache.getBlockState((ClientWorld) world, pos));
+            callbackInfo.setReturnValue(higherworld$cubeAccess().blockState(pos));
         }
     }
 
@@ -40,7 +49,7 @@ abstract class ChunkRendererRegionMixin {
     private void higherworld$getCubeFluidState(
             BlockPos pos, CallbackInfoReturnable<FluidState> callbackInfo) {
         if (outsideVanillaHeight(pos)) {
-            callbackInfo.setReturnValue(ClientCubeCache.getFluidState((ClientWorld) world, pos));
+            callbackInfo.setReturnValue(higherworld$cubeAccess().blockState(pos).getFluidState());
         }
     }
 
@@ -48,7 +57,7 @@ abstract class ChunkRendererRegionMixin {
     private void higherworld$getCubeBlockEntity(
             BlockPos pos, CallbackInfoReturnable<BlockEntity> callbackInfo) {
         if (outsideVanillaHeight(pos)) {
-            callbackInfo.setReturnValue(ClientCubeCache.getBlockEntity((ClientWorld) world, pos));
+            callbackInfo.setReturnValue(higherworld$cubeAccess().blockEntity(pos));
         }
     }
 
@@ -56,7 +65,7 @@ abstract class ChunkRendererRegionMixin {
         if (!outsideVanillaHeight(pos)) {
             return world.getLightLevel(type, pos);
         }
-        return ClientCubeCache.getLightLevel((ClientWorld) world, type, pos);
+        return higherworld$cubeAccess().lightLevel(type, pos);
     }
 
     public int getBaseLightLevel(BlockPos pos, int ambientDarkness) {
@@ -65,7 +74,7 @@ abstract class ChunkRendererRegionMixin {
         }
         return CubeLightMath.externalBaseLightLevel(
                 getLightLevel(LightType.SKY, pos), ambientDarkness,
-                ClientCubeCache.getBlockState((ClientWorld) world, pos).getLuminance());
+                higherworld$cubeAccess().blockState(pos).getLuminance());
     }
 
     public boolean isSkyVisible(BlockPos pos) {

@@ -21,35 +21,37 @@ final class CustomLakeGenerator {
     }
 
     static void generate(ServerWorld world, LoadedCube cube, CustomWorldSettings settings) {
-        for (int index = 0; index < settings.lakes().size(); index++) {
-            CustomWorldSettings.LakeSettings lake = settings.lakes().get(index);
-            BlockState fluid = CustomBlockStateResolver.resolve(world, lake.block());
-            if (fluid == null || !knownBiomes(world, lake.biomes())) {
-                continue;
-            }
-            CubePos pos = cube.pos();
-            Random random = new Random(seed(world.getSeed(), pos, index));
-            int surfaceY = highestSurfaceY(cube);
-            int actualY;
-            double probability;
-            if (surfaceY != Integer.MIN_VALUE) {
-                actualY = surfaceY;
-                probability = lake.surfaceProbability().getValue(actualY);
-            } else {
-                actualY = pos.minBlockY() + random.nextInt(CubePos.SIZE);
-                probability = lake.mainProbability().getValue(actualY);
-            }
-            BlockPos biomePos = new BlockPos(pos.minBlockX() + CubePos.SIZE / 2, actualY,
-                    pos.minBlockZ() + CubePos.SIZE / 2);
-            String biome = CustomGenerationSupport.biomeId(world, biomePos, settings.biome());
-            boolean listed = containsBiome(lake.biomes(), biome);
-            boolean allowed = lake.biomeSelect() == CustomWorldSettings.FilterType.INCLUDE
-                    ? listed : !listed;
-            if (!allowed || random.nextDouble() >= probability) {
-                continue;
-            }
-            carveLake(cube, fluid, random, actualY);
+        for (int index = 0; index < settings.lakes().size(); index++) generate(world, cube, settings, index);
+    }
+
+    static void generate(ServerWorld world, LoadedCube cube, CustomWorldSettings settings, int index) {
+        CustomWorldSettings.LakeSettings lake = settings.lakes().get(index);
+        BlockState fluid = CustomBlockStateResolver.resolve(world, lake.block());
+        if (fluid == null || !knownBiomes(world, lake.biomes())) {
+            return;
         }
+        CubePos pos = cube.pos();
+        Random random = new Random(seed(world.getSeed(), pos, index));
+        int surfaceY = highestSurfaceY(cube);
+        int actualY;
+        double probability;
+        if (surfaceY != Integer.MIN_VALUE) {
+            actualY = surfaceY;
+            probability = lake.surfaceProbability().getValue(actualY);
+        } else {
+            actualY = pos.minBlockY() + random.nextInt(CubePos.SIZE);
+            probability = lake.mainProbability().getValue(actualY);
+        }
+        BlockPos biomePos = new BlockPos(pos.minBlockX() + CubePos.SIZE / 2, actualY,
+                pos.minBlockZ() + CubePos.SIZE / 2);
+        String biome = CustomGenerationSupport.biomeId(world, biomePos, settings.biome());
+        boolean listed = containsBiome(lake.biomes(), biome);
+        boolean allowed = lake.biomeSelect() == CustomWorldSettings.FilterType.INCLUDE
+                ? listed : !listed;
+        if (!allowed || random.nextDouble() >= probability) {
+            return;
+        }
+        carveLake(cube, fluid, random, actualY);
     }
 
     private static void carveLake(LoadedCube cube, BlockState fluid, Random random, int worldY) {

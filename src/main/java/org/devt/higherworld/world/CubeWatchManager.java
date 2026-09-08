@@ -281,8 +281,7 @@ public final class CubeWatchManager {
 
         // Starting a read is intentionally separate from sending its result.
         // The read-ahead budget is shared by every watcher in this world.
-        while (readAheadBudget.hasRemaining() && state.activeUnsent.size() < MAX_ACTIVE_UNSENT
-                && state.stream.canSend(0, world.getTime())) {
+        while (readAheadBudget.hasRemaining() && canPrepare(state.activeUnsent.size())) {
             Watch watch = state.pollPendingStart();
             if (watch == null) break;
 
@@ -359,13 +358,19 @@ public final class CubeWatchManager {
 
     /** Re-publishes the watcher-owned read roots after a watch leaves the set. */
     private static void refreshPrefetches(ServerWorld world) {
-        Set<CubePos> requestedReads = new HashSet<>();
+        Map<CubePos, Integer> requestedReads = new HashMap<>();
         for (WatchState state : WATCHERS.values()) {
             if (state.world == world) {
-                requestedReads.addAll(state.activeUnsentPositions());
+                for (CubePos pos : state.activeUnsentPositions()) {
+                    requestedReads.merge(pos, cubePriority(pos, state.center), Math::min);
+                }
             }
         }
         CubicWorldManager.retainPrefetches(world, requestedReads);
+    }
+
+    static boolean canPrepare(int activeUnsent) {
+        return activeUnsent < MAX_ACTIVE_UNSENT;
     }
 
     /**

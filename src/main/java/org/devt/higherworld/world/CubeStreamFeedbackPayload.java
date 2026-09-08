@@ -36,5 +36,12 @@ public record CubeStreamFeedbackPayload(
                 && oldestMillis >= 0 && pendingRenders >= 0 && pendingLightCubes >= 0;
     }
 
+    /** Shared by sender throttling and client transition-triggered feedback. */
+    public boolean hasBackpressure() {
+        return pendingBytes >= CubeStreamBudget.WINDOW_BYTES / 2
+                || pendingUpdates >= 512 || oldestMillis >= 250
+                || pendingRenders >= 768 || pendingLightCubes >= 512;
+    }
+
     @Override public Id<CubeStreamFeedbackPayload> getId() { return ID; }
 }

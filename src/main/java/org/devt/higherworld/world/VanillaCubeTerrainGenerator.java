@@ -120,8 +120,7 @@ final class VanillaCubeTerrainGenerator {
                     }
                     return generateSampleBatch(
                             request.biomeSource(), request.settings(),
-                            NoiseConfig.create(
-                                    request.settings(), request.noiseParameters(), request.seed()),
+                            createNoiseConfig(request),
                             request.batchPos(), request.minimumY(), request.palettesFactory(),
                             request.structureAccessor());
                 });
@@ -130,8 +129,7 @@ final class VanillaCubeTerrainGenerator {
     /** CPU fallback for deep batches when OpenCL is disabled or unavailable. */
     private static TerrainBatchSnapshot generateDeepSparseBatch(TerrainRequest request) {
         try {
-            NoiseConfig noiseConfig = NoiseConfig.create(
-                    request.settings(), request.noiseParameters(), request.seed());
+            NoiseConfig noiseConfig = createNoiseConfig(request);
             DensityGrid grid = sampleDensityGrid(request, noiseConfig);
             if (grid == null) return null;
 
@@ -206,8 +204,7 @@ final class VanillaCubeTerrainGenerator {
 
         if (!uncached.isEmpty()) {
             TerrainRequest first = uncached.get(0);
-            NoiseConfig noiseConfig = NoiseConfig.create(
-                    first.settings(), first.noiseParameters(), first.seed());
+            NoiseConfig noiseConfig = createNoiseConfig(first);
             DensityGrid firstGrid = sampleDensityGrid(first, noiseConfig);
             if (firstGrid == null) return null;
 
@@ -332,6 +329,19 @@ final class VanillaCubeTerrainGenerator {
     }
 
     private static DensityGrid sampleDensityGrid(
+            TerrainRequest request, NoiseConfig noiseConfig) {
+        try (CubeWorkEvent ignored = CubeWorkEvent.start("vanilla.density.sample", request.cubePos())) {
+            return sampleDensityGridMeasured(request, noiseConfig);
+        }
+    }
+
+    private static NoiseConfig createNoiseConfig(TerrainRequest request) {
+        try (CubeWorkEvent ignored = CubeWorkEvent.start("vanilla.noise.config", request.cubePos())) {
+            return NoiseConfig.create(request.settings(), request.noiseParameters(), request.seed());
+        }
+    }
+
+    private static DensityGrid sampleDensityGridMeasured(
             TerrainRequest request, NoiseConfig noiseConfig) {
         GenerationShapeConfig shape = new GenerationShapeConfig(
                 request.minimumY(), BATCH_HEIGHT,

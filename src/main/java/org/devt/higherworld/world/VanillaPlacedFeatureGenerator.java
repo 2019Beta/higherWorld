@@ -536,6 +536,16 @@ final class VanillaPlacedFeatureGenerator {
             ServerWorld world, ChunkGenerator generator, Registry<PlacedFeature> registry,
             FeatureCache cache, FeatureBatchKey key, List<GenerationStep.Feature> steps,
             long bandSeed, int offsetY) {
+        try (CubeWorkEvent ignored = CubeWorkEvent.start("vanilla.features.batch",
+                new CubePos(key.chunkX(), Math.floorDiv(VANILLA_BOTTOM_Y + offsetY, CubePos.SIZE), key.chunkZ()))) {
+            return generateBatchMeasured(world, generator, registry, cache, key, steps, bandSeed, offsetY);
+        }
+    }
+
+    private static FeatureBatchSnapshot generateBatchMeasured(
+            ServerWorld world, ChunkGenerator generator, Registry<PlacedFeature> registry,
+            FeatureCache cache, FeatureBatchKey key, List<GenerationStep.Feature> steps,
+            long bandSeed, int offsetY) {
         FeatureBatchWriter writer = new FeatureBatchWriter(
                 world,
                 new BlockBox(key.chunkX() * CubePos.SIZE,

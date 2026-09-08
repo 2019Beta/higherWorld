@@ -33,6 +33,15 @@ public final class SparseCubeLightEngine {
 
     /** Queues an entire new cube, or only its faces when saved light is present. */
     public void queueCube(CubePos pos, boolean initialize) {
+        access.beginSlice();
+        try {
+            seedCube(pos, initialize);
+        } finally {
+            access.endSlice();
+        }
+    }
+
+    private void seedCube(CubePos pos, boolean initialize) {
         // CubePos deliberately permits every int coordinate for storage keys, but
         // a cube whose block range is outside int space cannot participate in the
         // block light graph.  Silently ignoring it also keeps a malformed packet
@@ -78,6 +87,15 @@ public final class SparseCubeLightEngine {
      * is measurable in this very hot loop, while a small overshoot is harmless.
      */
     public Result propagate(int maximumSteps, long maximumNanos) {
+        access.beginSlice();
+        try {
+            return propagateSlice(maximumSteps, maximumNanos);
+        } finally {
+            access.endSlice();
+        }
+    }
+
+    private Result propagateSlice(int maximumSteps, long maximumNanos) {
         Set<CubePos> changed = new HashSet<>();
         int steps = 0;
         long budget = Math.max(0L, maximumNanos);
@@ -205,6 +223,9 @@ public final class SparseCubeLightEngine {
     public record Result(Set<CubePos> changedCubes, boolean complete, int steps) {}
 
     public interface Access {
+        /** World membership is stable during synchronous seeding/propagation. */
+        default void beginSlice() {}
+        default void endSlice() {}
         boolean managed(int x, int y, int z);
         int emitted(int x, int y, int z);
         int opacity(int x, int y, int z);

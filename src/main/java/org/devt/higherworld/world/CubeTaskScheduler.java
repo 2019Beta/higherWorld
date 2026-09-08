@@ -30,8 +30,13 @@ final class CubeTaskScheduler implements AutoCloseable {
     private final ConcurrentMap<CubePos, CubeHolder> holders = new ConcurrentHashMap<>();
     /** Lifecycle-maintained frontier; cached terrain/payload cubes never enter it. */
     private final Set<CubeHolder> fullTickingHolders = ConcurrentHashMap.newKeySet();
-    /** Lowest request priority seen for each live lifecycle node. */
+    /** Fallback urgency for unowned, synchronous/ad-hoc lifecycle requests. */
     private final ConcurrentMap<CubePos, Integer> requestPriorities = new ConcurrentHashMap<>();
+    private final CubePriorityIndex priorityOwners = new CubePriorityIndex();
+    private volatile ConcurrentMap<CubePos, Integer> ownedPriorities = new ConcurrentHashMap<>();
+    private Map<CubePos, Integer> prefetchRanks = Map.of();
+    private final Map<CubePos, GraphExpansion> expandedGraphs = new HashMap<>();
+    private long graphExpansionCount;
     /**
      * The complete closure currently demanded by live tickets.  Keeping this
      * separately from {@link #holders} is important: a dependency cube can be
@@ -130,24 +135,31 @@ final class CubeTaskScheduler implements AutoCloseable {
 
     private CubeHolder requestGraph(
             CubePos pos, CubeStatus target, int priority, Set<StageRequest> visited) {
-        requestPriorities.merge(pos, priority, Math::min);
+        StageRequest request = new StageRequest(pos, target);
+        if (!visited.add(request)) return holders.get(pos);
+        if (!ownedPriorities.containsKey(pos)) requestPriorities.merge(pos, priority, Math::min);
         dirtyTargets.add(pos);
         CubeHolder holder = holders.computeIfAbsent(pos, this::newHolder);
         holder.request(target);
         refreshPriority(holder);
         if (target.isAtLeast(CubeStatus.IO_READY)) {
-            holder.startIo(() -> io.readAsync(pos, priority));
+            holder.startIo(() -> io.readAsync(pos, priority(pos)));
         }
-        StageRequest request = new StageRequest(pos, target);
-        if (!visited.add(request)) return holder;
+        GraphExpansion expanded = expandedGraphs.get(pos);
+        if (expanded != null && expanded.epoch() == holder.epoch()
+                && expanded.target().isAtLeast(target) && expanded.priority() <= priority) return holder;
+        graphExpansionCount++;
 
         for (CubeStatus stage : CubeStatus.values()) {
             if (stage.ordinal() > target.ordinal()) break;
             CubeStatus neighbourStatus = stage.neighbourPrerequisite();
             if (neighbourStatus == null) continue;
             stage.dependencyRadius().forEach(pos, dependency ->
-                    requestGraph(dependency, neighbourStatus, priority + 1, visited));
+                    requestGraph(dependency, neighbourStatus, CubePriorityIndex.increment(priority), visited));
         }
+        // Publish only a completely expanded graph. A synchronous IO failure
+        // must not leave a memo that suppresses the remaining prerequisites.
+        expandedGraphs.put(pos, new GraphExpansion(holder.epoch(), target, priority));
         return holder;
     }
 
@@ -155,6 +167,8 @@ final class CubeTaskScheduler implements AutoCloseable {
         CubeTicket previous = demandTickets.put(ticket.key(), ticket);
         if (ticket.equals(previous)) return;
         tickets.replace(ticket);
+        priorityOwners.replace(new TicketRoot(ticket.key()), CubePriorityIndex.ticket(ticket));
+        publishPriorities();
         Map<CubePos, CubeStatus> closure = new HashMap<>();
         CubeTicketManager.collectRequired(ticket.center(), ticket.radius(), ticket.targetStatus(), closure);
         dirtyTargets.addAll(demand.replace(new TicketRoot(ticket.key()), closure));
@@ -166,6 +180,8 @@ final class CubeTaskScheduler implements AutoCloseable {
         CubeTicket previous = demandTickets.remove(key);
         if (previous == null) return;
         tickets.remove(key);
+        priorityOwners.replace(new TicketRoot(key), Map.of());
+        publishPriorities();
         dirtyTargets.addAll(demand.replace(new TicketRoot(key), Map.of()));
         refreshTargets();
         refreshTicketPriorities(previous, null);
@@ -186,12 +202,94 @@ final class CubeTaskScheduler implements AutoCloseable {
         if (entry != null && entry.priority() != priority(holder.pos())) enqueueReady(holder);
     }
 
+    private void publishPriorities() {
+        Map<CubePos, Integer> next = priorityOwners.snapshot();
+        // Wide feature reads inherit the current owner's rank, including
+        // shared reads and owners that moved farther away.
+        inheritFeaturePriorities(next, featureTerrainDependencies.keySet());
+        Map<CubePos, Integer> previous = ownedPriorities;
+        ownedPriorities = new ConcurrentHashMap<>(next);
+        Set<CubePos> changed = new HashSet<>(previous.keySet());
+        changed.addAll(next.keySet());
+        for (CubePos pos : changed) {
+            requestPriorities.remove(pos);
+            if (java.util.Objects.equals(previous.get(pos), next.get(pos))) continue;
+            CubeHolder holder = holders.get(pos);
+            if (holder != null) refreshPriority(holder);
+            io.reprioritize(pos, priority(pos));
+        }
+        reprioritizeGenerationTasks();
+    }
+
+    private void reprioritizeGenerationTasks() {
+        for (Runnable runnable : generationExecutor.getQueue().toArray(Runnable[]::new)) {
+            if (runnable instanceof GenerationTask task
+                    && task.priority() != priority(task.pos())
+                    && generationExecutor.getQueue().remove(task)) {
+                generationExecutor.getQueue().offer(new GenerationTask(
+                        task.pos(), priority(task.pos()), task.sequence(), task.action()));
+            }
+        }
+    }
+
+    /** Propagate shared wide reads to a fixed point, independent of map order. */
+    private Set<CubePos> inheritFeaturePriorities(Map<CubePos, Integer> ranks, Iterable<CubePos> owners) {
+        java.util.PriorityQueue<PriorityPropagation> pending = new java.util.PriorityQueue<>(
+                java.util.Comparator.comparingInt(PriorityPropagation::rank));
+        for (CubePos owner : owners) {
+            Integer rank = ranks.get(owner);
+            if (rank != null) pending.offer(new PriorityPropagation(owner, rank));
+        }
+        Set<CubePos> changed = new HashSet<>();
+        while (!pending.isEmpty()) {
+            PriorityPropagation entry = pending.poll();
+            if (!java.util.Objects.equals(ranks.get(entry.pos()), entry.rank())) continue;
+            List<CubePos> dependencies = featureTerrainDependencies.get(entry.pos());
+            if (dependencies == null) continue;
+            int inherited = CubePriorityIndex.increment(entry.rank());
+            for (CubePos dependency : dependencies) {
+                Integer previous = ranks.get(dependency);
+                if (previous != null && previous <= inherited) continue;
+                ranks.put(dependency, inherited);
+                changed.add(dependency);
+                if (featureTerrainDependencies.containsKey(dependency)) {
+                    pending.offer(new PriorityPropagation(dependency, inherited));
+                }
+            }
+        }
+        return changed;
+    }
+
+    private record PriorityPropagation(CubePos pos, int rank) {}
+
+    void retainPrefetches(Map<CubePos, Integer> retained) {
+        if (!prefetchRanks.equals(retained)) {
+            for (CubePos pos : prefetchRanks.keySet()) {
+                if (!retained.containsKey(pos)) priorityOwners.replace(new PrefetchRoot(pos), Map.of());
+            }
+            retained.forEach((pos, rank) -> {
+                if (!java.util.Objects.equals(prefetchRanks.get(pos), rank)) {
+                    priorityOwners.replace(new PrefetchRoot(pos), CubePriorityIndex.prefetch(pos, rank));
+                }
+            });
+            prefetchRanks = Map.copyOf(retained);
+            publishPriorities();
+        }
+        retainPrefetchPositions(retained.keySet());
+    }
+
     /**
      * Retains the active watcher roots and their PAYLOAD dependency closure.
      * A watcher is deliberately not represented as a FULL ticket: streaming a
      * block payload must not start the lighting graph for the whole view.
      */
     void retainPrefetches(Set<CubePos> retained) {
+        Map<CubePos, Integer> ranks = new HashMap<>();
+        retained.forEach(pos -> ranks.put(pos, prefetchRanks.getOrDefault(pos, priority(pos))));
+        retainPrefetches(ranks);
+    }
+
+    private void retainPrefetchPositions(Set<CubePos> retained) {
         if (!prefetchPositions.equals(retained)) {
             for (CubePos pos : prefetchPositions) {
                 if (!retained.contains(pos)) {
@@ -230,12 +328,15 @@ final class CubeTaskScheduler implements AutoCloseable {
         CubeHolder holder = holders.remove(pos);
         if (holder != null) {
             requestPriorities.remove(pos);
+            expandedGraphs.remove(pos);
             removeQueuedReady(holder);
             holder.cancel();
         }
     }
 
     int priority(CubePos pos) {
+        Integer owned = ownedPriorities.get(pos);
+        if (owned != null) return owned;
         return Math.min(
                 tickets.priority(pos), requestPriorities.getOrDefault(pos, Integer.MAX_VALUE));
     }
@@ -444,6 +545,14 @@ final class CubeTaskScheduler implements AutoCloseable {
             featureTerrainRequiredCounts.merge(dependency, 1, Integer::sum);
             dirtyTargets.add(dependency);
         }
+        Set<CubePos> changed = inheritFeaturePriorities(ownedPriorities, List.of(owner));
+        for (CubePos dependency : changed) {
+            requestPriorities.remove(dependency);
+            CubeHolder holder = holders.get(dependency);
+            if (holder != null) refreshPriority(holder);
+            io.reprioritize(dependency, priority(dependency));
+        }
+        if (!changed.isEmpty()) reprioritizeGenerationTasks();
     }
 
     private void releaseFeatureTerrainDependencies(List<CubePos> dependencies) {
@@ -505,7 +614,7 @@ final class CubeTaskScheduler implements AutoCloseable {
             CustomWorldSettings settings, int priority) {
         CompletableFuture<CubeTerrainSnapshot> result = new CompletableFuture<>();
         try {
-            generationExecutor.execute(new GenerationTask(priority, sequence.getAndIncrement(), () -> {
+            generationExecutor.execute(new GenerationTask(holder.pos(), priority(holder.pos()), sequence.getAndIncrement(), () -> {
                 if (!holder.isCurrent(epoch) || !holder.target().isAtLeast(CubeStatus.TERRAIN)) {
                     result.cancel(false);
                     return;
@@ -553,7 +662,7 @@ final class CubeTaskScheduler implements AutoCloseable {
         CompletableFuture<CubeTerrainSnapshot> result = new CompletableFuture<>();
         try {
             generationExecutor.execute(new GenerationTask(
-                    priority, sequence.getAndIncrement(), () -> {
+                    holder.pos(), priority(holder.pos()), sequence.getAndIncrement(), () -> {
                         if (!holder.isCurrent(epoch)
                                 || !holder.target().isAtLeast(CubeStatus.TERRAIN)) {
                             result.cancel(false);
@@ -664,12 +773,21 @@ final class CubeTaskScheduler implements AutoCloseable {
                 waitingOrder.addLast(ref);
                 continue;
             }
-            waitingSinceEpoch.remove(holder);
             if (holder.failed()
                     || holder.target() == CubeStatus.EMPTY
                     || holder.status().isAtLeast(holder.target())) {
+                waitingSinceEpoch.remove(holder);
                 continue;
             }
+            // Unrelated progress is not a reason to push a still-blocked
+            // FEATURES owner through the heap again. Check its prerequisites
+            // here and preserve its rotating slot until they actually finish.
+            if (!nextCommitDependenciesReady(holder)) {
+                waitingSinceEpoch.put(holder, epoch);
+                waitingOrder.addLast(new WaitingRef(holder, epoch));
+                continue;
+            }
+            waitingSinceEpoch.remove(holder);
             enqueueReady(holder);
             reoffered++;
         }
@@ -721,6 +839,7 @@ final class CubeTaskScheduler implements AutoCloseable {
     }
 
     private void refreshTargets() {
+        boolean featurePrioritiesChanged = false;
         // Root diffs and ad-hoc requests identify the entire reconciliation
         // frontier. No full holder walk, halo walk or priority epoch reset.
         while (!dirtyTargets.isEmpty()) {
@@ -731,6 +850,7 @@ final class CubeTaskScheduler implements AutoCloseable {
                 if (!target.isAtLeast(CubeStatus.FEATURES)) {
                     List<CubePos> dependencies = featureTerrainDependencies.remove(pos);
                     if (dependencies != null) {
+                        featurePrioritiesChanged = true;
                         featureTerrainReady.remove(pos);
                         releaseFeatureTerrainDependencies(dependencies);
                     }
@@ -740,6 +860,7 @@ final class CubeTaskScheduler implements AutoCloseable {
                 CubeHolder holder = holders.get(pos);
                 if (target == CubeStatus.EMPTY) {
                     requestPriorities.remove(pos);
+                    expandedGraphs.remove(pos);
                     if (holder != null) {
                         removeQueuedReady(holder);
                         holder.cancel();
@@ -747,15 +868,21 @@ final class CubeTaskScheduler implements AutoCloseable {
                     }
                     io.cancelPrefetch(pos);
                 } else if (holder != null) {
-                    if (target.ordinal() < holder.target().ordinal()) holder.lowerTarget(target);
+                    if (target.ordinal() < holder.target().ordinal()) {
+                        expandedGraphs.remove(pos);
+                        holder.lowerTarget(target);
+                    }
                     else if (target.ordinal() > holder.target().ordinal()) {
                         requestGraph(pos, target, priority(pos), new HashSet<>());
                     }
                 }
             }
         }
+        if (featurePrioritiesChanged) publishPriorities();
     }
 
+    long graphExpansionCountForTest() { return graphExpansionCount; }
+    private record GraphExpansion(long epoch, CubeStatus target, int priority) {}
     private record StageRequest(CubePos pos, CubeStatus status) {}
     private record TicketRoot(Object key) {}
     private record PrefetchRoot(CubePos pos) {}
@@ -769,6 +896,10 @@ final class CubeTaskScheduler implements AutoCloseable {
         holders.clear();
         fullTickingHolders.clear();
         requestPriorities.clear();
+        priorityOwners.clear();
+        ownedPriorities.clear();
+        prefetchRanks = Map.of();
+        expandedGraphs.clear();
         demand.clear();
         demandTickets.clear();
         dirtyTargets.clear();
@@ -1170,7 +1301,7 @@ final class CubeTaskScheduler implements AutoCloseable {
         private void submitCpuFallback(CustomTerrainRequest request) {
             try {
                 generationExecutor.execute(new GenerationTask(
-                        request.priority(), sequence.getAndIncrement(), () -> {
+                        request.holder().pos(), priority(request.holder().pos()), sequence.getAndIncrement(), () -> {
                             if (!request.holder().isCurrent(request.epoch())
                                     || !request.holder().target().isAtLeast(CubeStatus.TERRAIN)) {
                                 request.result().cancel(false);
@@ -1217,7 +1348,7 @@ final class CubeTaskScheduler implements AutoCloseable {
             int priority, CompletableFuture<CubeTerrainSnapshot> result) {
     }
 
-    private record GenerationTask(int priority, long sequence, Runnable action)
+    private record GenerationTask(CubePos pos, int priority, long sequence, Runnable action)
             implements Runnable, Comparable<GenerationTask> {
         @Override public void run() { action.run(); }
 

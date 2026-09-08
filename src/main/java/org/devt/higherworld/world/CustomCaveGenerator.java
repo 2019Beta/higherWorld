@@ -42,50 +42,53 @@ final class CustomCaveGenerator {
     }
 
     static void generate(ServerWorld world, LoadedCube cube, List<CustomWorldSettings.CaveSettings> caves) {
+        for (int index = 0; index < caves.size(); index++) generate(world, cube, caves, index);
+    }
+
+    static void generate(
+            ServerWorld world, LoadedCube cube, List<CustomWorldSettings.CaveSettings> caves, int index) {
         CubePos pos = cube.pos();
-        for (int index = 0; index < caves.size(); index++) {
-            CustomWorldSettings.CaveSettings settings = caves.get(index);
-            if (pos.y() < settings.caveMinHeight() || pos.y() > settings.caveMaxHeight()) {
-                continue;
+        CustomWorldSettings.CaveSettings settings = caves.get(index);
+        if (pos.y() < settings.caveMinHeight() || pos.y() > settings.caveMaxHeight()) {
+            return;
+        }
+        BlockState caveBlock = CustomBlockStateResolver.resolve(world, settings.caveBlock());
+        List<BlockState> replaceableStates = CustomBlockStateResolver.resolveAll(
+                world, settings.isBlockReplaceable());
+        if (caveBlock == null || replaceableStates == null || replaceableStates.isEmpty()) {
+            return;
+        }
+        Set<Block> replaceable = new HashSet<>();
+        for (BlockState state : replaceableStates) {
+            replaceable.add(state.getBlock());
+        }
+        Random random = new Random(seed(world.getSeed(), pos, index, CAVE_SALT));
+        if (random.nextInt(settings.caveRarity()) != 0) {
+            return;
+        }
+        int nodeCount = random.nextInt(
+                random.nextInt(random.nextInt(settings.maxInitNodes() + 1) + 1) + 1);
+        for (int node = 0; node < nodeCount; node++) {
+            double x = pos.minBlockX() + random.nextInt(CubePos.SIZE);
+            double y = pos.minBlockY() + random.nextInt(CubePos.SIZE);
+            double z = pos.minBlockZ() + random.nextInt(CubePos.SIZE);
+            int branches = 1;
+            if (random.nextInt(settings.largeNodeRarity()) == 0) {
+                generateNode(random.nextLong(), cube, caveBlock, replaceable,
+                        x, y, z, 0.0, 0.0, 1.0 + random.nextDouble() * 6.0,
+                        0.5, -1, -1, settings);
+                branches += random.nextInt(settings.largeNodeMaxBranches());
             }
-            BlockState caveBlock = CustomBlockStateResolver.resolve(world, settings.caveBlock());
-            List<BlockState> replaceableStates = CustomBlockStateResolver.resolveAll(
-                    world, settings.isBlockReplaceable());
-            if (caveBlock == null || replaceableStates == null || replaceableStates.isEmpty()) {
-                continue;
-            }
-            Set<Block> replaceable = new HashSet<>();
-            for (BlockState state : replaceableStates) {
-                replaceable.add(state.getBlock());
-            }
-            Random random = new Random(seed(world.getSeed(), pos, index, CAVE_SALT));
-            if (random.nextInt(settings.caveRarity()) != 0) {
-                continue;
-            }
-            int nodeCount = random.nextInt(
-                    random.nextInt(random.nextInt(settings.maxInitNodes() + 1) + 1) + 1);
-            for (int node = 0; node < nodeCount; node++) {
-                double x = pos.minBlockX() + random.nextInt(CubePos.SIZE);
-                double y = pos.minBlockY() + random.nextInt(CubePos.SIZE);
-                double z = pos.minBlockZ() + random.nextInt(CubePos.SIZE);
-                int branches = 1;
-                if (random.nextInt(settings.largeNodeRarity()) == 0) {
-                    generateNode(random.nextLong(), cube, caveBlock, replaceable,
-                            x, y, z, 0.0, 0.0, 1.0 + random.nextDouble() * 6.0,
-                            0.5, -1, -1, settings);
-                    branches += random.nextInt(settings.largeNodeMaxBranches());
+            for (int branch = 0; branch < branches; branch++) {
+                float horizontalAngle = random.nextFloat() * (float) (Math.PI * 2.0);
+                float verticalAngle = (random.nextFloat() - 0.5f) * 2.0f / 8.0f;
+                double size = random.nextFloat() * 2.0 + random.nextFloat();
+                if (random.nextInt(settings.bigCaveRarity()) == 0) {
+                    size *= random.nextFloat() * random.nextFloat() * 3.0 + 1.0;
                 }
-                for (int branch = 0; branch < branches; branch++) {
-                    float horizontalAngle = random.nextFloat() * (float) (Math.PI * 2.0);
-                    float verticalAngle = (random.nextFloat() - 0.5f) * 2.0f / 8.0f;
-                    double size = random.nextFloat() * 2.0 + random.nextFloat();
-                    if (random.nextInt(settings.bigCaveRarity()) == 0) {
-                        size *= random.nextFloat() * random.nextFloat() * 3.0 + 1.0;
-                    }
-                    generateNode(random.nextLong(), cube, caveBlock, replaceable,
-                            x, y, z, horizontalAngle, verticalAngle, size, 1.0,
-                            0, 0, settings);
-                }
+                generateNode(random.nextLong(), cube, caveBlock, replaceable,
+                        x, y, z, horizontalAngle, verticalAngle, size, 1.0,
+                        0, 0, settings);
             }
         }
     }

@@ -529,6 +529,10 @@ final class CubicWorldState implements AutoCloseable {
         taskScheduler.retainPrefetches(retained);
     }
 
+    void retainPrefetches(Map<CubePos, Integer> retained) {
+        taskScheduler.retainPrefetches(retained);
+    }
+
     /**
      * Advances the IO -> live-cube boundary without ever waiting for disk on the
      * server thread. Returns {@code null} while the deduplicated read is pending.
@@ -1018,7 +1022,9 @@ final class CubicWorldState implements AutoCloseable {
     private boolean commitTerrain(
             CubeHolder holder, LoadContext context, int priority, boolean wait) throws IOException {
         try (GenerationStageScope stageScope = enterGenerationStage(
-                holder.pos(), CubeStatus.TERRAIN)) {
+                holder.pos(), CubeStatus.TERRAIN);
+                CubeWorkEvent event = CubeWorkEvent.start(
+                        context.payload == null ? "terrain.commit" : "server.decode", holder.pos())) {
             return commitTerrainBody(holder, context, priority, wait);
         }
     }
@@ -1324,7 +1330,10 @@ final class CubicWorldState implements AutoCloseable {
             }
         }
 
-        byte[] encoded = CubeRecordCodec.encode(cube, world, includeLight);
+        byte[] encoded;
+        try (CubeWorkEvent event = CubeWorkEvent.start("server.encode", cube.pos())) {
+            encoded = CubeRecordCodec.encode(cube, world, includeLight);
+        }
         if (encoded.length > MAX_CACHED_PAYLOAD_BYTES) return encoded;
         synchronized (payloadCache) {
             EncodedPayload previous = payloadCache.put(
@@ -1599,9 +1608,28 @@ final class CubicWorldState implements AutoCloseable {
     }
 
     private final class LightAccess implements SparseCubeLightEngine.Access {
+        private final CubeLookupCache<LoadedCube> lookup = new CubeLookupCache<>(CubicWorldState.this::loadedCube);
+        private boolean inSlice;
+
+        @Override
+        public void beginSlice() {
+            lookup.clear();
+            inSlice = true;
+        }
+
+        @Override
+        public void endSlice() {
+            inSlice = false;
+            lookup.clear();
+        }
+
+        private LoadedCube cubeAt(int x, int y, int z) {
+            return inSlice ? lookup.getBlock(x, y, z, 0L) : loadedCube(CubePos.fromBlock(x, y, z));
+        }
+
         @Override
         public boolean managed(int x, int y, int z) {
-            return loadedCube(CubePos.fromBlock(x, y, z)) != null;
+            return cubeAt(x, y, z) != null;
         }
 
         @Override
@@ -1631,7 +1659,7 @@ final class CubicWorldState implements AutoCloseable {
 
         @Override
         public int block(int x, int y, int z) {
-            LoadedCube cube = loadedCube(CubePos.fromBlock(x, y, z));
+            LoadedCube cube = cubeAt(x, y, z);
             if (cube != null) return cube.light().workingBlock(local(x), local(y), local(z));
             if (y >= world.getBottomY() && y <= world.getTopYInclusive()) {
                 return world.getLightingProvider().get(net.minecraft.world.LightType.BLOCK)
@@ -1642,7 +1670,7 @@ final class CubicWorldState implements AutoCloseable {
 
         @Override
         public int sky(int x, int y, int z) {
-            LoadedCube cube = loadedCube(CubePos.fromBlock(x, y, z));
+            LoadedCube cube = cubeAt(x, y, z);
             if (cube != null) return cube.light().workingSky(local(x), local(y), local(z));
             if (y >= world.getBottomY() && y <= world.getTopYInclusive()) {
                 return world.getLightingProvider().get(net.minecraft.world.LightType.SKY)
@@ -1653,13 +1681,13 @@ final class CubicWorldState implements AutoCloseable {
 
         @Override
         public boolean setBlock(int x, int y, int z, int value) {
-            LoadedCube cube = loadedCube(CubePos.fromBlock(x, y, z));
+            LoadedCube cube = cubeAt(x, y, z);
             return cube != null && cube.light().setWorkingBlock(local(x), local(y), local(z), value);
         }
 
         @Override
         public boolean setSky(int x, int y, int z, int value) {
-            LoadedCube cube = loadedCube(CubePos.fromBlock(x, y, z));
+            LoadedCube cube = cubeAt(x, y, z);
             return cube != null && cube.light().setWorkingSky(local(x), local(y), local(z), value);
         }
 
@@ -1670,7 +1698,7 @@ final class CubicWorldState implements AutoCloseable {
         }
 
         private BlockState state(int x, int y, int z) {
-            LoadedCube cube = loadedCube(CubePos.fromBlock(x, y, z));
+            LoadedCube cube = cubeAt(x, y, z);
             return cube == null ? net.minecraft.block.Blocks.VOID_AIR.getDefaultState()
                     : cube.section().getBlockState(local(x), local(y), local(z));
         }

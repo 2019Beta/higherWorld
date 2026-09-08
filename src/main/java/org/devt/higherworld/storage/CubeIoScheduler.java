@@ -93,6 +93,17 @@ public final class CubeIoScheduler implements AutoCloseable {
         }
     }
 
+    /** Replaces the priority from the scheduler's current owner snapshot. */
+    public void reprioritize(CubePos pos, int priority) {
+        ReadTask task = reads.get(pos);
+        if (task == null) return;
+        synchronized (task) {
+            if (task.priority == priority || !executor.getQueue().remove(task)) return;
+            task.priority = priority;
+            executor.getQueue().offer(task);
+        }
+    }
+
     public ReadResult poll(CubePos pos, int priority) throws IOException {
         Optional<byte[]> cachedWrite = latestPendingWrite(pos);
         if (cachedWrite.isPresent()) {

@@ -26,17 +26,23 @@ final class CustomOreGenerator {
     static void generateUniform(
             ServerWorld world, LoadedCube cube, CustomWorldSettings settings) {
         for (int index = 0; index < settings.standardOres().size(); index++) {
-            CustomWorldSettings.OreSettings ore = settings.standardOres().get(index);
-            generate(world, cube, settings, ore, index, UNIFORM_SALT, false);
+            generateUniform(world, cube, settings, index);
         }
     }
 
     static void generatePeriodic(
             ServerWorld world, LoadedCube cube, CustomWorldSettings settings) {
         for (int index = 0; index < settings.periodicGaussianOres().size(); index++) {
-            CustomWorldSettings.OreSettings ore = settings.periodicGaussianOres().get(index);
-            generate(world, cube, settings, ore, index, PERIODIC_SALT, true);
+            generatePeriodic(world, cube, settings, index);
         }
+    }
+
+    static void generateUniform(ServerWorld world, LoadedCube cube, CustomWorldSettings settings, int index) {
+        generate(world, cube, settings, settings.standardOres().get(index), index, UNIFORM_SALT, false);
+    }
+
+    static void generatePeriodic(ServerWorld world, LoadedCube cube, CustomWorldSettings settings, int index) {
+        generate(world, cube, settings, settings.periodicGaussianOres().get(index), index, PERIODIC_SALT, true);
     }
 
     private static void generate(

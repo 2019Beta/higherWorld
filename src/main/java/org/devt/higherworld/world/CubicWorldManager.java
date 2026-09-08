@@ -468,6 +468,11 @@ public final class CubicWorldManager {
         }
     }
 
+    public static void retainPrefetches(ServerWorld world, Map<CubePos, Integer> retained) {
+        CubicWorldState state = WORLDS.get(world);
+        if (state != null) state.retainPrefetches(retained);
+    }
+
     static void replaceTicket(ServerWorld world, CubeTicket ticket) {
         CubicWorldState state = WORLDS.get(world);
         if (state == null) return;

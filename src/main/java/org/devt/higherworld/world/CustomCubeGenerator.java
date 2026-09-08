@@ -167,54 +167,43 @@ final class CustomCubeGenerator {
     }
 
     /**
-     * Deadline-sliced variant.  {@code progress} indexes the finish stages
-     * below; a negative result means the cube is complete, otherwise the
-     * returned value is the next resume cursor.  The first fresh stage of a
-     * slice always runs, so a streaming commit keeps making progress without
-     * holding the server thread past its budget.
+     * Deadline-sliced variant. Progress counts completed entries across the
+     * ordered stages, so a long ore/lake/cave list need not finish in one tick.
+     * Each entry keeps its original index/seed, and at least one entry runs per
+     * slice. A single entry (or structure pass) can still exceed the budget.
      */
     static int finishGeneration(
             ServerWorld world, LoadedCube cube, CustomWorldSettings settings,
             StructureGenerationSettings structureSettings, boolean generateStructures,
             int progress, long deadlineNanos) {
-        switch (progress) {
-            case 0:
-                CustomCaveGenerator.generate(world, cube, settings.caves());
-                if (System.nanoTime() >= deadlineNanos) return 1;
-                // fallthrough
-            case 1:
-                if (settings.ravines()) {
-                    CustomCaveGenerator.generateRavine(world, cube);
+        int[] sizes = {settings.caves().size(), settings.ravines() ? 1 : 0,
+                generateStructures ? 1 : 0, settings.lakes().size(),
+                settings.dungeons() ? 1 : 0, settings.standardOres().size(),
+                settings.periodicGaussianOres().size()};
+        int next = FeatureWorkCursor.run(progress, sizes, deadlineNanos, (stage, entry) -> {
+            try (CubeWorkEvent event = CubeWorkEvent.start(FEATURE_STAGES[stage], cube.pos())) {
+                switch (stage) {
+                    case 0 -> CustomCaveGenerator.generate(world, cube, settings.caves(), entry);
+                    case 1 -> CustomCaveGenerator.generateRavine(world, cube);
+                    case 2 -> VanillaStructureGenerator.generate(world, cube, structureSettings, settings);
+                    case 3 -> CustomLakeGenerator.generate(world, cube, settings, entry);
+                    case 4 -> CustomDungeonGenerator.generate(world, cube, settings);
+                    case 5 -> CustomOreGenerator.generateUniform(world, cube, settings, entry);
+                    case 6 -> CustomOreGenerator.generatePeriodic(world, cube, settings, entry);
+                    default -> throw new IllegalStateException("Unknown feature stage " + stage);
                 }
-                if (System.nanoTime() >= deadlineNanos) return 2;
-                // fallthrough
-            case 2:
-                if (generateStructures) {
-                    VanillaStructureGenerator.generate(world, cube, structureSettings, settings);
-                }
-                if (System.nanoTime() >= deadlineNanos) return 3;
-                // fallthrough
-            case 3:
-                CustomLakeGenerator.generate(world, cube, settings);
-                if (System.nanoTime() >= deadlineNanos) return 4;
-                // fallthrough
-            case 4:
-                CustomDungeonGenerator.generate(world, cube, settings);
-                if (System.nanoTime() >= deadlineNanos) return 5;
-                // fallthrough
-            case 5:
-                CustomOreGenerator.generateUniform(world, cube, settings);
-                if (System.nanoTime() >= deadlineNanos) return 6;
-                // fallthrough
-            case 6:
-                CustomOreGenerator.generatePeriodic(world, cube, settings);
-                // fallthrough
-            default:
-                cube.setGenerationVersion(GENERATION_VERSION);
-                cube.markDirty();
-                return -1;
+            }
+        });
+        if (next < 0) {
+            cube.setGenerationVersion(GENERATION_VERSION);
+            cube.markDirty();
         }
+        return next;
     }
+
+    private static final String[] FEATURE_STAGES = {
+            "features.caves", "features.ravines", "features.structures", "features.lakes",
+            "features.dungeons", "features.uniform_ores", "features.periodic_ores"};
 
     /** Samples the migrated CustomTerrainGenerator equation at an exact point. */
     static double terrainDensity(
