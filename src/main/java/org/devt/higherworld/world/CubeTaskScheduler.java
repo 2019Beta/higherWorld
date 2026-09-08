@@ -78,8 +78,8 @@ final class CubeTaskScheduler implements AutoCloseable {
     /** Counts feature terrain graph starts for the package-level regression hook. */
     private long featureTerrainRequestCount;
     private final AtomicLong sequence = new AtomicLong();
-    private final PriorityBlockingQueue<ReadyEntry> readyQueue =
-            new PriorityBlockingQueue<>(256, CubeTaskScheduler::compareReadyEntries);
+    private final CubeReadyQueue<CubeHolder, ReadyEntry> readyQueue =
+            new CubeReadyQueue<>(ReadyEntry::holder, CubeTaskScheduler::compareReadyEntries);
     /** At most one live ready entry per holder; stale physical entries are skipped. */
     private final ConcurrentMap<CubeHolder, ReadyEntry> queuedReady = new ConcurrentHashMap<>();
     /**
@@ -382,21 +382,9 @@ final class CubeTaskScheduler implements AutoCloseable {
                     holder, holder.changeVersion(), priority(holder.pos()),
                     holder.status().ordinal());
             ReadyEntry previous = queuedReady.get(holder);
-            // Equal snapshots already have a physical queue entry. Check this
-            // before replacing the map value: replacing it with an equal but
-            // different record would make the old entry fail the identity
-            // check, while the new record would never be offered.
             if (entry.equals(previous)) return;
-            // A priority change is different from an ordinary lifecycle
-            // transition: leaving the old physical entry in the heap lets a
-            // cube that moved behind the player retain its historical rank
-            // until the next poll. Remove the superseded entry while holding
-            // the holder lock so the heap cannot choose that stale rank ahead
-            // of the newly promoted front cube.
-            if (previous != null) readyQueue.remove(previous);
             queuedReady.put(holder, entry);
             readyQueue.offer(entry);
-            compactReadyQueueIfNeeded();
         }
     }
 
@@ -714,8 +702,8 @@ final class CubeTaskScheduler implements AutoCloseable {
             ReadyEntry entry = readyQueue.poll();
             if (entry == null) return result;
             CubeHolder holder = entry.holder();
-            // The queue is intentionally lazy: a state update can supersede an
-            // entry while its old object is still physically present. Only the
+            // A concurrent state update can supersede a polled
+            // entry before we acquire the holder lock. Only the
             // entry that still owns the holder's map slot may inspect or
             // requeue it. Identity is checked under the same lock used by
             // holderChanged(), so an old entry cannot consume a new wake-up.
@@ -796,12 +784,6 @@ final class CubeTaskScheduler implements AutoCloseable {
             reoffered++;
         }
         return reoffered;
-    }
-
-    private void compactReadyQueueIfNeeded() {
-        long live = queuedReady.size();
-        if (readyQueue.size() <= 4L * live + 1024L) return;
-        readyQueue.removeIf(entry -> queuedReady.get(entry.holder()) != entry);
     }
 
     private void removeQueuedReady(CubeHolder holder) {

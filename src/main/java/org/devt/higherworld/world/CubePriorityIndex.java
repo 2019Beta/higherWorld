@@ -7,18 +7,40 @@ import org.devt.higherworld.storage.CubePos;
 /** Replaceable owner snapshots; removing an owner also removes its inherited urgency. */
 final class CubePriorityIndex {
     private final Map<Object, Map<CubePos, Integer>> owners = new HashMap<>();
+    private final Map<CubePos, java.util.TreeMap<Integer, Integer>> ranks = new HashMap<>();
+    private final Map<CubePos, Integer> effective = new HashMap<>();
 
-    void clear() { owners.clear(); }
+    void clear() {
+        owners.clear();
+        ranks.clear();
+        effective.clear();
+    }
 
     void replace(Object owner, Map<CubePos, Integer> priorities) {
-        if (priorities.isEmpty()) owners.remove(owner);
-        else owners.put(owner, Map.copyOf(priorities));
+        Map<CubePos, Integer> next = Map.copyOf(priorities);
+        Map<CubePos, Integer> previous = owners.getOrDefault(owner, Map.of());
+        previous.forEach((pos, rank) -> {
+            if (java.util.Objects.equals(next.get(pos), rank)) return;
+            java.util.TreeMap<Integer, Integer> counts = ranks.get(pos);
+            counts.compute(rank, (ignored, count) -> count == 1 ? null : count - 1);
+            if (counts.isEmpty()) {
+                ranks.remove(pos);
+                effective.remove(pos);
+            } else effective.put(pos, counts.firstKey());
+        });
+        next.forEach((pos, rank) -> {
+            if (java.util.Objects.equals(previous.get(pos), rank)) return;
+            java.util.TreeMap<Integer, Integer> counts = ranks.computeIfAbsent(
+                    pos, ignored -> new java.util.TreeMap<>());
+            counts.merge(rank, 1, Integer::sum);
+            effective.put(pos, counts.firstKey());
+        });
+        if (next.isEmpty()) owners.remove(owner);
+        else owners.put(owner, next);
     }
 
     Map<CubePos, Integer> snapshot() {
-        Map<CubePos, Integer> result = new HashMap<>();
-        owners.values().forEach(values -> values.forEach((pos, rank) -> result.merge(pos, rank, Math::min)));
-        return result;
+        return new HashMap<>(effective);
     }
 
     static Map<CubePos, Integer> prefetch(CubePos root, int priority) {
