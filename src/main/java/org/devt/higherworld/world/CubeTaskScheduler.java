@@ -387,9 +387,13 @@ final class CubeTaskScheduler implements AutoCloseable {
             // different record would make the old entry fail the identity
             // check, while the new record would never be offered.
             if (entry.equals(previous)) return;
-            // Keep replacement entries lazy. Removing from a global
-            // PriorityBlockingQueue is O(n); the poller discards superseded
-            // records by identity instead.
+            // A priority change is different from an ordinary lifecycle
+            // transition: leaving the old physical entry in the heap lets a
+            // cube that moved behind the player retain its historical rank
+            // until the next poll. Remove the superseded entry while holding
+            // the holder lock so the heap cannot choose that stale rank ahead
+            // of the newly promoted front cube.
+            if (previous != null) readyQueue.remove(previous);
             queuedReady.put(holder, entry);
             readyQueue.offer(entry);
             compactReadyQueueIfNeeded();
@@ -802,7 +806,8 @@ final class CubeTaskScheduler implements AutoCloseable {
 
     private void removeQueuedReady(CubeHolder holder) {
         synchronized (holder) {
-            queuedReady.remove(holder);
+            ReadyEntry previous = queuedReady.remove(holder);
+            if (previous != null) readyQueue.remove(previous);
         }
     }
 
