@@ -383,8 +383,18 @@ final class CubeTaskScheduler implements AutoCloseable {
                     holder.status().ordinal());
             ReadyEntry previous = queuedReady.get(holder);
             if (entry.equals(previous)) return;
-            queuedReady.put(holder, entry);
-            readyQueue.offer(entry);
+            // queuedReady and the heap must flip together.  A poller drops a
+            // polled entry as soon as queuedReady has moved on, so a reader
+            // that observes the promoted rank in queuedReady has to find the
+            // same entry in the heap.  Publishing them one at a time let a
+            // cube that moved behind the player keep its historical rank in
+            // the heap while the new rank was already visible in the map, and
+            // the stale rank could then still be polled ahead of the newly
+            // promoted front cube.  The queue's monitor is the poller's lock.
+            synchronized (readyQueue) {
+                queuedReady.put(holder, entry);
+                readyQueue.offer(entry);
+            }
         }
     }
 
