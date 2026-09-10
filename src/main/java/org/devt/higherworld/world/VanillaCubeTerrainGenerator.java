@@ -336,8 +336,13 @@ final class VanillaCubeTerrainGenerator {
     }
 
     private static NoiseConfig createNoiseConfig(TerrainRequest request) {
+        NoiseConfig cached = request.asyncBatches().noiseConfig();
+        if (cached != null) return cached;
         try (CubeWorkEvent ignored = CubeWorkEvent.start("vanilla.noise.config", request.cubePos())) {
-            return NoiseConfig.create(request.settings(), request.noiseParameters(), request.seed());
+            NoiseConfig created = NoiseConfig.create(
+                    request.settings(), request.noiseParameters(), request.seed());
+            request.asyncBatches().cacheNoiseConfig(created);
+            return created;
         }
     }
 
@@ -613,6 +618,22 @@ final class VanillaCubeTerrainGenerator {
 
     /** Thread-safe access-order cache that never evicts an in-flight batch. */
     static final class AsyncBatchCache {
+        // Owned by one world context (and thus one settings/registry/seed tuple).
+        // Never share the lazily initialized noise graph between workers, or
+        // retain world contexts in long-lived executor ThreadLocal values.
+        private final Map<Thread, NoiseConfig> workerNoise = new java.util.WeakHashMap<>();
+
+        synchronized NoiseConfig noiseConfig() {
+            return workerNoise.get(Thread.currentThread());
+        }
+
+        synchronized void cacheNoiseConfig(NoiseConfig config) {
+            // Eight CPU workers, one GPU batcher and occasional direct callers.
+            // Eviction only drops reuse; an active caller retains its own graph.
+            if (workerNoise.size() >= 16) workerNoise.clear();
+            workerNoise.put(Thread.currentThread(), config);
+        }
+
         private final LinkedHashMap<BatchPos, CompletableFuture<TerrainBatchSnapshot>> values =
                 new LinkedHashMap<>(32, 0.75f, true);
 

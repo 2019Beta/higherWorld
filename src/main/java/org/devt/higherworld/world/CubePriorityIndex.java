@@ -9,11 +9,13 @@ final class CubePriorityIndex {
     private final Map<Object, Map<CubePos, Integer>> owners = new HashMap<>();
     private final Map<CubePos, java.util.TreeMap<Integer, Integer>> ranks = new HashMap<>();
     private final Map<CubePos, Integer> effective = new HashMap<>();
+    private final Map<CubePos, Integer> previousEffective = new HashMap<>();
 
     void clear() {
         owners.clear();
         ranks.clear();
         effective.clear();
+        previousEffective.clear();
     }
 
     void replace(Object owner, Map<CubePos, Integer> priorities) {
@@ -21,6 +23,7 @@ final class CubePriorityIndex {
         Map<CubePos, Integer> previous = owners.getOrDefault(owner, Map.of());
         previous.forEach((pos, rank) -> {
             if (java.util.Objects.equals(next.get(pos), rank)) return;
+            rememberPriority(pos);
             java.util.TreeMap<Integer, Integer> counts = ranks.get(pos);
             counts.compute(rank, (ignored, count) -> count == 1 ? null : count - 1);
             if (counts.isEmpty()) {
@@ -30,6 +33,7 @@ final class CubePriorityIndex {
         });
         next.forEach((pos, rank) -> {
             if (java.util.Objects.equals(previous.get(pos), rank)) return;
+            rememberPriority(pos);
             java.util.TreeMap<Integer, Integer> counts = ranks.computeIfAbsent(
                     pos, ignored -> new java.util.TreeMap<>());
             counts.merge(rank, 1, Integer::sum);
@@ -41,6 +45,26 @@ final class CubePriorityIndex {
 
     Map<CubePos, Integer> snapshot() {
         return new HashMap<>(effective);
+    }
+
+    /** Null values explicitly remove an old effective rank. */
+    Map<CubePos, Integer> drainChanges() {
+        Map<CubePos, Integer> result = new HashMap<>();
+        previousEffective.forEach((pos, previous) -> {
+            Integer current = effective.get(pos);
+            if (!java.util.Objects.equals(previous, current)) result.put(pos, current);
+        });
+        previousEffective.clear();
+        return result;
+    }
+
+    private void rememberPriority(CubePos pos) {
+        // putIfAbsent would overwrite a remembered null during a second edit.
+        if (!previousEffective.containsKey(pos)) previousEffective.put(pos, effective.get(pos));
+    }
+
+    Integer effectivePriority(CubePos pos) {
+        return effective.get(pos);
     }
 
     static Map<CubePos, Integer> prefetch(CubePos root, int priority) {

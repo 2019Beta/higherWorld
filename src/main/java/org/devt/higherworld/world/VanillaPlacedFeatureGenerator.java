@@ -480,8 +480,9 @@ final class VanillaPlacedFeatureGenerator {
      * Deadline-sliced variant.  {@code keysDone} counts the batch keys already
      * applied to this cube; a negative result means the cube is complete,
      * otherwise the returned value is the next resume cursor.  The deadline is
-     * checked before generating a fresh (uncached) key, so the first fresh key
-     * always makes progress while a 27-key frontier column is spread over as
+     * checked between keys, including cached keys whose block/entity application
+     * still costs server time. The first key always makes progress while a
+     * 27-key frontier column is spread over as
      * many commit slices as the budget requires.
      */
     static int generateBatched(
@@ -513,13 +514,13 @@ final class VanillaPlacedFeatureGenerator {
                         keyIndex++;
                         continue;
                     }
+                    if (keyIndex > keysDone && System.nanoTime() >= deadlineNanos) {
+                        return keyIndex;
+                    }
                     FeatureBatchKey key = new FeatureBatchKey(
                             chunkX, chunkZ, sourceBand, stepsMask);
                     FeatureBatchSnapshot batch = cache.batchIfPresent(key);
                     if (batch == null) {
-                        if (keyIndex > keysDone && System.nanoTime() >= deadlineNanos) {
-                            return keyIndex;
-                        }
                         batch = cache.batch(key, () -> generateBatch(
                                 world, generator, registry, cache, key, steps,
                                 bandSeed, sourceOffsetY));
@@ -570,6 +571,8 @@ final class VanillaPlacedFeatureGenerator {
         int originZ = key.chunkZ() * CubePos.SIZE;
         long populationSeed = random.setPopulationSeed(bandSeed, originX, originZ);
         BlockPos origin = new BlockPos(originX, VANILLA_BOTTOM_Y, originZ);
+        CubePos eventPos = new CubePos(key.chunkX(),
+                Math.floorDiv(VANILLA_BOTTOM_Y + offsetY, CubePos.SIZE), key.chunkZ());
         for (FeatureCall call : features) {
             if (!shouldGenerateFeature(registry, call.feature(), key.repeatedBand(),
                     BoundaryMode.TRANSLATED)) {
@@ -578,7 +581,14 @@ final class VanillaPlacedFeatureGenerator {
             int registryId = registry.getRawId(call.feature());
             int decoratorIndex = registryId >= 0 ? registryId : call.index();
             random.setDecoratorSeed(populationSeed, decoratorIndex, call.step().ordinal());
-            call.feature().generate(access, generator, random, origin);
+            try (CubeWorkEvent event = CubeWorkEvent.start("vanilla.features.call", eventPos)) {
+                if (event != null) {
+                    event.detail = registry.getKey(call.feature())
+                            .map(featureKey -> featureKey.getValue().toString())
+                            .orElse("unregistered:" + call.index());
+                }
+                call.feature().generate(access, generator, random, origin);
+            }
         }
         return writer.snapshot(world);
     }

@@ -67,8 +67,11 @@ public class Higherworld implements ModInitializer {
         });
         ServerPlayConnectionEvents.JOIN.register((handler, sender, server) ->
                 sendTerrainGeneratorStatus(handler.player));
+        // Disconnect callbacks can arrive from the network event loop while
+        // the server thread is ticking a world.  Watcher removal mutates the
+        // cube scheduler, so keep it on the same thread as world ticks.
         ServerPlayConnectionEvents.DISCONNECT.register((handler, server) ->
-                CubeWatchManager.removePlayer(handler.player));
+                server.execute(() -> CubeWatchManager.removePlayer(handler.player)));
         ServerTickEvents.END_SERVER_TICK.register(Higherworld::syncTerrainGeneratorStatus);
         ServerTickEvents.START_WORLD_TICK.register(CubeWatchManager::midTick);
         ServerTickEvents.END_WORLD_TICK.register(CubeWatchManager::tick);

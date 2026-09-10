@@ -34,6 +34,7 @@ final class CubeTaskScheduler implements AutoCloseable {
     private final ConcurrentMap<CubePos, Integer> requestPriorities = new ConcurrentHashMap<>();
     private final CubePriorityIndex priorityOwners = new CubePriorityIndex();
     private volatile ConcurrentMap<CubePos, Integer> ownedPriorities = new ConcurrentHashMap<>();
+    private final Set<CubePos> inheritedPriorityPositions = new HashSet<>();
     private Map<CubePos, Integer> prefetchRanks = Map.of();
     private final Map<CubePos, GraphExpansion> expandedGraphs = new HashMap<>();
     private long graphExpansionCount;
@@ -203,22 +204,29 @@ final class CubeTaskScheduler implements AutoCloseable {
     }
 
     private void publishPriorities() {
-        Map<CubePos, Integer> next = priorityOwners.snapshot();
-        // Wide feature reads inherit the current owner's rank, including
-        // shared reads and owners that moved farther away.
-        inheritFeaturePriorities(next, featureTerrainDependencies.keySet());
-        Map<CubePos, Integer> previous = ownedPriorities;
-        ownedPriorities = new ConcurrentHashMap<>(next);
-        Set<CubePos> changed = new HashSet<>(previous.keySet());
-        changed.addAll(next.keySet());
-        for (CubePos pos : changed) {
+        Map<CubePos, Integer> next = priorityOwners.drainChanges();
+        // Reset all previous inherited contributions before propagating again:
+        // decreasing urgency/removing an owner must restore shared base ranks.
+        // Unchanged base positions remain in ownedPriorities without copying.
+        for (CubePos pos : inheritedPriorityPositions) {
+            next.put(pos, priorityOwners.effectivePriority(pos));
+        }
+        inheritedPriorityPositions.clear();
+        inheritedPriorityPositions.addAll(inheritFeaturePriorities(
+                next, featureTerrainDependencies.keySet(), ownedPriorities));
+        Set<CubePos> changed = new HashSet<>();
+        next.forEach((pos, rank) -> {
             requestPriorities.remove(pos);
-            if (java.util.Objects.equals(previous.get(pos), next.get(pos))) continue;
+            Integer previous = rank == null ? ownedPriorities.remove(pos) : ownedPriorities.put(pos, rank);
+            if (!java.util.Objects.equals(previous, rank)) changed.add(pos);
+        });
+        // Publish the entire delta before refreshing dependent queue entries.
+        for (CubePos pos : changed) {
             CubeHolder holder = holders.get(pos);
             if (holder != null) refreshPriority(holder);
             io.reprioritize(pos, priority(pos));
         }
-        reprioritizeGenerationTasks();
+        if (!changed.isEmpty()) reprioritizeGenerationTasks();
     }
 
     private void reprioritizeGenerationTasks() {
@@ -234,21 +242,27 @@ final class CubeTaskScheduler implements AutoCloseable {
 
     /** Propagate shared wide reads to a fixed point, independent of map order. */
     private Set<CubePos> inheritFeaturePriorities(Map<CubePos, Integer> ranks, Iterable<CubePos> owners) {
+        return inheritFeaturePriorities(ranks, owners, Map.of());
+    }
+
+    private Set<CubePos> inheritFeaturePriorities(
+            Map<CubePos, Integer> ranks, Iterable<CubePos> owners, Map<CubePos, Integer> unchanged) {
         java.util.PriorityQueue<PriorityPropagation> pending = new java.util.PriorityQueue<>(
                 java.util.Comparator.comparingInt(PriorityPropagation::rank));
         for (CubePos owner : owners) {
-            Integer rank = ranks.get(owner);
+            Integer rank = ranks.containsKey(owner) ? ranks.get(owner) : unchanged.get(owner);
             if (rank != null) pending.offer(new PriorityPropagation(owner, rank));
         }
         Set<CubePos> changed = new HashSet<>();
         while (!pending.isEmpty()) {
             PriorityPropagation entry = pending.poll();
-            if (!java.util.Objects.equals(ranks.get(entry.pos()), entry.rank())) continue;
+            Integer current = ranks.containsKey(entry.pos()) ? ranks.get(entry.pos()) : unchanged.get(entry.pos());
+            if (!java.util.Objects.equals(current, entry.rank())) continue;
             List<CubePos> dependencies = featureTerrainDependencies.get(entry.pos());
             if (dependencies == null) continue;
             int inherited = CubePriorityIndex.increment(entry.rank());
             for (CubePos dependency : dependencies) {
-                Integer previous = ranks.get(dependency);
+                Integer previous = ranks.containsKey(dependency) ? ranks.get(dependency) : unchanged.get(dependency);
                 if (previous != null && previous <= inherited) continue;
                 ranks.put(dependency, inherited);
                 changed.add(dependency);
@@ -383,6 +397,8 @@ final class CubeTaskScheduler implements AutoCloseable {
                     holder.status().ordinal());
             ReadyEntry previous = queuedReady.get(holder);
             if (entry.equals(previous)) return;
+            queuedReady.put(holder, entry);
+            readyQueue.offer(entry);
             // queuedReady and the heap must flip together.  A poller drops a
             // polled entry as soon as queuedReady has moved on, so a reader
             // that observes the promoted rank in queuedReady has to find the
@@ -391,10 +407,10 @@ final class CubeTaskScheduler implements AutoCloseable {
             // the heap while the new rank was already visible in the map, and
             // the stale rank could then still be polled ahead of the newly
             // promoted front cube.  The queue's monitor is the poller's lock.
-            synchronized (readyQueue) {
-                queuedReady.put(holder, entry);
-                readyQueue.offer(entry);
-            }
+            //synchronized (readyQueue) {
+            //    queuedReady.put(holder, entry);
+            //    readyQueue.offer(entry);
+            //}
         }
     }
 
@@ -548,6 +564,7 @@ final class CubeTaskScheduler implements AutoCloseable {
             dirtyTargets.add(dependency);
         }
         Set<CubePos> changed = inheritFeaturePriorities(ownedPriorities, List.of(owner));
+        inheritedPriorityPositions.addAll(changed);
         for (CubePos dependency : changed) {
             requestPriorities.remove(dependency);
             CubeHolder holder = holders.get(dependency);
@@ -895,6 +912,7 @@ final class CubeTaskScheduler implements AutoCloseable {
         requestPriorities.clear();
         priorityOwners.clear();
         ownedPriorities.clear();
+        inheritedPriorityPositions.clear();
         prefetchRanks = Map.of();
         expandedGraphs.clear();
         demand.clear();

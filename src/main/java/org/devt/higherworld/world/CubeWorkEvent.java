@@ -18,6 +18,7 @@ import org.devt.higherworld.storage.CubePos;
 public final class CubeWorkEvent extends Event implements AutoCloseable {
     private static final EventType TYPE = EventType.getEventType(CubeWorkEvent.class);
     @Label("Stage") public String stage;
+    @Label("Detail") public String detail;
     public int cubeX;
     public int cubeY;
     public int cubeZ;
