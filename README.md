@@ -35,29 +35,6 @@ cube 加载用可取消、可重建的分阶段 future，`FEATURES` 依赖邻居
 
 数据分工没变：原版高度带内的方块和实体兼容仍走 `.mca`，外面的方块写 `.hwr`。
 
-## GPU 生成
-
-自定义世界的纯噪声采样可以用 OpenCL 加速，默认关着。首次启动会生成
-`config/higherworld.properties`，把 `higherworld.gpu.enabled` 改成 `true` 再重启就行。
-没有兼容设备、或者内核起不来，会自动回退 CPU。
-
-打开之后，自定义噪声的采样和体素分类都在 GPU 上做；无限向下和非标准密度函数这类路径
-复用同一套 GPU 栅格体素化阶段。原版高度以下的完整 64 格批次会复用密度采样，
-一次做完栅格化和回读。回退到 CPU 时走的是同一套稀疏栅格，原版高度带始终保留原版精确生成。
-方块写入、洞穴、结构和光照没走 GPU，还是原来的路径。
-
-自定义稀疏 cube 按最多 16 个请求一批提交。GPU 端按 X/Z 列缓存深度、基准高度和波动项，
-省掉重复的噪声采样和 JNI/队列往返。
-
-其余开关：`higherworld.gpu.device_index`、`higherworld.gpu.allow_cpu_devices`、
-`higherworld.gpu.fallback_on_error`。
-
-## 存档位置
-
-```text
-<world>/hw_chunks/<dimension namespace>/<dimension path>/region3d/r.<x>.<y>.<z>.hwr
-```
-
 ## 参考
 
 第一代 Cubic Chunks（1.12.2 Forge）的稀疏 CubeMap、三维玩家视距和 BlockPos 包转义，
