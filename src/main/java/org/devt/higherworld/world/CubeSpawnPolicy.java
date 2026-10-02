@@ -19,8 +19,15 @@ import org.devt.higherworld.storage.CubePos;
  */
 public final class CubeSpawnPolicy {
     public static final int MAX_ATTEMPTS = 64;
+    /** Vertical radius shared by watcher, simulation, and natural-spawn windows. */
+    public static final int SIMULATION_VERTICAL_RADIUS = 4;
 
     private CubeSpawnPolicy() {
+    }
+
+    /** Creates the standard three-dimensional simulation window. */
+    public static SimulationWindow simulationWindow(CubePos center, int horizontalRadius) {
+        return new SimulationWindow(center, horizontalRadius, SIMULATION_VERTICAL_RADIUS);
     }
 
     /** The 3D simulation-distance envelope for one spawn pass. */

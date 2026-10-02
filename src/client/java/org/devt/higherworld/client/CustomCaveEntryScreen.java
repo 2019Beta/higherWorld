@@ -82,10 +82,7 @@ public final class CustomCaveEntryScreen extends Screen {
     }
 
     private void addText(String id, String labelKey, String value) {
-        TextFieldWidget field = new TextFieldWidget(textRenderer, 0, 0, 230, 20, Text.empty());
-        field.setMaxLength(1_000_000);
-        field.setText(value);
-        field.setTooltip(Tooltip.of(Text.translatable(labelKey + ".tooltip")));
+        TextFieldWidget field = CustomEntryFormSupport.createTextField(textRenderer, labelKey, value);
         fields.put(id, field);
         settingsList.addRow(Text.translatable(labelKey), field);
     }
@@ -117,11 +114,7 @@ public final class CustomCaveEntryScreen extends Screen {
             close();
             return true;
         } catch (RuntimeException exception) {
-            for (TextFieldWidget field : fields.values()) {
-                field.setEditableColor(0xFFFF5555);
-            }
-            error = exception.getMessage() == null
-                    ? Text.translatable("custom.error.invalid").getString() : exception.getMessage();
+            error = CustomEntryFormSupport.markInvalid(fields.values(), exception);
             return false;
         }
     }

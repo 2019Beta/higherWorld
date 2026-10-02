@@ -12,6 +12,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.Optional;
 import java.util.Map;
 import java.util.Arrays;
@@ -46,31 +50,90 @@ final class CubeRegionFile implements Closeable {
         this.position = pos;
         Files.createDirectories(path.getParent());
         this.file = new RandomAccessFile(path.toFile(), "rw");
-        if (file.length() == 0) {
-            writeHeader(pos);
-            dirty = true;
-        } else {
-            readHeader(pos);
+        try {
+            if (file.length() == 0) {
+                writeHeader(pos);
+                dirty = true;
+            } else {
+                readHeader(pos);
+            }
+            rebuildIndex();
+        } catch (IOException | RuntimeException exception) {
+            try {
+                file.close();
+            } catch (IOException closeFailure) {
+                exception.addSuppressed(closeFailure);
+            }
+            throw exception;
         }
-        rebuildIndex();
     }
 
-    synchronized Optional<byte[]> read(int slot) throws IOException {
-        validateSlot(slot);
-        if (offsets[slot] == 0) {
-            return Optional.empty();
+    Optional<byte[]> read(int slot) throws IOException {
+        CompressedRecord compressed;
+        synchronized (this) {
+            Record record = snapshotRecord(slot);
+            if (record == null) {
+                return Optional.empty();
+            }
+            compressed = new CompressedRecord(record, readCompressed(record));
+        }
+        return Optional.of(decode(compressed));
+    }
+
+    /** Reads compressed records in physical offset order, then inflates outside the file lock. */
+    Map<Integer, Optional<byte[]>> readBatch(Collection<Integer> requestedSlots)
+            throws IOException {
+        Map<Integer, Optional<byte[]>> result = new LinkedHashMap<>();
+        ArrayList<CompressedRecord> compressed = new ArrayList<>(requestedSlots.size());
+        synchronized (this) {
+            Map<Integer, Record> recordsBySlot = new LinkedHashMap<>();
+            for (int slot : requestedSlots) {
+                Record record = snapshotRecord(slot);
+                if (record == null) {
+                    result.put(slot, Optional.empty());
+                } else {
+                    recordsBySlot.putIfAbsent(slot, record);
+                }
+            }
+
+            ArrayList<Record> records = new ArrayList<>(recordsBySlot.values());
+            records.sort(Comparator.comparingLong(Record::offset));
+            for (Record record : records) {
+                compressed.add(new CompressedRecord(record, readCompressed(record)));
+            }
         }
 
-        byte[] compressed = new byte[compressedLengths[slot]];
-        file.seek(offsets[slot]);
+        // Decompression and CRC verification are CPU work. Keep them outside
+        // the file monitor so another operation can append or read the region
+        // while this batch is decoding its immutable byte snapshots.
+        for (CompressedRecord record : compressed) {
+            result.put(record.record().slot(), Optional.of(decode(record)));
+        }
+        return result;
+    }
+
+    private Record snapshotRecord(int slot) throws IOException {
+        validateSlot(slot);
+        if (offsets[slot] == 0L) return null;
+        return new Record(slot, offsets[slot], compressedLengths[slot],
+                uncompressedLengths[slot], checksums[slot]);
+    }
+
+    private byte[] readCompressed(Record record) throws IOException {
+        byte[] compressed = new byte[record.compressedLength()];
+        file.seek(record.offset());
         file.readFully(compressed);
-        byte[] payload = inflate(compressed, uncompressedLengths[slot]);
+        return compressed;
+    }
+
+    private static byte[] decode(CompressedRecord record) throws IOException {
+        byte[] payload = inflate(record.compressed(), record.record().uncompressedLength());
         CRC32 crc = new CRC32();
         crc.update(payload);
-        if ((int) crc.getValue() != checksums[slot]) {
-            throw new IOException("CRC mismatch in cube slot " + slot);
+        if ((int) crc.getValue() != record.record().checksum()) {
+            throw new IOException("CRC mismatch in cube slot " + record.record().slot());
         }
-        return Optional.of(payload);
+        return payload;
     }
 
     synchronized void write(int slot, byte[] payload) throws IOException {
@@ -313,6 +376,11 @@ final class CubeRegionFile implements Closeable {
             throw new IOException("Invalid cube record lengths " + compressed + "/" + uncompressed);
         }
     }
+
+    private record Record(int slot, long offset, int compressedLength,
+                          int uncompressedLength, int checksum) {}
+
+    private record CompressedRecord(Record record, byte[] compressed) {}
 
     @Override
     public synchronized void close() throws IOException {

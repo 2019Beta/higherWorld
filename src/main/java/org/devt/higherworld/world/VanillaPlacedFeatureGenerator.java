@@ -40,12 +40,16 @@ import net.minecraft.world.HeightLimitView;
 import net.minecraft.world.StructureWorldAccess;
 import net.minecraft.world.biome.Biome;
 import net.minecraft.world.biome.GenerationSettings;
+import net.minecraft.world.biome.source.BiomeAccess;
+import net.minecraft.world.biome.source.BiomeCoords;
 import net.minecraft.world.chunk.Chunk;
 import net.minecraft.world.chunk.ProtoChunk;
 import net.minecraft.world.chunk.UpgradeData;
 import net.minecraft.world.gen.GenerationStep;
 import net.minecraft.world.gen.chunk.ChunkGenerator;
+import net.minecraft.world.gen.feature.OreFeature;
 import net.minecraft.world.gen.feature.PlacedFeature;
+import net.minecraft.world.gen.feature.ScatteredOreFeature;
 import org.devt.higherworld.storage.CubePos;
 
 /** Decorates sparse cubes by executing the biome's registered vanilla placed features. */
@@ -81,6 +85,7 @@ final class VanillaPlacedFeatureGenerator {
     // bounded LRU window large enough for the nearby source bands without
     // allowing an unbounded deep-world cache.
     private static final int MAX_FEATURE_BATCHES = 2_048;
+    private static final int MAX_FEATURE_JOBS = 32;
     private static final int MAX_FEATURE_PLANS = 4_096;
     private static final int MAX_BIOME_QUERIES = 4_096;
     private static final Map<ServerWorld, FeatureCache> CACHES = new ConcurrentHashMap<>();
@@ -89,7 +94,8 @@ final class VanillaPlacedFeatureGenerator {
     }
 
     static void release(ServerWorld world) {
-        CACHES.remove(world);
+        FeatureCache cache = CACHES.remove(world);
+        if (cache != null) cache.clear();
     }
 
     private static int sectionsPerBand() {
@@ -116,6 +122,39 @@ final class VanillaPlacedFeatureGenerator {
         int highestSection = highestSection(world, repeatedBand, sectionsPerBand);
         int lowestSection = highestSection - sectionsPerBand + 1;
         return lowestSection * CubePos.SIZE - VANILLA_BOTTOM_Y;
+    }
+
+    static int fixedTerrainMinSection(int offsetY) {
+        return Math.floorDiv(
+                offsetY + VANILLA_BOTTOM_Y - FEATURE_VERTICAL_HALO, CubePos.SIZE);
+    }
+
+    static int fixedTerrainMaxSection(int offsetY) {
+        return Math.floorDiv(
+                offsetY + VANILLA_BOTTOM_Y + REPEATED_BAND_HEIGHT
+                        + FEATURE_VERTICAL_HALO - 1,
+                CubePos.SIZE);
+    }
+
+    static boolean isPureDeepBatch(int offsetY, int worldBottomY) {
+        long actualMaxY = (long) offsetY + VANILLA_BOTTOM_Y
+                + REPEATED_BAND_HEIGHT + FEATURE_VERTICAL_HALO - 1L;
+        return actualMaxY < worldBottomY;
+    }
+
+    static boolean isKnownSafeVanillaOre(String namespace, String path) {
+        return "minecraft".equals(namespace)
+                && path != null && path.startsWith("ore_");
+    }
+
+    private static BlockBox featureVirtualBand(int chunkX, int chunkZ) {
+        return new BlockBox(
+                chunkX * CubePos.SIZE,
+                VANILLA_BOTTOM_Y - FEATURE_VERTICAL_HALO,
+                chunkZ * CubePos.SIZE,
+                chunkX * CubePos.SIZE + CubePos.SIZE - 1,
+                VANILLA_BOTTOM_Y + REPEATED_BAND_HEIGHT + FEATURE_VERTICAL_HALO - 1,
+                chunkZ * CubePos.SIZE + CubePos.SIZE - 1);
     }
 
     /**
@@ -152,6 +191,8 @@ final class VanillaPlacedFeatureGenerator {
     private static final class FeatureCache {
         private final LinkedHashMap<FeatureBatchKey, FeatureBatchSnapshot> batches =
                 new LinkedHashMap<>(256, 0.75f, true);
+        private final LinkedHashMap<FeatureBatchKey, FeatureBatchJob> jobs =
+                new LinkedHashMap<>(128, 0.75f, true);
         private final LinkedHashMap<FeaturePlanKey, List<FeatureCall>> plans =
                 new LinkedHashMap<>(256, 0.75f, true);
         private final LinkedHashMap<BiomeQueryKey, List<RegistryEntry<Biome>>> biomes =
@@ -170,6 +211,48 @@ final class VanillaPlacedFeatureGenerator {
         /** Non-computing peek used by the sliced commit to decide the deadline gate. */
         private synchronized FeatureBatchSnapshot batchIfPresent(FeatureBatchKey key) {
             return batches.get(key);
+        }
+
+        private synchronized FeatureBatchJob jobIfPresent(FeatureBatchKey key) {
+            return jobs.get(key);
+        }
+
+        private synchronized FeatureBatchJob job(
+                FeatureBatchKey key, Supplier<FeatureBatchJob> factory) {
+            FeatureBatchJob existing = jobs.get(key);
+            if (existing != null) return existing;
+            FeatureBatchJob created = factory.get();
+            jobs.put(key, created);
+            trim(jobs, MAX_FEATURE_JOBS);
+            return created;
+        }
+
+        private synchronized void discardJob(FeatureBatchKey key) {
+            jobs.remove(key);
+        }
+
+        private synchronized void publishBatch(
+                FeatureBatchKey key, FeatureBatchJob job, FeatureBatchSnapshot batch) {
+            if (!job.isComplete()) {
+                throw new IllegalStateException("Cannot publish an incomplete placed-feature job");
+            }
+            jobs.remove(key);
+            batches.put(key, batch);
+            trim(batches, MAX_FEATURE_BATCHES);
+        }
+
+        private synchronized void publishAtomicBatch(
+                FeatureBatchKey key, FeatureBatchSnapshot batch) {
+            jobs.remove(key);
+            batches.put(key, batch);
+            trim(batches, MAX_FEATURE_BATCHES);
+        }
+
+        private synchronized void clear() {
+            jobs.clear();
+            batches.clear();
+            plans.clear();
+            biomes.clear();
         }
 
         private synchronized List<FeatureCall> plan(
@@ -218,11 +301,94 @@ final class VanillaPlacedFeatureGenerator {
          * shared air section so the snapshot cache stays total.
          */
         private final Map<CubePos, BlockState[]> terrainSnapshots = new HashMap<>();
+        private final BiomeAccess fixedBiomeAccess;
+        /**
+         * A sliced job uses a complete, immutable terrain view.  It must not
+         * fall back to ServerWorld after yielding: doing so would make the
+         * result depend on changes made between two server ticks.
+         */
+        private final boolean fixedTerrainView;
 
         private FeatureBatchWriter(ServerWorld world, BlockBox virtualBand, int offsetY) {
+            this(world, virtualBand, offsetY, null, null);
+        }
+
+        private FeatureBatchWriter(
+                ServerWorld world, BlockBox virtualBand, int offsetY,
+                Map<CubePos, BlockState[]> fixedTerrainSnapshots,
+                BiomeAccess fixedBiomeAccess) {
             this.world = world;
             this.virtualBand = virtualBand;
             this.offsetY = offsetY;
+            if (fixedTerrainSnapshots != null) {
+                this.terrainSnapshots.putAll(fixedTerrainSnapshots);
+                this.fixedBiomeAccess = fixedBiomeAccess;
+                this.fixedTerrainView = true;
+            } else {
+                this.fixedBiomeAccess = null;
+                this.fixedTerrainView = false;
+            }
+        }
+
+        private static FeatureBatchWriter withFixedTerrainView(
+                ServerWorld world, BlockBox virtualBand, int offsetY,
+                int sourceChunkX, int sourceChunkZ) {
+            Map<CubePos, BlockState[]> snapshots = new HashMap<>();
+            Map<QuartBiomeKey, RegistryEntry<Biome>> biomes = new HashMap<>();
+            int actualMinSection = fixedTerrainMinSection(offsetY);
+            int actualMaxSection = fixedTerrainMaxSection(offsetY);
+            try {
+                for (int chunkZ = sourceChunkZ - FEATURE_ORIGIN_RADIUS;
+                        chunkZ <= sourceChunkZ + FEATURE_ORIGIN_RADIUS; chunkZ++) {
+                    for (int chunkX = sourceChunkX - FEATURE_ORIGIN_RADIUS;
+                            chunkX <= sourceChunkX + FEATURE_ORIGIN_RADIUS; chunkX++) {
+                        for (int sectionY = actualMinSection;
+                                sectionY <= actualMaxSection; sectionY++) {
+                            CubePos pos = new CubePos(chunkX, sectionY, chunkZ);
+                            BlockState[] snapshot = CubicWorldManager.snapshotCubeSection(world, pos);
+                            snapshots.put(pos, snapshot == null ? AIR_SECTION : snapshot);
+                        }
+                    }
+                }
+                int minX = (sourceChunkX - FEATURE_ORIGIN_RADIUS) * CubePos.SIZE;
+                int maxX = (sourceChunkX + FEATURE_ORIGIN_RADIUS + 1) * CubePos.SIZE - 1;
+                int minZ = (sourceChunkZ - FEATURE_ORIGIN_RADIUS) * CubePos.SIZE;
+                int maxZ = (sourceChunkZ + FEATURE_ORIGIN_RADIUS + 1) * CubePos.SIZE - 1;
+                int minQuartX = BiomeCoords.fromBlock(minX) - 1;
+                int maxQuartX = BiomeCoords.fromBlock(maxX) + 1;
+                int minQuartZ = BiomeCoords.fromBlock(minZ) - 1;
+                int maxQuartZ = BiomeCoords.fromBlock(maxZ) + 1;
+                int minQuartY = BiomeCoords.fromBlock(virtualBand.getMinY()) - 1;
+                int maxQuartY = BiomeCoords.fromBlock(virtualBand.getMaxY()) + 1;
+                BiomeAccess source = world.getBiomeAccess();
+                for (int quartY = minQuartY; quartY <= maxQuartY; quartY++) {
+                    for (int quartZ = minQuartZ; quartZ <= maxQuartZ; quartZ++) {
+                        for (int quartX = minQuartX; quartX <= maxQuartX; quartX++) {
+                            biomes.put(new QuartBiomeKey(quartX, quartY, quartZ),
+                                    source.getBiomeForNoiseGen(quartX, quartY, quartZ));
+                        }
+                    }
+                }
+                Map<QuartBiomeKey, RegistryEntry<Biome>> capturedBiomes = Map.copyOf(biomes);
+                BiomeAccess fixed = source.withSource((quartX, quartY, quartZ) -> {
+                    RegistryEntry<Biome> biome = capturedBiomes.get(
+                            new QuartBiomeKey(quartX, quartY, quartZ));
+                    if (biome == null) {
+                        throw new SnapshotBoundaryException(
+                                "Placed feature biome quart escaped fixed view at "
+                                        + quartX + "," + quartY + "," + quartZ);
+                    }
+                    return biome;
+                });
+                return new FeatureBatchWriter(world, virtualBand, offsetY, snapshots, fixed);
+            } catch (RuntimeException exception) {
+                throw new SnapshotBoundaryException(
+                        "Cannot capture fixed placed-feature terrain/biome view", exception);
+            }
+        }
+
+        private RegistryEntry<Biome> readBiome(BlockPos virtualPos) {
+            return fixedBiomeAccess.getBiome(virtualPos);
         }
 
         private BlockState read(BlockPos virtualPos) {
@@ -231,6 +397,17 @@ final class VanillaPlacedFeatureGenerator {
             int actualX = virtualPos.getX();
             int actualY = virtualPos.getY() + offsetY;
             int actualZ = virtualPos.getZ();
+            if (fixedTerrainView) {
+                CubePos cubePos = CubePos.fromBlock(actualX, actualY, actualZ);
+                BlockState[] snapshot = terrainSnapshots.get(cubePos);
+                if (snapshot == null) {
+                    throw new SnapshotBoundaryException(
+                            "Placed feature read escaped fixed terrain view at " + virtualPos);
+                }
+                return snapshot[(Math.floorMod(actualY, CubePos.SIZE) * CubePos.SIZE
+                        + Math.floorMod(actualZ, CubePos.SIZE)) * CubePos.SIZE
+                        + Math.floorMod(actualX, CubePos.SIZE)];
+            }
             if (actualY < world.getBottomY()) {
                 CubePos cubePos = CubePos.fromBlock(actualX, actualY, actualZ);
                 BlockState[] snapshot = terrainSnapshots.get(cubePos);
@@ -277,6 +454,125 @@ final class VanillaPlacedFeatureGenerator {
                 }
             });
             return new FeatureBatchSnapshot(writesByCube, entitiesByCube);
+        }
+    }
+
+    /**
+     * Resumable state for one source-chunk/repeated-band batch.  The writer,
+     * proxy and random stream stay alive until every placed feature call has
+     * completed; only the final immutable snapshot is visible in the cache.
+     */
+    static final class FeatureBatchJobState {
+        private final int callCount;
+        private int callCursor;
+        private boolean complete;
+
+        FeatureBatchJobState(int callCount) {
+            if (callCount < 0) throw new IllegalArgumentException("callCount");
+            this.callCount = callCount;
+        }
+
+        boolean hasNext() {
+            return callCursor < callCount;
+        }
+
+        int take() {
+            if (!hasNext()) throw new IllegalStateException("No placed-feature call remains");
+            return callCursor++;
+        }
+
+        void finish() {
+            if (hasNext()) {
+                throw new IllegalStateException("Placed-feature job finished before its cursor");
+            }
+            complete = true;
+        }
+
+        boolean isComplete() {
+            return complete;
+        }
+
+        int cursor() {
+            return callCursor;
+        }
+    }
+
+    private static final class FeatureBatchJob {
+        private final ServerWorld world;
+        private final ChunkGenerator generator;
+        private final Registry<PlacedFeature> registry;
+        private final FeatureBatchKey key;
+        private final List<FeatureCall> features;
+        private final FeatureBatchWriter writer;
+        private final StructureWorldAccess access;
+        private final ChunkRandom random;
+        private final long populationSeed;
+        private final BlockPos origin;
+        private final CubePos eventPos;
+        private final FeatureBatchJobState state;
+
+        private FeatureBatchJob(
+                ServerWorld world, ChunkGenerator generator, Registry<PlacedFeature> registry,
+                FeatureBatchKey key, List<FeatureCall> features,
+                long bandSeed, int offsetY) {
+            this.world = world;
+            this.generator = generator;
+            this.registry = registry;
+            this.key = key;
+            this.features = List.copyOf(features);
+            this.state = new FeatureBatchJobState(this.features.size());
+            BlockBox virtualBand = featureVirtualBand(key.chunkX(), key.chunkZ());
+            this.writer = FeatureBatchWriter.withFixedTerrainView(
+                    world, virtualBand, offsetY, key.chunkX(), key.chunkZ());
+            this.access = translatedAccess(
+                    world, null, VANILLA_BOTTOM_Y, offsetY,
+                    BoundaryMode.TRANSLATED, writer);
+            this.random = new ChunkRandom(new Xoroshiro128PlusPlusRandom(
+                    world.getSeed() ^ key.repeatedBand() * 0x9E3779B97F4A7C15L));
+            int originX = key.chunkX() * CubePos.SIZE;
+            int originZ = key.chunkZ() * CubePos.SIZE;
+            this.populationSeed = random.setPopulationSeed(bandSeed, originX, originZ);
+            this.origin = new BlockPos(originX, VANILLA_BOTTOM_Y, originZ);
+            this.eventPos = new CubePos(
+                    key.chunkX(), Math.floorDiv(VANILLA_BOTTOM_Y + offsetY, CubePos.SIZE),
+                    key.chunkZ());
+        }
+
+        private FeatureBatchSnapshot advance(long deadlineNanos) {
+            boolean madeProgress = false;
+            while (state.hasNext()) {
+                if (madeProgress && System.nanoTime() >= deadlineNanos) {
+                    return null;
+                }
+                FeatureCall call = features.get(state.take());
+                if (!shouldGenerateFeature(
+                        registry, call.feature(), key.repeatedBand(), BoundaryMode.TRANSLATED)) {
+                    madeProgress = true;
+                    continue;
+                }
+                int registryId = registry.getRawId(call.feature());
+                int decoratorIndex = registryId >= 0 ? registryId : call.index();
+                random.setDecoratorSeed(
+                        populationSeed, decoratorIndex, call.step().ordinal());
+                runFeatureCall(call, access, generator, random, origin, registry, eventPos);
+                madeProgress = true;
+            }
+            state.finish();
+            return writer.snapshot(world);
+        }
+
+        private boolean isComplete() {
+            return state.isComplete();
+        }
+    }
+
+    private static final class SnapshotBoundaryException extends RuntimeException {
+        private SnapshotBoundaryException(String message) {
+            super(message);
+        }
+
+        private SnapshotBoundaryException(String message, Throwable cause) {
+            super(message, cause);
         }
     }
 
@@ -340,6 +636,9 @@ final class VanillaPlacedFeatureGenerator {
     }
 
     private record BiomeQueryKey(int chunkX, int chunkZ, long repeatedBand) {
+    }
+
+    private record QuartBiomeKey(int x, int y, int z) {
     }
 
     /** The enclosing snapshot partition owns the full cube coordinate. */
@@ -521,9 +820,66 @@ final class VanillaPlacedFeatureGenerator {
                             chunkX, chunkZ, sourceBand, stepsMask);
                     FeatureBatchSnapshot batch = cache.batchIfPresent(key);
                     if (batch == null) {
-                        batch = cache.batch(key, () -> generateBatch(
-                                world, generator, registry, cache, key, steps,
-                                bandSeed, sourceOffsetY));
+                        FeatureBatchJob job = cache.jobIfPresent(key);
+                        if (job != null) {
+                            boolean atomicFallback = false;
+                            try {
+                                batch = job.advance(deadlineNanos);
+                            } catch (SnapshotBoundaryException boundary) {
+                                // A fixed-view read escaped its captured 3x3
+                                // column/vertical halo.  Discard all partial
+                                // writes and recompute this key atomically;
+                                // no incomplete snapshot is cache-visible.
+                                cache.discardJob(key);
+                                batch = generateBatch(
+                                        world, generator, registry, cache, key, steps,
+                                        bandSeed, sourceOffsetY);
+                                atomicFallback = true;
+                            } catch (RuntimeException failure) {
+                                cache.discardJob(key);
+                                throw failure;
+                            }
+                            if (batch == null) return keyIndex;
+                            if (atomicFallback) {
+                                cache.publishAtomicBatch(key, batch);
+                            } else {
+                                cache.publishBatch(key, job, batch);
+                            }
+                        } else {
+                            List<FeatureCall> features = featurePlan(
+                                    world, generator, cache, key, steps);
+                            if (canSliceBatch(world, registry, sourceOffsetY, features)) {
+                                boolean atomicFallback = false;
+                                try {
+                                    job = cache.job(key, () -> new FeatureBatchJob(
+                                            world, generator, registry, key, features,
+                                            bandSeed, sourceOffsetY));
+                                    batch = job.advance(deadlineNanos);
+                                } catch (SnapshotBoundaryException boundary) {
+                                    // The fixed snapshot is intentionally
+                                    // fail-closed.  Atomic recomputation is
+                                    // the only path allowed to use live reads.
+                                    cache.discardJob(key);
+                                    batch = generateBatch(
+                                            world, generator, registry, cache, key, steps,
+                                            bandSeed, sourceOffsetY);
+                                    atomicFallback = true;
+                                } catch (RuntimeException failure) {
+                                    cache.discardJob(key);
+                                    throw failure;
+                                }
+                                if (batch == null) return keyIndex;
+                                if (atomicFallback) {
+                                    cache.publishAtomicBatch(key, batch);
+                                } else {
+                                    cache.publishBatch(key, job, batch);
+                                }
+                            } else {
+                                batch = cache.batch(key, () -> generateBatch(
+                                        world, generator, registry, cache, key, steps,
+                                        bandSeed, sourceOffsetY));
+                            }
+                        }
                     }
                     applyBatch(world, cube, batch, sourceOffsetY);
                     keyIndex++;
@@ -548,23 +904,10 @@ final class VanillaPlacedFeatureGenerator {
             FeatureCache cache, FeatureBatchKey key, List<GenerationStep.Feature> steps,
             long bandSeed, int offsetY) {
         FeatureBatchWriter writer = new FeatureBatchWriter(
-                world,
-                new BlockBox(key.chunkX() * CubePos.SIZE,
-                        VANILLA_BOTTOM_Y - FEATURE_VERTICAL_HALO,
-                        key.chunkZ() * CubePos.SIZE,
-                        key.chunkX() * CubePos.SIZE + CubePos.SIZE - 1,
-                        VANILLA_BOTTOM_Y + REPEATED_BAND_HEIGHT
-                                + FEATURE_VERTICAL_HALO - 1,
-                        key.chunkZ() * CubePos.SIZE + CubePos.SIZE - 1),
-                offsetY);
+                world, featureVirtualBand(key.chunkX(), key.chunkZ()), offsetY);
         StructureWorldAccess access = translatedAccess(
                 world, null, VANILLA_BOTTOM_Y, offsetY, BoundaryMode.TRANSLATED, writer);
-        List<FeatureCall> features = cache.plan(
-                new FeaturePlanKey(key.chunkX(), key.chunkZ(), key.repeatedBand(), key.stepsMask()),
-                () -> collectFeatures(
-                        world, key.chunkX() * CubePos.SIZE, key.chunkZ() * CubePos.SIZE,
-                        VANILLA_BOTTOM_Y, generator, steps, cache,
-                        new BiomeQueryKey(key.chunkX(), key.chunkZ(), key.repeatedBand())));
+        List<FeatureCall> features = featurePlan(world, generator, cache, key, steps);
         ChunkRandom random = new ChunkRandom(new Xoroshiro128PlusPlusRandom(
                 world.getSeed() ^ key.repeatedBand() * 0x9E3779B97F4A7C15L));
         int originX = key.chunkX() * CubePos.SIZE;
@@ -581,14 +924,7 @@ final class VanillaPlacedFeatureGenerator {
             int registryId = registry.getRawId(call.feature());
             int decoratorIndex = registryId >= 0 ? registryId : call.index();
             random.setDecoratorSeed(populationSeed, decoratorIndex, call.step().ordinal());
-            try (CubeWorkEvent event = CubeWorkEvent.start("vanilla.features.call", eventPos)) {
-                if (event != null) {
-                    event.detail = registry.getKey(call.feature())
-                            .map(featureKey -> featureKey.getValue().toString())
-                            .orElse("unregistered:" + call.index());
-                }
-                call.feature().generate(access, generator, random, origin);
-            }
+            runFeatureCall(call, access, generator, random, origin, registry, eventPos);
         }
         return writer.snapshot(world);
     }
@@ -616,6 +952,47 @@ final class VanillaPlacedFeatureGenerator {
             String path = key.getValue().getPath();
             return "monster_room".equals(path) || "monster_room_deep".equals(path);
         }).orElse(false);
+    }
+
+    private static boolean canSliceFeature(
+            Registry<PlacedFeature> registry, FeatureCall call) {
+        if (call.step() != GenerationStep.Feature.UNDERGROUND_ORES) return false;
+        return registry.getKey(call.feature()).map(key -> isKnownSafeVanillaOre(
+                key.getValue().getNamespace(), key.getValue().getPath())
+                && call.feature().getDecoratedFeatures().allMatch(configured ->
+                        configured.feature() instanceof OreFeature
+                                || configured.feature() instanceof ScatteredOreFeature))
+                .orElse(false);
+    }
+
+    private static boolean isKnownVanillaSource(
+            Registry<PlacedFeature> registry, FeatureCall call) {
+        return registry.getKey(call.feature()).map(key ->
+                "minecraft".equals(key.getValue().getNamespace())
+                        && call.feature().getDecoratedFeatures().allMatch(configured ->
+                                configured.feature().getClass().getName()
+                                        .startsWith("net.minecraft.")))
+                .orElse(false);
+    }
+
+    private static boolean canSliceBatch(
+            ServerWorld world, Registry<PlacedFeature> registry,
+            int offsetY, List<FeatureCall> features) {
+        if (features.isEmpty() || !isPureDeepBatch(offsetY, world.getBottomY())) return false;
+        boolean hasSafeOre = false;
+        for (FeatureCall call : features) {
+            if (!isKnownVanillaSource(registry, call)) {
+                // A mod/datapack supplied source can depend on arbitrary
+                // world services. Keep the whole source batch atomic.
+                return false;
+            }
+            if (canSliceFeature(registry, call)) hasSafeOre = true;
+        }
+        // The fixed-view path is intentionally entered only when it can
+        // amortize a known-safe ore call. Other vanilla calls in this list
+        // still run to completion as one unit; the deadline is observed
+        // between calls, never inside a feature implementation.
+        return hasSafeOre;
     }
 
     private static void applyBatch(
@@ -681,6 +1058,31 @@ final class VanillaPlacedFeatureGenerator {
         int mask = 0;
         for (GenerationStep.Feature step : steps) mask |= 1 << step.ordinal();
         return mask;
+    }
+
+    private static List<FeatureCall> featurePlan(
+            ServerWorld world, ChunkGenerator generator, FeatureCache cache,
+            FeatureBatchKey key, List<GenerationStep.Feature> steps) {
+        return cache.plan(
+                new FeaturePlanKey(key.chunkX(), key.chunkZ(), key.repeatedBand(), key.stepsMask()),
+                () -> collectFeatures(
+                        world, key.chunkX() * CubePos.SIZE, key.chunkZ() * CubePos.SIZE,
+                        VANILLA_BOTTOM_Y, generator, steps, cache,
+                        new BiomeQueryKey(key.chunkX(), key.chunkZ(), key.repeatedBand())));
+    }
+
+    private static void runFeatureCall(
+            FeatureCall call, StructureWorldAccess access, ChunkGenerator generator,
+            ChunkRandom random, BlockPos origin, Registry<PlacedFeature> registry,
+            CubePos eventPos) {
+        try (CubeWorkEvent event = CubeWorkEvent.start("vanilla.features.call", eventPos)) {
+            if (event != null) {
+                event.detail = registry.getKey(call.feature())
+                        .map(featureKey -> featureKey.getValue().toString())
+                        .orElse("unregistered:" + call.index());
+            }
+            call.feature().generate(access, generator, random, origin);
+        }
     }
 
     private static List<FeatureCall> collectFeatures(
@@ -931,6 +1333,10 @@ final class VanillaPlacedFeatureGenerator {
                             boundaryMode, clippedBlockStates, virtualPos)
                     : batchWriter.read(virtualPos).getFluidState());
         }
+        if ("getBiome".equals(name) && virtualPos != null
+                && batchWriter != null && batchWriter.fixedTerrainView) {
+            return batchWriter.readBiome(virtualPos);
+        }
         if (batchWriter != null && "getBlockEntity".equals(name)
                 && virtualPos != null) {
             BlockEntity blockEntity = batchWriter.blockEntities.get(virtualPos);
@@ -940,6 +1346,11 @@ final class VanillaPlacedFeatureGenerator {
                     return blockEntity.getType() == type ? Optional.of(blockEntity) : Optional.empty();
                 }
                 return blockEntity;
+            }
+            if (batchWriter.fixedTerrainView) {
+                throw new SnapshotBoundaryException(
+                        "Placed feature block-entity read escaped fixed terrain view at "
+                                + virtualPos);
             }
             BlockEntity actual = world.getBlockEntity(translate(virtualPos, offsetY));
             if (arguments.length == 2
@@ -1088,6 +1499,22 @@ final class VanillaPlacedFeatureGenerator {
         if (("scheduleBlockTick".equals(name) || "scheduleFluidTick".equals(name)
                 || "scheduleTick".equals(name)) && virtualPos != null) {
             return null;
+        }
+        if (batchWriter != null && batchWriter.fixedTerrainView
+                && ("getRegistryManager".equals(name)
+                || "getChunkGenerator".equals(name)
+                || "getSeed".equals(name))) {
+            try {
+                return method.invoke(world, arguments);
+            } catch (InvocationTargetException exception) {
+                throw exception.getCause();
+            }
+        }
+        if (batchWriter != null && batchWriter.fixedTerrainView) {
+            // In particular, getBiome and every future StructureWorldAccess
+            // read must not silently consult the live world after a yield.
+            throw new SnapshotBoundaryException(
+                    "Unsupported placed-feature world delegate in fixed terrain view: " + name);
         }
         try {
             return method.invoke(world, arguments);

@@ -51,6 +51,14 @@ final class CubeHolder {
             changed = true;
         }
         if (requested.ordinal() > current.target.ordinal()) {
+            if (requested.isAtLeast(CubeStatus.PAYLOAD)
+                    && !current.status.isAtLeast(CubeStatus.PAYLOAD)) {
+                synchronized (current) {
+                    if (current.payloadWait == null) {
+                        current.payloadWait = CubeWorkEvent.start("lifecycle.request_to_payload", pos);
+                    }
+                }
+            }
             current.target = requested;
             changed = true;
         }
@@ -59,6 +67,7 @@ final class CubeHolder {
 
     synchronized void lowerTarget(CubeStatus requested) {
         if (requested.ordinal() >= lifecycle.target.ordinal()) return;
+        if (!requested.isAtLeast(CubeStatus.PAYLOAD)) finishPayloadWait(lifecycle, "cancelled");
         lifecycle.target = requested;
         notifyChanged();
     }
@@ -77,6 +86,7 @@ final class CubeHolder {
                 current.stage(stage).complete(null);
             }
             current.status = reached;
+            if (reached.isAtLeast(CubeStatus.PAYLOAD)) finishPayloadWait(current, "ready");
             if (reached.isAtLeast(CubeStatus.TERRAIN)) {
                 // The section now owns the committed terrain. Keeping the
                 // completed future here pins its raw snapshot even after the
@@ -147,6 +157,7 @@ final class CubeHolder {
         Lifecycle current = lifecycle;
         if (current.epoch != epoch || current.cancelled) return;
         current.failed = true;
+        finishPayloadWait(current, "failed");
         current.stageFutures.values().forEach(future -> future.completeExceptionally(throwable));
         current.fullFuture.completeExceptionally(throwable);
         notifyChanged();
@@ -156,6 +167,7 @@ final class CubeHolder {
         Lifecycle current = lifecycle;
         if (current.cancelled) return;
         current.cancelled = true;
+        finishPayloadWait(current, "cancelled");
         current.target = CubeStatus.EMPTY;
         current.status = CubeStatus.EMPTY;
         CancellationException cancelled = new CancellationException("Cube lifecycle cancelled: " + pos);
@@ -186,6 +198,17 @@ final class CubeHolder {
         return false;
     }
 
+    private static void finishPayloadWait(Lifecycle current, String outcome) {
+        synchronized (current) {
+            CubeWorkEvent event = current.payloadWait;
+            current.payloadWait = null;
+            if (event != null) {
+                event.detail = outcome;
+                event.close();
+            }
+        }
+    }
+
     private void notifyChanged() {
         changeVersion.incrementAndGet();
         if (changeListener != null) changeListener.accept(this);
@@ -205,6 +228,7 @@ final class CubeHolder {
         private volatile CubeStatus target = CubeStatus.EMPTY;
         private volatile boolean cancelled;
         private volatile boolean failed;
+        private CubeWorkEvent payloadWait;
         private volatile CompletableFuture<Optional<byte[]>> ioFuture;
         private volatile CompletableFuture<CubeTerrainSnapshot> terrainPreparationFuture;
 

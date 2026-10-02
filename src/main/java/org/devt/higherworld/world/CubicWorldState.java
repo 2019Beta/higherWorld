@@ -5,7 +5,6 @@ import java.nio.file.Path;
 import java.util.Collection;
 import java.util.HashSet;
 import java.util.Iterator;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -45,7 +44,6 @@ final class CubicWorldState implements AutoCloseable {
     private static final int MAINTENANCE_SCANS_PER_PASS = 256;
     private static final long EVICTION_NANOS_PER_PASS = 2_000_000L;
     private static final int LIGHT_BROADCASTS_PER_TICK = 2;
-    private static final long MAX_CACHED_PAYLOAD_BYTES = 32L * 1024L * 1024L;
     private final ServerWorld world;
     private final CubeStorage storage;
     private final CubeIoScheduler ioScheduler;
@@ -62,10 +60,10 @@ final class CubicWorldState implements AutoCloseable {
     private Iterator<LoadedCube> saveCursor = java.util.Collections.emptyIterator();
     private Iterator<LoadedCube> evictionCursor = java.util.Collections.emptyIterator();
     private final ConcurrentMap<CubePos, LoadContext> loadContexts = new ConcurrentHashMap<>();
-    private final ConcurrentMap<BlockColumnPos, Integer> highestBlocks = new ConcurrentHashMap<>();
+    private final CubeHeightIndex highestBlocks = new CubeHeightIndex(
+            (columnX, columnZ) -> columns.get(new ColumnPos(columnX, columnZ)));
     /** Small LRU of immutable codec results reused by send/save paths. */
-    private final Map<CubePos, EncodedPayload> payloadCache = new LinkedHashMap<>(32, 0.75f, true);
-    private long cachedPayloadBytes;
+    private final CubePayloadCache payloadCache = new CubePayloadCache();
     private final SparseCubeLightEngine lightEngine = new SparseCubeLightEngine(new LightAccess());
     private final CubeScheduledTickQueue scheduledTicks;
     private final CubeScheduledTickJournal scheduledTickJournal;
@@ -99,9 +97,10 @@ final class CubicWorldState implements AutoCloseable {
         this.world = world;
         this.storage = storage;
         this.ioScheduler = new CubeIoScheduler(storage);
-        this.taskScheduler = new CubeTaskScheduler(ioScheduler);
         this.generateInfinitelyDownward = CubicWorldManager.generatesInfinitelyDownward(world);
         this.customWorld = CubicWorldManager.generatesCustomWorld(world);
+        this.taskScheduler = new CubeTaskScheduler(ioScheduler, customWorld
+                ? CustomCubeGenerator.GENERATION_VERSION : InfiniteDownwardGenerator.GENERATION_VERSION);
         this.generateStructures = generateStructures;
         this.structureSettings = structureSettings;
         this.customWorldSettings = customWorldSettings;
@@ -219,7 +218,7 @@ final class CubicWorldState implements AutoCloseable {
                 // must never roll back the authoritative block mutation.
                 Higherworld.LOGGER.warn("Cannot update sparse POI index at {}", pos, exception);
             }
-            updateHeight(pos, state);
+            highestBlocks.update(pos, state);
             lightEngine.queueBlock(pos.getX(), pos.getY(), pos.getZ());
             queueLoadedSkyColumn(pos.getX(), pos.getZ());
             changedLight = lightEngine.propagate(
@@ -366,9 +365,9 @@ final class CubicWorldState implements AutoCloseable {
         List<CubeSpawnPolicy.SimulationWindow> result = new java.util.ArrayList<>();
         for (var player : world.getPlayers()) {
             BlockPos position = player.getBlockPos();
-            result.add(new CubeSpawnPolicy.SimulationWindow(
+            result.add(CubeSpawnPolicy.simulationWindow(
                     CubePos.fromBlock(position.getX(), position.getY(), position.getZ()),
-                    simulationDistance, 4));
+                    simulationDistance));
         }
         return List.copyOf(result);
     }
@@ -418,7 +417,7 @@ final class CubicWorldState implements AutoCloseable {
     }
 
     Integer highestBlockY(int blockX, int blockZ) {
-        return highestBlocks.get(new BlockColumnPos(blockX, blockZ));
+        return highestBlocks.get(blockX, blockZ);
     }
 
     int lightLevel(net.minecraft.world.LightType type, BlockPos pos) {
@@ -679,7 +678,7 @@ final class CubicWorldState implements AutoCloseable {
                 lightEngine.discardCube(cube.pos());
                 invalidatePayload(cube.pos());
                 loadContexts.remove(cube.pos());
-                removeIndexedHeights(cube);
+                highestBlocks.remove(cube);
                 if (cube.pos().minBlockY() > world.getTopYInclusive()) {
                     // Above the vanilla band, removing the highest cube
                     // can expose disconnected lower cubes to direct sky.
@@ -1011,7 +1010,7 @@ final class CubicWorldState implements AutoCloseable {
             cubes.remove(pos, existing.cube);
             simulationServices.fullCubeUnloaded(pos);
             invalidatePayload(pos);
-            removeIndexedHeights(existing.cube);
+            highestBlocks.remove(existing.cube);
         }
         LoadedCube cube = registerPlaceholder(pos);
         LoadContext created = new LoadContext(cube, payload.orElse(null), holder.epoch());
@@ -1114,6 +1113,13 @@ final class CubicWorldState implements AutoCloseable {
                 }
             }
             holder.advance(CubeStatus.TERRAIN);
+            if (context.payload != null) {
+                // Decode and any legacy migration above completed successfully.
+                // Stored records already contain their decorations; restoring
+                // them needs no new neighbour feature pass. LIGHT is separate.
+                holder.advance(holder.target().isAtLeast(CubeStatus.PAYLOAD)
+                        ? CubeStatus.PAYLOAD : CubeStatus.FEATURES);
+            }
             return true;
         } finally {
             if (wasSuppressing) {
@@ -1191,7 +1197,7 @@ final class CubicWorldState implements AutoCloseable {
 
     private boolean commitLightBody(CubeHolder holder, LoadContext context) {
         if (!context.lightQueued) {
-            indexHeights(context.cube);
+            highestBlocks.index(context.cube);
             boolean initializeAllCells = !context.hasSavedLight
                     && !hasUniformLightFastPath(context.cube);
             lightEngine.queueCube(holder.pos(), initializeAllCells);
@@ -1241,74 +1247,6 @@ final class CubicWorldState implements AutoCloseable {
         return generateStructures ? structureSettings : StructureGenerationSettings.none();
     }
 
-    private void indexHeights(LoadedCube cube) {
-        int baseX = cube.pos().minBlockX();
-        int baseY = cube.pos().minBlockY();
-        int baseZ = cube.pos().minBlockZ();
-        for (int localZ = 0; localZ < CubePos.SIZE; localZ++) {
-            for (int localX = 0; localX < CubePos.SIZE; localX++) {
-                for (int localY = CubePos.SIZE - 1; localY >= 0; localY--) {
-                    if (!cube.section().getBlockState(localX, localY, localZ).isAir()) {
-                        BlockColumnPos key = new BlockColumnPos(baseX + localX, baseZ + localZ);
-                        highestBlocks.merge(key, baseY + localY, Math::max);
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    private void updateHeight(BlockPos pos, BlockState state) {
-        BlockColumnPos key = new BlockColumnPos(pos.getX(), pos.getZ());
-        if (!state.isAir()) {
-            highestBlocks.merge(key, pos.getY(), Math::max);
-            return;
-        }
-        Integer current = highestBlocks.get(key);
-        if (current != null && current == pos.getY()) {
-            recomputeHeight(key);
-        }
-    }
-
-    private void removeIndexedHeights(LoadedCube cube) {
-        int baseX = cube.pos().minBlockX();
-        int baseZ = cube.pos().minBlockZ();
-        int minY = cube.pos().minBlockY();
-        int maxY = minY + CubePos.SIZE - 1;
-        for (int localZ = 0; localZ < CubePos.SIZE; localZ++) {
-            for (int localX = 0; localX < CubePos.SIZE; localX++) {
-                BlockColumnPos key = new BlockColumnPos(baseX + localX, baseZ + localZ);
-                Integer height = highestBlocks.get(key);
-                if (height != null && height >= minY && height <= maxY) {
-                    recomputeHeight(key);
-                }
-            }
-        }
-    }
-
-    private void recomputeHeight(BlockColumnPos key) {
-        CubeColumn<LoadedCube> column = columns.get(
-                new ColumnPos(Math.floorDiv(key.x(), CubePos.SIZE), Math.floorDiv(key.z(), CubePos.SIZE)));
-        int highest = Integer.MIN_VALUE;
-        if (column != null) {
-            int localX = Math.floorMod(key.x(), CubePos.SIZE);
-            int localZ = Math.floorMod(key.z(), CubePos.SIZE);
-            for (LoadedCube cube : column.loaded()) {
-                for (int localY = CubePos.SIZE - 1; localY >= 0; localY--) {
-                    if (!cube.section().getBlockState(localX, localY, localZ).isAir()) {
-                        highest = Math.max(highest, cube.pos().minBlockY() + localY);
-                        break;
-                    }
-                }
-            }
-        }
-        if (highest == Integer.MIN_VALUE) {
-            highestBlocks.remove(key);
-        } else {
-            highestBlocks.put(key, highest);
-        }
-    }
-
     private Collection<LoadedCube> loadedCubes() {
         return cubes.values();
     }
@@ -1322,46 +1260,23 @@ final class CubicWorldState implements AutoCloseable {
         long revision = cube.revision();
         LoadContext context = loadContexts.get(cube.pos());
         boolean includeLight = context == null || context.full || context.hasSavedLight;
-        synchronized (payloadCache) {
-            EncodedPayload cached = payloadCache.get(cube.pos());
-            if (cached != null && cached.cube() == cube && cached.revision() == revision
-                    && cached.lightIncluded() == includeLight) {
-                return cached.payload();
-            }
-        }
+        byte[] cached = payloadCache.get(cube.pos(), cube, revision, includeLight);
+        if (cached != null) return cached;
 
         byte[] encoded;
         try (CubeWorkEvent event = CubeWorkEvent.start("server.encode", cube.pos())) {
             encoded = CubeRecordCodec.encode(cube, world, includeLight);
         }
-        if (encoded.length > MAX_CACHED_PAYLOAD_BYTES) return encoded;
-        synchronized (payloadCache) {
-            EncodedPayload previous = payloadCache.put(
-                    cube.pos(), new EncodedPayload(cube, revision, includeLight, encoded));
-            if (previous != null) cachedPayloadBytes -= previous.payload().length;
-            cachedPayloadBytes += encoded.length;
-            while (cachedPayloadBytes > MAX_CACHED_PAYLOAD_BYTES && !payloadCache.isEmpty()) {
-                Iterator<Map.Entry<CubePos, EncodedPayload>> entries = payloadCache.entrySet().iterator();
-                Map.Entry<CubePos, EncodedPayload> eldest = entries.next();
-                entries.remove();
-                cachedPayloadBytes -= eldest.getValue().payload().length;
-            }
-        }
+        payloadCache.put(cube.pos(), cube, revision, includeLight, encoded);
         return encoded;
     }
 
     private void invalidatePayload(CubePos pos) {
-        synchronized (payloadCache) {
-            EncodedPayload removed = payloadCache.remove(pos);
-            if (removed != null) cachedPayloadBytes -= removed.payload().length;
-        }
+        payloadCache.invalidate(pos);
     }
 
     private void clearPayloadCache() {
-        synchronized (payloadCache) {
-            payloadCache.clear();
-            cachedPayloadBytes = 0L;
-        }
+        payloadCache.clear();
     }
 
     private void markScheduledTickDirty(CubePos pos) {
@@ -1457,13 +1372,6 @@ final class CubicWorldState implements AutoCloseable {
     }
 
     private record ColumnPos(int x, int z) {
-    }
-
-    private record BlockColumnPos(int x, int z) {
-    }
-
-    private record EncodedPayload(
-            LoadedCube cube, long revision, boolean lightIncluded, byte[] payload) {
     }
 
     private static final class LoadContext {
@@ -1645,7 +1553,7 @@ final class CubicWorldState implements AutoCloseable {
         @Override
         public boolean skySource(int x, int y, int z) {
             if (!world.getDimension().hasSkyLight() || opacity(x, y, z) >= 15) return false;
-            Integer cubicHighest = highestBlocks.get(new BlockColumnPos(x, z));
+            Integer cubicHighest = highestBlocks.get(x, z);
             // Managed cells are outside the vanilla height band.  Below the
             // band they can never be above the vanilla heightmap; above it they
             // always are. Avoid a synchronous vanilla chunk/heightmap lookup

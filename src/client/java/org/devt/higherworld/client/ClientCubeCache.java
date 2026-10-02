@@ -3,15 +3,14 @@ package org.devt.higherworld.client;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.Collection;
-import java.util.LinkedHashSet;
 import java.util.Map;
-import java.util.Set;
 
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.block.BlockEntityProvider;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.world.ClientWorld;
+import net.minecraft.entity.Entity;
 import net.minecraft.fluid.FluidState;
 import net.minecraft.util.math.BlockPos;
 import net.minecraft.world.chunk.ChunkSection;
@@ -28,6 +27,7 @@ import org.devt.higherworld.world.CubeFeedbackCadence;
 import org.devt.higherworld.world.CubeWorkEvent;
 import org.devt.higherworld.world.CubeRecordCodec;
 import org.devt.higherworld.world.CubeRevisionGate;
+import org.devt.higherworld.world.CubeRenderQueue;
 import org.devt.higherworld.world.CubeStreamFeedbackPayload;
 import org.devt.higherworld.world.CubeStreamQueue;
 import org.devt.higherworld.world.SparseCubeLightEngine;
@@ -77,10 +77,10 @@ public final class ClientCubeCache {
     private static final SparseCubeLightEngine LIGHT_ENGINE = new SparseCubeLightEngine(new ClientLightAccess());
     /**
      * Render invalidations are produced only on the client thread. Keep them in
-     * one tick-local set so a burst of cube packets, block updates and light
+     * one queue so a burst of cube packets, block updates and light
      * publications rebuilds each affected section at most once.
      */
-    private static final Set<CubePos> PENDING_RENDER_CUBES = new LinkedHashSet<>();
+    private static final CubeRenderQueue PENDING_RENDER_QUEUE = new CubeRenderQueue();
 
     private ClientCubeCache() {
     }
@@ -315,7 +315,7 @@ public final class ClientCubeCache {
             HIGHEST_BLOCKS.clear();
             removeAllBlockEntities();
             LIGHT_ENGINE.clear();
-            PENDING_RENDER_CUBES.clear();
+            PENDING_RENDER_QUEUE.clear();
             owner = null;
             sectionEpoch++;
         }
@@ -326,10 +326,10 @@ public final class ClientCubeCache {
         drainPendingUpdates();
         tickBlockEntities(MinecraftClient.getInstance().world);
         propagateLighting();
-        // Keep the invalidation set alive while a packet burst spans multiple
+        // Keep the invalidation queue alive while a packet burst spans multiple
         // client ticks, but submit a bounded slice every tick.  Waiting for the
         // network queue to become empty made the first visible deep terrain
-        // wait behind the entire view; the set still turns duplicate cube plus
+        // wait behind the entire view; the queue still turns duplicate cube plus
         // six-neighbour notifications into one submission per affected section.
         flushRenderUpdates();
         sendStreamFeedback();
@@ -341,7 +341,7 @@ public final class ClientCubeCache {
 
     private static void sendStreamFeedback() {
         if (MinecraftClient.getInstance().world == null) return;
-        var feedback = PENDING_UPDATES.feedback(System.nanoTime(), PENDING_RENDER_CUBES.size(),
+        var feedback = PENDING_UPDATES.feedback(System.nanoTime(), PENDING_RENDER_QUEUE.size(),
                 LIGHT_ENGINE.pendingCubeCount());
         if (feedback.streamId() != 0
                 && ClientPlayNetworking.canSend(CubeStreamFeedbackPayload.ID)
@@ -495,7 +495,7 @@ public final class ClientCubeCache {
                     HIGHEST_BLOCKS.clear();
                     removeAllBlockEntities();
                     LIGHT_ENGINE.clear();
-                    PENDING_RENDER_CUBES.clear();
+                    PENDING_RENDER_QUEUE.clear();
                     owner = world;
                     sectionEpoch++;
                 }
@@ -509,7 +509,7 @@ public final class ClientCubeCache {
      * neighbor's full boundary face in the scene as a visible 16-block sheet.
      */
     private static void queueRenderNeighborhood(CubePos pos) {
-        PENDING_RENDER_CUBES.add(pos);
+        PENDING_RENDER_QUEUE.offer(pos);
         addRepresentableRenderCube((long) pos.x() - 1L, pos.y(), pos.z());
         addRepresentableRenderCube((long) pos.x() + 1L, pos.y(), pos.z());
         addRepresentableRenderCube(pos.x(), (long) pos.y() - 1L, pos.z());
@@ -522,19 +522,21 @@ public final class ClientCubeCache {
         if (x < Integer.MIN_VALUE || x > Integer.MAX_VALUE
                 || y < Integer.MIN_VALUE || y > Integer.MAX_VALUE
                 || z < Integer.MIN_VALUE || z > Integer.MAX_VALUE) return;
-        PENDING_RENDER_CUBES.add(new CubePos((int) x, (int) y, (int) z));
+        PENDING_RENDER_QUEUE.offer(new CubePos((int) x, (int) y, (int) z));
     }
 
     /** Flushes the de-duplicated invalidations once at the end of the client tick. */
     private static void flushRenderUpdates() {
-        if (PENDING_RENDER_CUBES.isEmpty()) return;
+        if (PENDING_RENDER_QUEUE.isEmpty()) return;
         MinecraftClient client = MinecraftClient.getInstance();
         if (client.worldRenderer == null) return;
+        Entity cameraEntity = client.getCameraEntity();
+        CubePos cameraCube = cameraEntity == null ? null : CubePos.fromBlock(
+                cameraEntity.getBlockX(), cameraEntity.getBlockY(), cameraEntity.getBlockZ());
+        PENDING_RENDER_QUEUE.beginRound(cameraCube, MAX_RENDER_INVALIDATIONS_PER_TICK);
         int scheduled = 0;
-        var iterator = PENDING_RENDER_CUBES.iterator();
-        while (iterator.hasNext() && scheduled < MAX_RENDER_INVALIDATIONS_PER_TICK) {
-            CubePos pos = iterator.next();
-            iterator.remove();
+        CubePos pos;
+        while ((pos = PENDING_RENDER_QUEUE.poll()) != null) {
             client.worldRenderer.scheduleChunkRender(pos.x(), pos.y(), pos.z());
             scheduled++;
         }

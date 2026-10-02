@@ -11,6 +11,8 @@ import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 
 /** Thread-safe entry point for one dimension's three-dimensional region store. */
 public final class CubeStorage implements Closeable {
@@ -18,6 +20,8 @@ public final class CubeStorage implements Closeable {
     private final Path directory;
     private final Object regionCacheLock = new Object();
     private final Map<RegionPos, RegionHandle> regions = new LinkedHashMap<>(16, 0.75F, true);
+    /** Region constructors scan their append log, so keep that work outside the cache lock. */
+    private final Map<RegionPos, CompletableFuture<RegionHandle>> openings = new HashMap<>();
     private boolean closed;
 
     public CubeStorage(Path directory) throws IOException {
@@ -88,8 +92,10 @@ public final class CubeStorage implements Closeable {
             return result;
         }
         try {
+            Map<Integer, Optional<byte[]>> localResult = handle.file.readBatch(
+                    positions.stream().map(CubePos::localIndex).toList());
             for (CubePos pos : positions) {
-                result.put(pos, handle.file.read(pos.localIndex()));
+                result.put(pos, localResult.getOrDefault(pos.localIndex(), Optional.empty()));
             }
             return result;
         } finally {
@@ -151,25 +157,80 @@ public final class CubeStorage implements Closeable {
     }
 
     private RegionHandle acquire(RegionPos pos, boolean create) throws IOException {
-        synchronized (regionCacheLock) {
-            ensureOpen();
-            RegionHandle current = regions.get(pos);
-            if (current != null) {
-                current.users++;
-                return current;
+        Path path = directory.resolve(pos.fileName());
+        while (true) {
+            CompletableFuture<RegionHandle> opening;
+            boolean owner = false;
+            synchronized (regionCacheLock) {
+                ensureOpen();
+                RegionHandle current = regions.get(pos);
+                if (current != null) {
+                    current.users++;
+                    return current;
+                }
+
+                opening = openings.get(pos);
+                if (opening == null) {
+                    if (!create && !Files.exists(path)) {
+                        return null;
+                    }
+                    opening = new CompletableFuture<>();
+                    openings.put(pos, opening);
+                    owner = true;
+                }
             }
 
-            Path file = directory.resolve(pos.fileName());
-            if (!create && !Files.exists(file)) {
-                return null;
+            if (!owner) {
+                awaitOpening(opening);
+                continue;
             }
 
-            evictIdleRegionsIfNecessary();
-            RegionHandle created = new RegionHandle(new CubeRegionFile(file, pos));
-            created.users = 1;
-            regions.put(pos, created);
-            return created;
+            RegionHandle created = null;
+            try {
+                // CubeRegionFile's header/index scan is deliberately outside
+                // regionCacheLock. Other regions can be acquired concurrently.
+                created = new RegionHandle(new CubeRegionFile(path, pos));
+                synchronized (regionCacheLock) {
+                    evictIdleRegionsIfNecessary();
+                    created.users = 1;
+                    regions.put(pos, created);
+                    openings.remove(pos, opening);
+                    opening.complete(created);
+                    regionCacheLock.notifyAll();
+                    return created;
+                }
+            } catch (Throwable failure) {
+                if (created != null) {
+                    try {
+                        created.file.close();
+                    } catch (IOException closeFailure) {
+                        failure.addSuppressed(closeFailure);
+                    }
+                }
+                synchronized (regionCacheLock) {
+                    openings.remove(pos, opening);
+                    opening.completeExceptionally(failure);
+                    regionCacheLock.notifyAll();
+                }
+                rethrowOpenFailure(failure);
+                throw new AssertionError("unreachable");
+            }
         }
+    }
+
+    private static void awaitOpening(CompletableFuture<RegionHandle> opening) throws IOException {
+        try {
+            opening.join();
+        } catch (CompletionException exception) {
+            rethrowOpenFailure(exception.getCause());
+        }
+    }
+
+    private static void rethrowOpenFailure(Throwable failure) throws IOException {
+        if (failure instanceof IOException exception) throw exception;
+        if (failure instanceof RuntimeException exception) throw exception;
+        if (failure instanceof Error error) throw error;
+        throw new IOException("Cannot open cube region", failure);
     }
 
     private void release(RegionHandle handle) {
@@ -189,9 +250,21 @@ public final class CubeStorage implements Closeable {
             while (iterator.hasNext()) {
                 Map.Entry<RegionPos, RegionHandle> candidate = iterator.next();
                 if (candidate.getValue().users == 0) {
-                    candidate.getValue().file.sync();
+                    RegionHandle handle = candidate.getValue();
                     iterator.remove();
-                    candidate.getValue().file.close();
+                    IOException failure = null;
+                    try {
+                        handle.file.sync();
+                    } catch (IOException exception) {
+                        failure = exception;
+                    }
+                    try {
+                        handle.file.close();
+                    } catch (IOException exception) {
+                        if (failure == null) failure = exception;
+                        else failure.addSuppressed(exception);
+                    }
+                    if (failure != null) throw failure;
                     evicted = true;
                     break;
                 }
@@ -213,14 +286,17 @@ public final class CubeStorage implements Closeable {
     @Override
     public void close() throws IOException {
         List<RegionHandle> toClose;
+        boolean interrupted = false;
         synchronized (regionCacheLock) {
             closed = true;
-            while (regions.values().stream().anyMatch(handle -> handle.users != 0)) {
+            while (!openings.isEmpty()
+                    || regions.values().stream().anyMatch(handle -> handle.users != 0)) {
                 try {
                     regionCacheLock.wait();
                 } catch (InterruptedException exception) {
-                    Thread.currentThread().interrupt();
-                    throw new IOException("Interrupted while closing cube storage", exception);
+                    // Finish closing after in-flight constructors/operations
+                    // release their resources, then restore interruption below.
+                    interrupted = true;
                 }
             }
             toClose = List.copyOf(regions.values());
@@ -238,6 +314,12 @@ public final class CubeStorage implements Closeable {
                     failure.addSuppressed(exception);
                 }
             }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+            IOException interruption = new IOException("Interrupted while closing cube storage");
+            if (failure == null) failure = interruption;
+            else failure.addSuppressed(interruption);
         }
         if (failure != null) {
             throw failure;

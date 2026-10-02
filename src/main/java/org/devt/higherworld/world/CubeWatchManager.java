@@ -26,7 +26,6 @@ import org.devt.higherworld.storage.CubePos;
 
 /** Maintains a bounded three-dimensional cube view around every player. */
 public final class CubeWatchManager {
-    private static final int VERTICAL_RADIUS = 4;
     // Cube creation still commits palettes, features and light on the server
     // thread. A small world-wide budget keeps initial view streaming from
     // monopolizing that thread; pure vanilla terrain sampling is dispatched by
@@ -210,9 +209,8 @@ public final class CubeWatchManager {
     }
 
     static boolean withinSimulationDistance(CubePos pos, CubePos center, int distance) {
-        return Math.abs((long) pos.x() - center.x()) <= distance
-                && Math.abs((long) pos.z() - center.z()) <= distance
-                && Math.abs((long) pos.y() - center.y()) <= VERTICAL_RADIUS;
+        if (distance < 0) return false;
+        return CubeSpawnPolicy.simulationWindow(center, distance).contains(pos);
     }
 
     public static void broadcastCubeUpdate(ServerWorld world, BlockPos blockPos) {
@@ -447,13 +445,14 @@ public final class CubeWatchManager {
         }
         state.center = center;
         state.horizontalRadius = horizontalRadius;
-        if (center.y() - VERTICAL_RADIUS < world.getBottomSectionCoord()
-                || center.y() + VERTICAL_RADIUS >= world.getTopSectionCoord()) {
+        if (center.y() - CubeSpawnPolicy.SIMULATION_VERTICAL_RADIUS < world.getBottomSectionCoord()
+                || center.y() + CubeSpawnPolicy.SIMULATION_VERTICAL_RADIUS >= world.getTopSectionCoord()) {
             int simulationDistance = Math.max(
                     0, world.getServer().getPlayerManager().getSimulationDistance());
             CubicWorldManager.replaceTicket(world,
                     CubeTicket.playerSimulation(
-                            player.getUuid(), center, simulationDistance, VERTICAL_RADIUS));
+                            player.getUuid(), center, simulationDistance,
+                            CubeSpawnPolicy.SIMULATION_VERTICAL_RADIUS));
         } else {
             CubicWorldManager.removeTicket(
                     world, CubeTicket.playerSimulationKey(player.getUuid()));
@@ -560,7 +559,8 @@ public final class CubeWatchManager {
         static CubeBox around(CubePos center, int horizontalRadius) {
             return new CubeBox(
                     center.x() - horizontalRadius, center.x() + horizontalRadius,
-                    center.y() - VERTICAL_RADIUS, center.y() + VERTICAL_RADIUS,
+                    center.y() - CubeSpawnPolicy.SIMULATION_VERTICAL_RADIUS,
+                    center.y() + CubeSpawnPolicy.SIMULATION_VERTICAL_RADIUS,
                     center.z() - horizontalRadius, center.z() + horizontalRadius);
         }
 
@@ -605,24 +605,14 @@ public final class CubeWatchManager {
     }
 
     private static boolean withinView(CubePos pos, CubePos center, int horizontalRadius) {
-        return coordinateDistance(pos.x(), center.x()) <= horizontalRadius
-                && coordinateDistance(pos.y(), center.y()) <= VERTICAL_RADIUS
-                && coordinateDistance(pos.z(), center.z()) <= horizontalRadius;
+        if (horizontalRadius < 0) return false;
+        return CubeSpawnPolicy.simulationWindow(center, horizontalRadius).contains(pos);
     }
 
     private static int cubePriority(CubePos pos, CubePos center) {
-        long dx = coordinateDistance(pos.x(), center.x());
-        long dy = coordinateDistance(pos.y(), center.y());
-        long dz = coordinateDistance(pos.z(), center.z());
-        long horizontalShell = Math.max(dx, dz);
-        // Anisotropic priority matches the 3D ticket shape: horizontal view
-        // distance is large, while vertical demand is a narrow fixed column.
-        long priority = horizontalShell * horizontalShell * (VERTICAL_RADIUS + 1L) + dy * dy;
-        return (int) Math.min(Integer.MAX_VALUE, priority);
-    }
-
-    private static long coordinateDistance(int first, int second) {
-        return Math.abs((long) first - second);
+        // Anisotropic priority matches the same 3D window used by simulation
+        // tickets and natural spawning.
+        return CubeSpawnPolicy.simulationWindow(center, 0).priority(pos);
     }
 
     private static boolean watches(ServerPlayerEntity player, CubePos pos) {

@@ -12,6 +12,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.Future;
 import java.util.concurrent.Callable;
 import java.util.concurrent.Executors;
 
@@ -106,6 +107,46 @@ class CubeStorageTest {
             Map<CubePos, java.util.Optional<byte[]>> result = storage.readBatch(Set.of(first, second));
             assertArrayEquals(new byte[] {1}, result.get(first).orElseThrow());
             assertTrue(result.get(second).isEmpty());
+        }
+    }
+
+    @Test
+    void readsBatchWithPositionsOutOfPhysicalAppendOrder() throws Exception {
+        CubePos first = new CubePos(0, 0, 0);
+        CubePos second = new CubePos(1, 0, 0);
+        CubePos third = new CubePos(2, 0, 0);
+        try (CubeStorage storage = new CubeStorage(directory)) {
+            storage.write(first, new byte[] {1});
+            storage.write(second, new byte[] {2});
+            storage.write(third, new byte[] {3});
+
+            Map<CubePos, java.util.Optional<byte[]>> result = storage.readBatch(
+                    List.of(third, first, second));
+            assertArrayEquals(new byte[] {1}, result.get(first).orElseThrow());
+            assertArrayEquals(new byte[] {2}, result.get(second).orElseThrow());
+            assertArrayEquals(new byte[] {3}, result.get(third).orElseThrow());
+        }
+    }
+
+    @Test
+    void concurrentReadsShareOneOpeningAndCloseAfterReadersRelease() throws Exception {
+        CubePos position = new CubePos(4, 5, 6);
+        byte[] payload = new byte[256 * 1024];
+        new java.util.Random(91L).nextBytes(payload);
+        try (CubeStorage storage = new CubeStorage(directory)) {
+            storage.write(position, payload);
+        }
+
+        try (CubeStorage storage = new CubeStorage(directory);
+                var executor = Executors.newFixedThreadPool(8)) {
+            List<Callable<byte[]>> operations = new ArrayList<>();
+            for (int index = 0; index < 32; index++) {
+                operations.add(() -> storage.read(position).orElseThrow());
+            }
+            for (Future<byte[]> future : executor.invokeAll(operations)) {
+                assertArrayEquals(payload, future.get());
+            }
+            assertEquals(1, storage.openRegionCount());
         }
     }
 

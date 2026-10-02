@@ -57,6 +57,37 @@ class TerrainCommitRegressionTest {
     }
 
     @Test
+    void vanillaBatchCommitSkipsAirInFreshSectionAndLocksOnce() {
+        CountingChunkSection section = new CountingChunkSection();
+        LoadedCube cube = new LoadedCube(new CubePos(3, -20, -4), section);
+        BlockState[] states = vanillaBatchStates();
+        states[0] = Blocks.STONE.getDefaultState();
+
+        vanillaBatchSnapshot(states).applyTo(cube);
+
+        assertEquals(1, section.lockCalls);
+        assertEquals(1, section.unlockCalls);
+        assertEquals(1, section.bulkWrites);
+        assertEquals(Blocks.STONE.getDefaultState(), section.getBlockState(0, 0, 0));
+        assertTrue(section.getBlockState(1, 0, 0).isAir());
+    }
+
+    @Test
+    void vanillaBatchCommitClearsAirInExistingSection() {
+        CountingChunkSection section = new CountingChunkSection();
+        LoadedCube cube = new LoadedCube(new CubePos(3, -20, -4), section);
+        section.setBlockState(0, 0, 0, Blocks.STONE.getDefaultState());
+        int writesBeforeCommit = section.bulkWrites;
+
+        vanillaBatchSnapshot(vanillaBatchStates()).applyTo(cube);
+
+        assertEquals(1, section.lockCalls);
+        assertEquals(1, section.unlockCalls);
+        assertEquals(4096, section.bulkWrites - writesBeforeCommit);
+        assertTrue(section.isEmpty());
+    }
+
+    @Test
     void surfaceSearchMatchesReferenceAcrossAirSolidsFluidsAndCaves() {
         LoadedCube cube = cube();
         assertEquals(Integer.MIN_VALUE, CustomLakeGenerator.highestSurfaceY(cube));
@@ -95,5 +126,62 @@ class TerrainCommitRegressionTest {
             }
         }
         return highest;
+    }
+
+    private static BlockState[] vanillaBatchStates() {
+        BlockState[] states = new BlockState[CubePos.SIZE * CubePos.SIZE * CubePos.SIZE * 4];
+        Arrays.fill(states, Blocks.AIR.getDefaultState());
+        return states;
+    }
+
+    private static CubeTerrainSnapshot vanillaBatchSnapshot(BlockState[] states) {
+        try {
+            Class<?> batchPosType = Class.forName(
+                    "org.devt.higherworld.world.VanillaCubeTerrainGenerator$BatchPos");
+            var batchPosConstructor = batchPosType.getDeclaredConstructor(
+                    int.class, int.class, int.class);
+            batchPosConstructor.setAccessible(true);
+            Object batchPos = batchPosConstructor.newInstance(3, -20, -4);
+
+            Class<?> snapshotType = Class.forName(
+                    "org.devt.higherworld.world.VanillaCubeTerrainGenerator$TerrainBatchSnapshot");
+            var snapshotConstructor = snapshotType.getDeclaredConstructor(
+                    batchPosType, int.class, BlockState[].class);
+            snapshotConstructor.setAccessible(true);
+            return (CubeTerrainSnapshot) snapshotConstructor.newInstance(
+                    batchPos, -320, (Object) states);
+        } catch (ReflectiveOperationException exception) {
+            throw new AssertionError("Cannot construct vanilla terrain snapshot", exception);
+        }
+    }
+
+    private static final class CountingChunkSection extends ChunkSection {
+        private int lockCalls;
+        private int unlockCalls;
+        private int bulkWrites;
+
+        private CountingChunkSection() {
+            super(new PalettedContainer<>(Blocks.AIR.getDefaultState(),
+                    PaletteProvider.forBlockStates(Block.STATE_IDS)), null);
+        }
+
+        @Override
+        public void lock() {
+            lockCalls++;
+            super.lock();
+        }
+
+        @Override
+        public void unlock() {
+            unlockCalls++;
+            super.unlock();
+        }
+
+        @Override
+        public BlockState setBlockState(
+                int x, int y, int z, BlockState state, boolean lock) {
+            bulkWrites++;
+            return super.setBlockState(x, y, z, state, lock);
+        }
     }
 }

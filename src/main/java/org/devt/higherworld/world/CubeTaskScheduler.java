@@ -10,6 +10,7 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.PriorityBlockingQueue;
 import java.util.concurrent.ThreadFactory;
@@ -26,6 +27,10 @@ import org.devt.higherworld.storage.CubePos;
 /** Cube dependency DAG coordinator. IO and pure terrain run off-thread; commits do not. */
 final class CubeTaskScheduler implements AutoCloseable {
     private final CubeIoScheduler io;
+    /** Negative keeps the eager graph contract used by non-world callers. */
+    private final int restorableGenerationVersion;
+    private final ConcurrentMap<CubeHolder, Long> deferredGraphs = new ConcurrentHashMap<>();
+    private final java.util.Queue<DeferredGraph> completedDeferredGraphs = new ConcurrentLinkedQueue<>();
     private final CubeTicketManager tickets = new CubeTicketManager();
     private final ConcurrentMap<CubePos, CubeHolder> holders = new ConcurrentHashMap<>();
     /** Lifecycle-maintained frontier; cached terrain/payload cubes never enter it. */
@@ -67,6 +72,8 @@ final class CubeTaskScheduler implements AutoCloseable {
      * poll and every retry regenerated the same deep dependency set.
      */
     private final Map<CubePos, List<CubePos>> featureTerrainDependencies = new HashMap<>();
+    private final Map<FeatureTerrainBand, FeatureTerrainGroup> featureTerrainGroups = new HashMap<>();
+    private final Map<CubePos, FeatureTerrainBand> featureTerrainOwners = new HashMap<>();
     /**
      * Feature terrain reads registered between target refreshes.  The owner map
      * is server-thread state, while this refcounted set is read by eviction and
@@ -94,6 +101,9 @@ final class CubeTaskScheduler implements AutoCloseable {
      * without resurrecting the queue churn.
      */
     private final ConcurrentMap<CubeHolder, Long> waitingSinceEpoch = new ConcurrentHashMap<>();
+    /** One first-blocking edge per owner, rather than a reverse map of its entire halo. */
+    private final ConcurrentMap<CubeHolder, DependencyWait> waitingOn = new ConcurrentHashMap<>();
+    private final java.util.Queue<DependencyWait> dependencyWakeups = new ConcurrentLinkedQueue<>();
     /** Rotating scan order for {@link #waitingSinceEpoch}; server-thread only. */
     private final java.util.ArrayDeque<WaitingRef> waitingOrder = new java.util.ArrayDeque<>();
     /** Upper bound of waiting holders rechecked per commit scan. */
@@ -102,7 +112,12 @@ final class CubeTaskScheduler implements AutoCloseable {
     private final AtomicLong dependencyEpoch = new AtomicLong();
 
     CubeTaskScheduler(CubeIoScheduler io) {
+        this(io, -1);
+    }
+
+    CubeTaskScheduler(CubeIoScheduler io, int restorableGenerationVersion) {
         this.io = io;
+        this.restorableGenerationVersion = restorableGenerationVersion;
         int workers = Math.max(1, Math.min(8, Runtime.getRuntime().availableProcessors() - 2));
         ThreadFactory factory = runnable -> {
             Thread thread = new Thread(runnable, "higherworld-cube-generation");
@@ -146,6 +161,23 @@ final class CubeTaskScheduler implements AutoCloseable {
         if (target.isAtLeast(CubeStatus.IO_READY)) {
             holder.startIo(() -> io.readAsync(pos, priority(pos)));
         }
+        // Streaming must discover whether a record exists before starting
+        // terrain for its halo. FULL still expands its lighting/simulation DAG.
+        if (restorableGenerationVersion >= 0 && target.isAtLeast(CubeStatus.FEATURES)
+                && !target.isAtLeast(CubeStatus.LIGHT) && !holder.ioFuture().isDone()) {
+            long epoch = holder.epoch();
+            Long previous = deferredGraphs.put(holder, epoch);
+            if (previous == null || previous != epoch) {
+                holder.ioFuture().whenComplete((payload, failure) ->
+                        completedDeferredGraphs.offer(new DeferredGraph(holder, epoch)));
+            }
+            return holder;
+        }
+        deferredGraphs.remove(holder);
+        if (restorableGenerationVersion >= 0 && prefetchPositions.contains(pos)
+                && holder.ioFuture() != null && holder.ioFuture().isDone()) {
+            dirtyTargets.addAll(demand.replace(new PrefetchRoot(pos), prefetchClosure(pos)));
+        }
         GraphExpansion expanded = expandedGraphs.get(pos);
         if (expanded != null && expanded.epoch() == holder.epoch()
                 && expanded.target().isAtLeast(target) && expanded.priority() <= priority) return holder;
@@ -155,6 +187,7 @@ final class CubeTaskScheduler implements AutoCloseable {
             if (stage.ordinal() > target.ordinal()) break;
             CubeStatus neighbourStatus = stage.neighbourPrerequisite();
             if (neighbourStatus == null) continue;
+            if (stage == CubeStatus.FEATURES && canRestorePayload(holder)) continue;
             stage.dependencyRadius().forEach(pos, dependency ->
                     requestGraph(dependency, neighbourStatus, CubePriorityIndex.increment(priority), visited));
         }
@@ -162,6 +195,42 @@ final class CubeTaskScheduler implements AutoCloseable {
         // must not leave a memo that suppresses the remaining prerequisites.
         expandedGraphs.put(pos, new GraphExpansion(holder.epoch(), target, priority));
         return holder;
+    }
+
+    private boolean canRestorePayload(CubeHolder holder) {
+        if (restorableGenerationVersion < 0 || holder.ioFuture() == null
+                || !holder.ioFuture().isDone() || holder.ioFuture().isCompletedExceptionally()) return false;
+        var payload = holder.ioFuture().getNow(java.util.Optional.empty());
+        return payload.isPresent()
+                && CubeRecordCodec.generationVersion(payload.get()) >= restorableGenerationVersion;
+    }
+
+    private Map<CubePos, CubeStatus> prefetchClosure(CubePos pos) {
+        CubeHolder holder = holders.get(pos);
+        if (restorableGenerationVersion >= 0 && (holder == null || holder.ioFuture() == null
+                || !holder.ioFuture().isDone() || canRestorePayload(holder))) {
+            return Map.of(pos, CubeStatus.PAYLOAD);
+        }
+        Map<CubePos, CubeStatus> closure = new HashMap<>();
+        CubeTicketManager.collectRequired(pos, CubeDependencyRadius.NONE, CubeStatus.PAYLOAD, closure);
+        return closure;
+    }
+
+    /** Worker completions only enqueue; demand/graph mutation stays on the server thread. */
+    private void resolveDeferredGraphs(long deadlineNanos) {
+        int remaining = 128;
+        DeferredGraph completion;
+        while (remaining-- > 0 && System.nanoTime() < deadlineNanos
+                && (completion = completedDeferredGraphs.poll()) != null) {
+            CubeHolder holder = completion.holder();
+            if (!holder.isCurrent(completion.epoch()) || holder.failed()
+                    || holders.get(holder.pos()) != holder) {
+                deferredGraphs.remove(holder, completion.epoch());
+                continue;
+            }
+            if (!deferredGraphs.remove(holder, completion.epoch())) continue;
+            requestGraph(holder.pos(), holder.target(), priority(holder.pos()), new HashSet<>());
+        }
     }
 
     void replaceTicket(CubeTicket ticket) {
@@ -312,9 +381,7 @@ final class CubeTaskScheduler implements AutoCloseable {
             }
             for (CubePos pos : retained) {
                 if (prefetchPositions.contains(pos)) continue;
-                Map<CubePos, CubeStatus> closure = new HashMap<>();
-                CubeTicketManager.collectRequired(pos, CubeDependencyRadius.NONE, CubeStatus.PAYLOAD, closure);
-                dirtyTargets.addAll(demand.replace(new PrefetchRoot(pos), closure));
+                dirtyTargets.addAll(demand.replace(new PrefetchRoot(pos), prefetchClosure(pos)));
             }
             prefetchPositions = Set.copyOf(retained);
         }
@@ -341,6 +408,7 @@ final class CubeTaskScheduler implements AutoCloseable {
         if (isRequired(pos)) return;
         CubeHolder holder = holders.remove(pos);
         if (holder != null) {
+            deferredGraphs.remove(holder);
             requestPriorities.remove(pos);
             expandedGraphs.remove(pos);
             removeQueuedReady(holder);
@@ -378,6 +446,7 @@ final class CubeTaskScheduler implements AutoCloseable {
     }
 
     private void enqueueReady(CubeHolder holder) {
+        waitingOn.remove(holder);
         waitingSinceEpoch.remove(holder);
         synchronized (holder) {
             if (!holder.failed() && holder.target() == CubeStatus.FULL
@@ -534,9 +603,19 @@ final class CubeTaskScheduler implements AutoCloseable {
         if (featureTerrainReady.contains(holder.pos())) return true;
         boolean ready = true;
         List<CubePos> dependencies = featureTerrainDependencies.get(holder.pos());
+        FeatureTerrainBand band = new FeatureTerrainBand(holder.pos().x(),
+                Math.floorDiv((long) world.getBottomSectionCoord() - 1L - holder.pos().y(), 4L),
+                holder.pos().z());
+        FeatureTerrainGroup group = featureTerrainGroups.computeIfAbsent(band, ignored ->
+                new FeatureTerrainGroup(VanillaPlacedFeatureGenerator.terrainBatchPositions(world, holder.pos())));
         if (dependencies == null) {
-            dependencies = VanillaPlacedFeatureGenerator.terrainBatchPositions(world, holder.pos());
+            dependencies = group.dependencies;
             registerFeatureTerrainDependencies(holder.pos(), dependencies);
+        }
+        if (featureTerrainOwners.putIfAbsent(holder.pos(), band) == null) group.owners++;
+        if (group.ready) {
+            featureTerrainReady.add(holder.pos());
+            return true;
         }
         for (CubePos dependency : dependencies) {
             // The first pass materializes this wider read set. Once a holder
@@ -549,8 +628,30 @@ final class CubeTaskScheduler implements AutoCloseable {
                 ready = false;
             }
         }
-        if (ready) featureTerrainReady.add(holder.pos());
+        if (ready) {
+            group.ready = true;
+            featureTerrainReady.add(holder.pos());
+        }
         return ready;
+    }
+
+    private record FeatureTerrainBand(int x, long band, int z) {}
+
+    private static final class FeatureTerrainGroup {
+        private final List<CubePos> dependencies;
+        private int owners;
+        private boolean ready;
+
+        private FeatureTerrainGroup(List<CubePos> dependencies) {
+            this.dependencies = dependencies;
+        }
+    }
+
+    private void releaseFeatureTerrainGroup(CubePos owner) {
+        FeatureTerrainBand band = featureTerrainOwners.remove(owner);
+        if (band == null) return;
+        FeatureTerrainGroup group = featureTerrainGroups.get(band);
+        if (group != null && --group.owners == 0) featureTerrainGroups.remove(band);
     }
 
     private void registerFeatureTerrainDependencies(
@@ -711,6 +812,8 @@ final class CubeTaskScheduler implements AutoCloseable {
 
     List<CubeHolder> readyForCommit(int limit, long deadlineNanos) {
         if (limit <= 0) return List.of();
+        resolveDeferredGraphs(deadlineNanos);
+        drainDependencyWakeups(deadlineNanos);
 
         // Holder state transitions enqueue a versioned entry. Poll only the
         // current frontier instead of scanning and partially sorting every
@@ -792,6 +895,12 @@ final class CubeTaskScheduler implements AutoCloseable {
                 waitingOrder.addLast(ref);
                 continue;
             }
+            if (waitingOn.containsKey(holder)) {
+                // This owner has a concrete completion notification. Unrelated
+                // terrain progress is not a reason to rescan its 180-cube halo.
+                waitingOrder.addLast(ref);
+                continue;
+            }
             if (holder.failed()
                     || holder.target() == CubeStatus.EMPTY
                     || holder.status().isAtLeast(holder.target())) {
@@ -864,6 +973,7 @@ final class CubeTaskScheduler implements AutoCloseable {
                 if (!target.isAtLeast(CubeStatus.FEATURES)) {
                     List<CubePos> dependencies = featureTerrainDependencies.remove(pos);
                     if (dependencies != null) {
+                        releaseFeatureTerrainGroup(pos);
                         featurePrioritiesChanged = true;
                         featureTerrainReady.remove(pos);
                         releaseFeatureTerrainDependencies(dependencies);
@@ -876,6 +986,7 @@ final class CubeTaskScheduler implements AutoCloseable {
                     requestPriorities.remove(pos);
                     expandedGraphs.remove(pos);
                     if (holder != null) {
+                        deferredGraphs.remove(holder);
                         removeQueuedReady(holder);
                         holder.cancel();
                         holders.remove(pos, holder);
@@ -915,17 +1026,23 @@ final class CubeTaskScheduler implements AutoCloseable {
         inheritedPriorityPositions.clear();
         prefetchRanks = Map.of();
         expandedGraphs.clear();
+        deferredGraphs.clear();
+        completedDeferredGraphs.clear();
         demand.clear();
         demandTickets.clear();
         dirtyTargets.clear();
         prefetchPositions = Set.of();
         featureTerrainDependencies.clear();
+        featureTerrainGroups.clear();
+        featureTerrainOwners.clear();
         featureTerrainRequiredCounts.clear();
         featureTerrainReady.clear();
         featureTerrainRequestCount = 0L;
         readyQueue.clear();
         queuedReady.clear();
         waitingSinceEpoch.clear();
+        waitingOn.clear();
+        dependencyWakeups.clear();
         waitingOrder.clear();
     }
 
@@ -934,6 +1051,35 @@ final class CubeTaskScheduler implements AutoCloseable {
             int statusOrdinal) {}
 
     private record WaitingRef(CubeHolder holder, long epoch) {}
+
+    private record DependencyWait(CubeHolder owner, long ownerEpoch,
+            CubeHolder dependency, long dependencyEpoch, CubeStatus stage) {}
+
+    private void waitForDependency(CubeHolder owner, CubeHolder dependency, CubeStatus stage) {
+        if (dependency == null || dependency.failed()) return;
+        CompletableFuture<Void> future = dependency.localStageFuture(stage);
+        // advance() completes its futures just before publishing the status.
+        // A completed future with an older status uses the epoch fallback.
+        if (future.isDone()) return;
+        DependencyWait wait = new DependencyWait(owner, owner.epoch(),
+                dependency, dependency.epoch(), stage);
+        DependencyWait previous = waitingOn.put(owner, wait);
+        if (wait.equals(previous)) return;
+        future.whenComplete((ignored, failure) -> dependencyWakeups.offer(wait));
+    }
+
+    private void drainDependencyWakeups(long deadlineNanos) {
+        int remaining = 512;
+        DependencyWait wait;
+        while (remaining-- > 0 && System.nanoTime() < deadlineNanos
+                && (wait = dependencyWakeups.poll()) != null) {
+            if (!waitingOn.remove(wait.owner(), wait)) continue;
+            if (wait.owner().isCurrent(wait.ownerEpoch())
+                    && holders.get(wait.owner().pos()) == wait.owner()) enqueueReady(wait.owner());
+        }
+    }
+
+    int dependencyWaitCountForTest() { return waitingOn.size(); }
 
     private static int compareReadyEntries(ReadyEntry first, ReadyEntry second) {
         // Ticket priority includes distance from the ticket centre.  It must be
@@ -951,6 +1097,7 @@ final class CubeTaskScheduler implements AutoCloseable {
 
     private boolean nextCommitDependenciesReady(CubeHolder holder) {
         CubeStatus next = CubeStatus.values()[holder.status().ordinal() + 1];
+        if (next == CubeStatus.FEATURES && canRestorePayload(holder)) return true;
         CubeStatus neighbour = next.neighbourPrerequisite();
         if (neighbour == null) return true;
 
@@ -966,6 +1113,7 @@ final class CubeTaskScheduler implements AutoCloseable {
                     if (dependencyHolder == null
                             || dependencyHolder.failed()
                             || !dependencyHolder.status().isAtLeast(neighbour)) {
+                        waitForDependency(holder, dependencyHolder, neighbour);
                         return false;
                     }
                 }
@@ -978,6 +1126,7 @@ final class CubeTaskScheduler implements AutoCloseable {
         // is ready.  A missing registration deliberately passes above: the
         // feature poll then materializes the halo exactly once.
         if (holder.status() == CubeStatus.TERRAIN) {
+            if (featureTerrainReady.contains(holder.pos())) return true;
             List<CubePos> featureDependencies = featureTerrainDependencies.get(holder.pos());
             if (featureDependencies != null) {
                 for (CubePos dependency : featureDependencies) {
@@ -985,6 +1134,7 @@ final class CubeTaskScheduler implements AutoCloseable {
                     if (dependencyHolder == null
                             || dependencyHolder.failed()
                             || !dependencyHolder.status().isAtLeast(CubeStatus.TERRAIN)) {
+                        waitForDependency(holder, dependencyHolder, CubeStatus.TERRAIN);
                         return false;
                     }
                 }
@@ -1000,14 +1150,9 @@ final class CubeTaskScheduler implements AutoCloseable {
      * the OpenCL raster kernel is not invoked once per cube.
      */
     private final class VanillaTerrainBatcher implements AutoCloseable {
-        private static final int MAX_BATCH = 16;
-        private static final long COLLECTION_WINDOW_NANOS = 750_000L;
-
-        private final BlockingQueue<VanillaTerrainRequest> pending =
-                new LinkedBlockingQueue<>();
-        private final Object lifecycleLock = new Object();
-        private volatile boolean closed;
-        private Thread worker;
+        private final CubeTerrainBatcher<VanillaTerrainRequest> collector = new CubeTerrainBatcher<>(
+                "higherworld-vanilla-terrain-batcher", VanillaTerrainRequest::result,
+                this::compatible, this::process, this::submitCpuFallback);
 
         private CompletableFuture<CubeTerrainSnapshot> submit(
                 CubeHolder holder, long epoch,
@@ -1015,59 +1160,8 @@ final class CubeTaskScheduler implements AutoCloseable {
             CompletableFuture<CubeTerrainSnapshot> result = new CompletableFuture<>();
             VanillaTerrainRequest queued = new VanillaTerrainRequest(
                     holder, epoch, request, priority, result);
-            synchronized (lifecycleLock) {
-                if (closed) {
-                    result.completeExceptionally(new IllegalStateException(
-                            "Vanilla terrain batcher is closed"));
-                    return result;
-                }
-                pending.offer(queued);
-                if (worker == null) {
-                    worker = new Thread(this::run, "higherworld-vanilla-terrain-batcher");
-                    worker.setDaemon(true);
-                    worker.start();
-                }
-                lifecycleLock.notifyAll();
-            }
+            collector.submit(queued);
             return result;
-        }
-
-        private void run() {
-            while (!closed) {
-                VanillaTerrainRequest first;
-                try {
-                    first = pending.take();
-                } catch (InterruptedException interrupted) {
-                    if (closed) return;
-                    continue;
-                }
-                List<VanillaTerrainRequest> batch = new ArrayList<>(MAX_BATCH);
-                batch.add(first);
-                List<VanillaTerrainRequest> deferred = new ArrayList<>();
-                long deadline = System.nanoTime() + COLLECTION_WINDOW_NANOS;
-                while (batch.size() < MAX_BATCH) {
-                    VanillaTerrainRequest next = pending.poll();
-                    if (next == null) {
-                        long remaining = deadline - System.nanoTime();
-                        if (remaining <= 0L) break;
-                        try {
-                            next = pending.poll(remaining, TimeUnit.NANOSECONDS);
-                        } catch (InterruptedException interrupted) {
-                            if (closed) return;
-                            continue;
-                        }
-                        if (next == null) break;
-                    }
-                    if (compatible(first, next)) batch.add(next);
-                    else deferred.add(next);
-                }
-                deferred.forEach(pending::offer);
-                process(batch);
-            }
-            VanillaTerrainRequest request;
-            while ((request = pending.poll()) != null) {
-                request.result().cancel(false);
-            }
         }
 
         private boolean compatible(VanillaTerrainRequest first, VanillaTerrainRequest next) {
@@ -1140,6 +1234,7 @@ final class CubeTaskScheduler implements AutoCloseable {
         }
 
         private void submitCpuFallback(VanillaTerrainRequest request) {
+            if (request.result().isDone()) return;
             submitVanillaCpuTerrain(
                     request.holder(), request.epoch(), request.request(), request.priority())
                     .whenComplete((snapshot, throwable) -> {
@@ -1160,17 +1255,9 @@ final class CubeTaskScheduler implements AutoCloseable {
 
         @Override
         public void close() {
-            synchronized (lifecycleLock) {
-                if (closed) return;
-                closed = true;
-                pending.forEach(request -> request.result().cancel(false));
-                pending.clear();
-                if (worker != null) worker.interrupt();
-                lifecycleLock.notifyAll();
-            }
+            collector.close();
         }
     }
-
     /**
      * A tiny collector for custom terrain requests. The normal scheduler keeps
      * one lifecycle future per cube, but OpenCL is much faster when those
@@ -1179,14 +1266,9 @@ final class CubeTaskScheduler implements AutoCloseable {
      * single-cube world does not wait behind a large batch.
      */
     private final class CustomTerrainBatcher implements AutoCloseable {
-        private static final int MAX_BATCH = 16;
-        private static final long COLLECTION_WINDOW_NANOS = 750_000L;
-
-        private final BlockingQueue<CustomTerrainRequest> pending =
-                new LinkedBlockingQueue<>();
-        private final Object lifecycleLock = new Object();
-        private volatile boolean closed;
-        private Thread worker;
+        private final CubeTerrainBatcher<CustomTerrainRequest> collector = new CubeTerrainBatcher<>(
+                "higherworld-custom-terrain-batcher", CustomTerrainRequest::result,
+                this::compatible, this::process, this::submitCpuFallback);
 
         private CompletableFuture<CubeTerrainSnapshot> submit(
                 CubeHolder holder, long epoch, long seed,
@@ -1194,59 +1276,8 @@ final class CubeTaskScheduler implements AutoCloseable {
             CompletableFuture<CubeTerrainSnapshot> result = new CompletableFuture<>();
             CustomTerrainRequest request = new CustomTerrainRequest(
                     holder, epoch, seed, settings, priority, result);
-            synchronized (lifecycleLock) {
-                if (closed) {
-                    result.completeExceptionally(new IllegalStateException(
-                            "Custom terrain batcher is closed"));
-                    return result;
-                }
-                pending.offer(request);
-                if (worker == null) {
-                    worker = new Thread(this::run, "higherworld-custom-terrain-batcher");
-                    worker.setDaemon(true);
-                    worker.start();
-                }
-                lifecycleLock.notifyAll();
-            }
+            collector.submit(request);
             return result;
-        }
-
-        private void run() {
-            while (!closed) {
-                CustomTerrainRequest first;
-                try {
-                    first = pending.take();
-                } catch (InterruptedException interrupted) {
-                    if (closed) return;
-                    continue;
-                }
-                List<CustomTerrainRequest> batch = new ArrayList<>(MAX_BATCH);
-                batch.add(first);
-                List<CustomTerrainRequest> deferred = new ArrayList<>();
-                long deadline = System.nanoTime() + COLLECTION_WINDOW_NANOS;
-                while (batch.size() < MAX_BATCH) {
-                    CustomTerrainRequest next = pending.poll();
-                    if (next == null) {
-                        long remaining = deadline - System.nanoTime();
-                        if (remaining <= 0L) break;
-                        try {
-                            next = pending.poll(remaining, TimeUnit.NANOSECONDS);
-                        } catch (InterruptedException interrupted) {
-                            if (closed) return;
-                            continue;
-                        }
-                        if (next == null) break;
-                    }
-                    if (compatible(first, next)) batch.add(next);
-                    else deferred.add(next);
-                }
-                deferred.forEach(pending::offer);
-                process(batch);
-            }
-            CustomTerrainRequest request;
-            while ((request = pending.poll()) != null) {
-                request.result().cancel(false);
-            }
         }
 
         private boolean compatible(CustomTerrainRequest first, CustomTerrainRequest next) {
@@ -1314,10 +1345,12 @@ final class CubeTaskScheduler implements AutoCloseable {
         }
 
         private void submitCpuFallback(CustomTerrainRequest request) {
+            if (request.result().isDone()) return;
             try {
                 generationExecutor.execute(new GenerationTask(
                         request.holder().pos(), priority(request.holder().pos()), sequence.getAndIncrement(), () -> {
-                            if (!request.holder().isCurrent(request.epoch())
+                            if (request.result().isDone()
+                                    || !request.holder().isCurrent(request.epoch())
                                     || !request.holder().target().isAtLeast(CubeStatus.TERRAIN)) {
                                 request.result().cancel(false);
                                 return;
@@ -1341,16 +1374,10 @@ final class CubeTaskScheduler implements AutoCloseable {
 
         @Override
         public void close() {
-            synchronized (lifecycleLock) {
-                if (closed) return;
-                closed = true;
-                pending.forEach(request -> request.result().cancel(false));
-                pending.clear();
-                if (worker != null) worker.interrupt();
-                lifecycleLock.notifyAll();
-            }
+            collector.close();
         }
     }
+    private record DeferredGraph(CubeHolder holder, long epoch) {}
 
     private record CustomTerrainRequest(
             CubeHolder holder, long epoch, long seed, CustomWorldSettings settings,

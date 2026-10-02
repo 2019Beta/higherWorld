@@ -216,31 +216,6 @@ final class InfiniteDownwardGenerator {
         }
     }
 
-    private static double interpolateVanillaDensity(
-            double[] samples, int x, int y, int z,
-            int horizontalCell, int verticalCell,
-            int horizontalCells, int verticalCells) {
-        int gridX = Math.min(horizontalCells - 1, x / horizontalCell);
-        int gridY = Math.min(verticalCells - 1, y / verticalCell);
-        int gridZ = Math.min(horizontalCells - 1, z / horizontalCell);
-        double tx = (double) (x - gridX * horizontalCell) / horizontalCell;
-        double ty = (double) (y - gridY * verticalCell) / verticalCell;
-        double tz = (double) (z - gridZ * horizontalCell) / horizontalCell;
-        double x00 = lerp(
-                samples[vanillaSampleIndex(gridX, gridY, gridZ, horizontalCells)],
-                samples[vanillaSampleIndex(gridX + 1, gridY, gridZ, horizontalCells)], tx);
-        double x10 = lerp(
-                samples[vanillaSampleIndex(gridX, gridY + 1, gridZ, horizontalCells)],
-                samples[vanillaSampleIndex(gridX + 1, gridY + 1, gridZ, horizontalCells)], tx);
-        double x01 = lerp(
-                samples[vanillaSampleIndex(gridX, gridY, gridZ + 1, horizontalCells)],
-                samples[vanillaSampleIndex(gridX + 1, gridY, gridZ + 1, horizontalCells)], tx);
-        double x11 = lerp(
-                samples[vanillaSampleIndex(gridX, gridY + 1, gridZ + 1, horizontalCells)],
-                samples[vanillaSampleIndex(gridX + 1, gridY + 1, gridZ + 1, horizontalCells)], tx);
-        return lerp(lerp(x00, x10, ty), lerp(x01, x11, ty), tz);
-    }
-
     private static int vanillaSampleIndex(int x, int y, int z, int horizontalCells) {
         int side = horizontalCells + 1;
         return (y * side + z) * side + x;

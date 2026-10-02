@@ -722,13 +722,26 @@ final class VanillaCubeTerrainGenerator {
                 throw new IllegalArgumentException("Terrain batch does not contain cube " + cube.pos());
             }
             int yOffset = localSectionY * CubePos.SIZE;
-            for (int localY = 0; localY < CubePos.SIZE; localY++) {
-                for (int localZ = 0; localZ < CubePos.SIZE; localZ++) {
-                    for (int localX = 0; localX < CubePos.SIZE; localX++) {
-                        cube.setGeneratedBlockState(localX, localY, localZ,
-                                states[batchIndex(localX, yOffset + localY, localZ)]);
+            // Fresh sparse sections already contain air. Avoid rebuilding the
+            // palette for those air entries, while retaining the full clear
+            // behavior when a snapshot is applied to an existing section.
+            boolean clearAir = !cube.section().isEmpty();
+            ChunkSection section = cube.section();
+            section.lock();
+            try {
+                for (int localY = 0; localY < CubePos.SIZE; localY++) {
+                    for (int localZ = 0; localZ < CubePos.SIZE; localZ++) {
+                        for (int localX = 0; localX < CubePos.SIZE; localX++) {
+                            BlockState state = states[
+                                    batchIndex(localX, yOffset + localY, localZ)];
+                            if (!state.isAir() || clearAir) {
+                                section.setBlockState(localX, localY, localZ, state, false);
+                            }
+                        }
                     }
                 }
+            } finally {
+                section.unlock();
             }
         }
     }
