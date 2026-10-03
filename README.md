@@ -43,6 +43,8 @@ Fabric 1.21.11 + Yarn API。
 
 ## 构建
 
+使用 JDK 25 和仓库自带的 Gradle 9.8.0 Wrapper。运行模组也需要 Java 25 或更高版本。
+
 ```powershell
 .\gradlew.bat build
 ```
